@@ -1,0 +1,28 @@
+name: ci
+
+# Public repo: Actions minutes are free, so the gate runs here as well as in hk's pre-push.
+on:
+  merge_group:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    # macOS: the daemon is a launchd agent, and the suite's refused write (a symlink to
+    # /dev/urandom) is refused only there
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          components: clippy, llvm-tools-preview, rustfmt
+          # Must match mise.toml's pin: Cargo.toml's [lints] enumerate this toolchain's lints.
+          toolchain: 1.94.0
+      # mise.toml's pin: a drifting llvm-cov drifts what the 100 % counts.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov@0.9.1
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo llvm-cov --fail-under-lines 100 --show-missing-lines

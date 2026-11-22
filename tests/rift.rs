@@ -1,0 +1,1237 @@
+//! End to end: the built `rift` over temp roots, against docs/protocol.html and the daemon rules;
+//! a daemon a test starts is drained by it, or killed when its guard drops.
+
+// the binary's dependencies, unused by the suite
+use hotswap as _;
+use signal_hook as _;
+
+#[cfg(test)]
+mod tests {
+    use serde_json::{Value, json};
+    use std::env;
+    use std::error::Error;
+    use std::fs::{self, File, OpenOptions, Permissions};
+    use std::io::{self, BufRead as _, BufReader, Write as _};
+    use std::iter;
+    use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _, symlink};
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::process::{Child, Command, ExitStatus, Stdio, id};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    /// The hello every raw connection opens with.
+    const HELLO: &str = r#"{"client":"test/1","op":"hello","proto":1}"#;
+
+    /// A test's fallible outcome.
+    type Outcome = Result<(), Box<dyn Error>>;
+
+    /// A running `rift serve`, killed and reaped when it drops.
+    struct Daemon(Child);
+
+    impl Drop for Daemon {
+        fn drop(&mut self) {
+            drop(self.0.kill());
+            drop(self.0.wait());
+        }
+    }
+
+    /// An attached disk image by its mount point, detached when it drops.
+    struct Volume(String);
+
+    impl Drop for Volume {
+        fn drop(&mut self) {
+            drop(
+                Command::new("hdiutil")
+                    .args(["detach", "-force", &self.0])
+                    .output(),
+            );
+        }
+    }
+
+    /// `left` equal to `right`, else an error showing both.
+    fn same(left: &str, right: &str) -> Outcome {
+        if left == right {
+            Ok(())
+        } else {
+            Err(format!("\n left: {left}\nright: {right}").into())
+        }
+    }
+
+    /// A fresh directory for `name`, short enough for a socket path under it.
+    fn temp(name: &str) -> Result<String, Box<dyn Error>> {
+        let dir = env::temp_dir().join(format!("rift-{name}-{}", id()));
+        drop(fs::remove_dir_all(&dir));
+        fs::create_dir_all(&dir)?;
+        Ok(fs::canonicalize(dir)?.to_string_lossy().into_owned())
+    }
+
+    /// `rift args` over `root` with `envs`: its exit code, a newline, its stdout, then its stderr.
+    fn rift(root: &str, envs: &[(&str, &str)], args: &[&str]) -> Result<String, Box<dyn Error>> {
+        let out = Command::new(env!("CARGO_BIN_EXE_rift"))
+            .env("RIFT_ROOT", root)
+            .envs(envs.iter().copied())
+            .args(args)
+            .stdin(Stdio::null())
+            .output()?;
+        Ok(format!(
+            "{}\n{}{}",
+            out.status.code().unwrap_or(-1),
+            String::from_utf8(out.stdout)?,
+            String::from_utf8(out.stderr)?
+        ))
+    }
+
+    /// This build's version, as `rift version` prints it.
+    fn version() -> Result<String, Box<dyn Error>> {
+        Ok(rift("/nonexistent", &[], &["version"])?
+            .trim_start_matches("0\n")
+            .trim_end()
+            .to_owned())
+    }
+
+    /// `rift serve` over `root` with `envs`, and the ready line it prints.
+    fn serve(root: &str, envs: &[(&str, &str)]) -> Result<(Daemon, Value), Box<dyn Error>> {
+        let mut daemon = Daemon(
+            Command::new(env!("CARGO_BIN_EXE_rift"))
+                .env("RIFT_ROOT", root)
+                .envs(envs.iter().copied())
+                .arg("serve")
+                .stdout(Stdio::piped())
+                .spawn()?,
+        );
+        let mut ready = String::new();
+        let _: usize =
+            BufReader::new(daemon.0.stdout.take().ok_or("stdout")?).read_line(&mut ready)?;
+        Ok((daemon, serde_json::from_str(&ready)?))
+    }
+
+    /// A raw connection to the daemon over `root`, nothing sent.
+    fn dial(root: &str) -> io::Result<BufReader<UnixStream>> {
+        let stream = UnixStream::connect(format!("{root}/run/rift.sock"))?;
+        stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+        Ok(BufReader::new(stream))
+    }
+
+    /// `line` sent on `conn`, and the next line read (empty at end of stream).
+    fn say(conn: &mut BufReader<UnixStream>, line: &str) -> io::Result<String> {
+        conn.get_mut().write_all(format!("{line}\n").as_bytes())?;
+        next(conn)
+    }
+
+    /// The next line on `conn`, its newline trimmed; empty at end of stream.
+    fn next(conn: &mut BufReader<UnixStream>) -> io::Result<String> {
+        let mut line = String::new();
+        let _: usize = conn.read_line(&mut line)?;
+        Ok(line.trim_end().to_owned())
+    }
+
+    /// A connection that has said hello.
+    fn greet(root: &str) -> Result<BufReader<UnixStream>, Box<dyn Error>> {
+        let mut conn = dial(root)?;
+        let hello: Value = serde_json::from_str(&say(&mut conn, HELLO)?)?;
+        if hello["ok"] != true {
+            return Err(format!("hello refused: {hello}").into());
+        }
+        Ok(conn)
+    }
+
+    /// Every line of `<root>/events.ndjson`, parsed.
+    fn events(root: &str) -> Result<Vec<Value>, Box<dyn Error>> {
+        Ok(fs::read_to_string(format!("{root}/events.ndjson"))?
+            .lines()
+            .map(serde_json::from_str)
+            .collect::<Result<_, _>>()?)
+    }
+
+    /// Each event's `(boot, seq, e)`, compact.
+    fn positions(lines: &[Value]) -> String {
+        lines
+            .iter()
+            .map(|event| format!("{}:{} {}", event["boot"], event["seq"], event["e"]))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Lines read from `conn` until end of stream, parsed.
+    fn drain(conn: &mut BufReader<UnixStream>) -> Result<Vec<Value>, Box<dyn Error>> {
+        Ok(conn
+            .lines()
+            .map_while(Result::ok)
+            .map(|line| serde_json::from_str(&line))
+            .collect::<Result<_, _>>()?)
+    }
+
+    /// A stand-in daemon at `<root>/run/rift.sock` for one connection: each of `replies`
+    /// answers the next line it reads.
+    fn fake(root: &str, replies: &[&str]) -> Outcome {
+        fs::create_dir_all(format!("{root}/run"))?;
+        drop(fs::remove_file(format!("{root}/run/rift.sock")));
+        let listener = UnixListener::bind(format!("{root}/run/rift.sock"))?;
+        let owned: Vec<String> = replies.iter().map(|&reply| reply.to_owned()).collect();
+        drop(thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                let mut conn = BufReader::new(stream);
+                for reply in owned {
+                    drop(next(&mut conn));
+                    drop(conn.get_mut().write_all(format!("{reply}\n").as_bytes()));
+                }
+            }
+        }));
+        Ok(())
+    }
+
+    /// The daemon's life: the ready line, an absent root and `run/` made 0700, a socket and its pid, a second
+    /// instance refused and logged, `status` and `version`, every error code, `id` echoed, quiet's
+    /// idempotence, a failed append answered `io` with health `degraded` until the next append,
+    /// then a SIGTERM drain under an open connection: `stopping` in its health and for any other
+    /// request, the `stop` event, exit 0 once it closes, the pid file and socket gone, start,
+    /// refusal, degradation and exit logged.
+    #[test]
+    fn life() -> Outcome {
+        let (root, built) = (format!("{}/root", temp("life")?), version()?);
+        let (mut daemon, ready) = serve(&root, &[])?;
+        let pid = daemon.0.id();
+        let since = ready["since"].as_str().unwrap_or_default().to_owned();
+        let health = json!({"boot": 1u8, "ok": true, "pid": pid, "proto": 1u8, "quiet": false, "seq": 1u8, "since": since, "state": "ready", "version": built});
+        same(&ready.to_string(), &health.to_string())?;
+        same(&since.len().to_string(), "24")?;
+        for dir in [root.clone(), format!("{root}/run")] {
+            same(&format!("{:o}", fs::metadata(dir)?.mode() & 0o777), "700")?;
+        }
+        same(
+            &fs::read_to_string(format!("{root}/run/serve.pid"))?,
+            &pid.to_string(),
+        )?;
+        same(
+            &fs::metadata(format!("{root}/run/rift.sock"))?
+                .file_type()
+                .is_socket()
+                .to_string(),
+            "true",
+        )?;
+        same(
+            &rift(&root, &[], &["serve"])?,
+            &format!("1\nrift serve: already running (pid {pid}, by its pid file)\n"),
+        )?;
+        same(&rift(&root, &[], &["status"])?, &format!("0\n{health}\n"))?;
+        same(&rift(&root, &[], &["version"])?, &format!("0\n{built}\n"))?;
+        let hello = json!({"boot": 1u8, "id": 7u8, "ok": true, "pid": pid, "proto": 1u8, "since": since, "state": "ready", "version": built});
+        same(
+            &say(
+                &mut dial(&root)?,
+                r#"{"client":"test/1","id":7,"op":"hello","proto":1}"#,
+            )?,
+            &hello.to_string(),
+        )?;
+        // a refused first line is answered, then the connection closed
+        for (first, reply) in [
+            (
+                "not json",
+                r#"{"code":"bad_request","ok":false}"#.to_owned(),
+            ),
+            (
+                r#"{"op":"health"}"#,
+                r#"{"code":"bad_request","ok":false}"#.to_owned(),
+            ),
+            (
+                r#"{"op":"hello","proto":1}"#,
+                r#"{"code":"bad_request","ok":false}"#.to_owned(),
+            ),
+            (
+                r#"{"client":"test/1","op":"hello","proto":2}"#,
+                format!(r#"{{"code":"proto","ok":false,"proto":1,"version":"{built}"}}"#),
+            ),
+        ] {
+            let mut conn = dial(&root)?;
+            same(&say(&mut conn, first)?, &reply)?;
+            same(&next(&mut conn)?, "")?;
+        }
+        let mut conn = greet(&root)?;
+        for (line, reply) in [
+            ("[]", r#"{"code":"bad_request","ok":false}"#),
+            ("{}", r#"{"code":"bad_request","ok":false}"#),
+            (
+                r#"{"id":[1],"op":"health"}"#,
+                r#"{"code":"bad_request","ok":false}"#,
+            ),
+            (
+                r#"{"id":"a","op":"nope"}"#,
+                r#"{"code":"unknown_op","id":"a","ok":false}"#,
+            ),
+            (HELLO, r#"{"code":"unknown_op","ok":false}"#),
+            (r#"{"op":"quiet"}"#, r#"{"code":"bad_request","ok":false}"#),
+            (
+                r#"{"on":1,"op":"quiet"}"#,
+                r#"{"code":"bad_request","ok":false}"#,
+            ),
+            (r#"{"op":"feed"}"#, r#"{"code":"bad_request","ok":false}"#),
+            (
+                r#"{"after":{"boot":1},"op":"feed"}"#,
+                r#"{"code":"bad_request","ok":false}"#,
+            ),
+            (
+                r#"{"id":2,"on":true,"op":"quiet"}"#,
+                r#"{"changed":true,"id":2,"ok":true,"seq":2}"#,
+            ),
+            (
+                r#"{"on":true,"op":"quiet"}"#,
+                r#"{"changed":false,"ok":true,"seq":2}"#,
+            ),
+        ] {
+            same(&say(&mut conn, line)?, reply)?;
+        }
+        let quieted = json!({"boot": 1u8, "ok": true, "pid": pid, "proto": 1u8, "quiet": true, "seq": 2u8, "since": since, "state": "ready", "version": built});
+        // a line of exactly 65 536 bytes is read; one byte more is too long, and closes
+        let pad = |len: usize| format!(r#"{{"op":"health","pad":"{}"}}"#, "x".repeat(len - 24));
+        same(&say(&mut conn, &pad(0x1_0000))?, &quieted.to_string())?;
+        same(
+            &say(&mut conn, &pad(0x1_0001))?,
+            r#"{"code":"too_long","ok":false}"#,
+        )?;
+        same(&next(&mut conn)?, "")?;
+        same(
+            &rift(&root, &[], &["quiet", "off"])?,
+            "0\n{\"changed\":true,\"ok\":true,\"seq\":3}\n",
+        )?;
+        // the log opens but refuses the write (a device that takes none): the event did not
+        // happen, and nothing changed
+        let (log, aside) = (
+            format!("{root}/events.ndjson"),
+            format!("{root}/held.ndjson"),
+        );
+        fs::rename(&log, &aside)?;
+        symlink("/dev/urandom", &log)?;
+        same(
+            &rift(&root, &[], &["quiet", "on"])?,
+            "1\n{\"code\":\"io\",\"ok\":false}\n",
+        )?;
+        let degraded = json!({"boot": 1u8, "ok": true, "pid": pid, "proto": 1u8, "quiet": false, "seq": 3u8, "since": since, "state": "degraded", "version": built});
+        same(&rift(&root, &[], &["status"])?, &format!("0\n{degraded}\n"))?;
+        fs::rename(&aside, &log)?;
+        same(
+            &rift(&root, &[], &["quiet", "on"])?,
+            "0\n{\"changed\":true,\"ok\":true,\"seq\":4}\n",
+        )?;
+        let healed: Value =
+            serde_json::from_str(rift(&root, &[], &["status"])?.trim_start_matches("0\n"))?;
+        same(&healed["state"].to_string(), r#""ready""#)?;
+        let mut held = greet(&root)?;
+        same(&signal(&daemon, "TERM")?, "")?;
+        let begun = Instant::now();
+        while !fs::read_to_string(&log)?.contains("\"stop\"") {
+            if begun.elapsed() > Duration::from_secs(10) {
+                return Err("no stop event".into());
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let stopping: Value = serde_json::from_str(&say(&mut held, r#"{"op":"health"}"#)?)?;
+        same(&stopping["state"].to_string(), r#""stopping""#)?;
+        same(
+            &say(&mut held, r#"{"on":true,"op":"quiet"}"#)?,
+            r#"{"code":"stopping","ok":false}"#,
+        )?;
+        same(
+            &say(&mut held, r#"{"op":"shutdown"}"#)?,
+            r#"{"code":"stopping","ok":false}"#,
+        )?;
+        drop(held);
+        same(&format!("{:?}", daemon.0.wait()?.code()), "Some(0)")?;
+        same(
+            &positions(&events(&root)?),
+            &format!(
+                "1:1 {{\"kind\":\"boot\",\"pid\":{pid},\"version\":\"{built}\"}}\n1:2 {{\"kind\":\"quiet\",\"on\":true}}\n1:3 {{\"kind\":\"quiet\",\"on\":false}}\n1:4 {{\"kind\":\"quiet\",\"on\":true}}\n1:5 {{\"kind\":\"stop\",\"reason\":\"signal TERM\"}}"
+            ),
+        )?;
+        same(
+            &format!(
+                "{} {}",
+                fs::exists(format!("{root}/run/serve.pid"))?,
+                fs::exists(format!("{root}/run/rift.sock"))?
+            ),
+            "false false",
+        )?;
+        let logged: Vec<Value> = fs::read_to_string(format!("{root}/run/serve.log"))?
+            .lines()
+            .map(serde_json::from_str)
+            .collect::<Result<_, _>>()?;
+        same(
+            &logged
+                .iter()
+                .map(|line| {
+                    let mut bare = line.clone();
+                    drop(bare.as_object_mut().and_then(|map| map.remove("at")));
+                    bare.to_string()
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            &format!(
+                "{{\"event\":\"start\",\"pid\":{pid},\"version\":\"{built}\"}}\n{{\"event\":\"refused\",\"reason\":\"already running (pid {pid}, by its pid file)\"}}\n{{\"event\":\"degraded\",\"reason\":\"Operation not permitted (os error 1)\"}}\n{{\"event\":\"exit\",\"reason\":\"signal TERM\"}}"
+            ),
+        )
+    }
+
+    /// `kill -<signal>` to `daemon`, not waiting: `kill`'s stderr, empty when delivered.
+    fn signal(daemon: &Daemon, name: &str) -> Result<String, Box<dyn Error>> {
+        let out = Command::new("kill")
+            .args([format!("-{name}"), daemon.0.id().to_string()])
+            .output()?;
+        Ok(String::from_utf8(out.stderr)?)
+    }
+
+    /// An append the disk fills partway through (a full HFS+ image of 4 KiB blocks, 10 bytes
+    /// left in the log's last one) is answered `io` and cut back, the log byte for byte what it
+    /// was; once there is room, the next append is a whole line after it.
+    #[test]
+    fn torn() -> Outcome {
+        let dir = temp("torn")?;
+        let (root, vol) = (format!("{dir}/root"), format!("{dir}/vol"));
+        let image = format!("{dir}/disk.dmg");
+        for args in [
+            &[
+                "create", "-size", "1m", "-fs", "HFS+", "-fsargs", "-b 4096", &image,
+            ][..],
+            &["attach", "-nobrowse", "-mountpoint", &vol, &image],
+        ] {
+            let out = Command::new("hdiutil").args(args).output()?;
+            same(&out.status.success().to_string(), "true")?;
+        }
+        let _volume = Volume(vol.clone());
+        let (_daemon, _) = serve(&root, &[])?;
+        let (log, disk) = (
+            format!("{root}/events.ndjson"),
+            format!("{vol}/events.ndjson"),
+        );
+        let mut kept = fs::read(&log)?;
+        // the boot line, padded to 10 bytes short of its first block
+        kept.resize(4086, b'\n');
+        fs::write(&disk, &kept)?;
+        fs::remove_file(&log)?;
+        symlink(&disk, &log)?;
+        let mut fill = File::create(format!("{vol}/fill"))?;
+        for chunk in [0x1_0000, 0x1000] {
+            let bytes = vec![0; chunk];
+            while matches!(fill.write(&bytes), Ok(1..)) {}
+        }
+        drop(fill);
+        same(
+            &rift(&root, &[], &["quiet", "on"])?,
+            "1\n{\"code\":\"io\",\"ok\":false}\n",
+        )?;
+        same(&(fs::read(&disk)? == kept).to_string(), "true")?;
+        fs::remove_file(format!("{vol}/fill"))?;
+        same(
+            &rift(&root, &[], &["quiet", "on"])?,
+            "0\n{\"changed\":true,\"ok\":true,\"seq\":2}\n",
+        )?;
+        let after = fs::read(&disk)?;
+        let line: Value = serde_json::from_slice(after.strip_prefix(&*kept).ok_or("rewritten")?)?;
+        same(&positions(&[line]), r#"1:2 {"kind":"quiet","on":true}"#)
+    }
+
+    /// SIGTERM, SIGINT and SIGHUP each drain to exit 0 and append `stop` with the signal's name,
+    /// and so does the shutdown request; `boot` counts each start; a connection left open is cut
+    /// once the drain budget is spent; the diagnostic log and launchd's `serve.err` rotate at
+    /// their cap.
+    #[test]
+    fn stops() -> Outcome {
+        let root = temp("stops")?;
+        let envs = [("RIFT_DRAIN_MS", "200"), ("RIFT_LOG_CAP", "1")];
+        fs::write(format!("{root}/serve.err"), "launchd's")?;
+        for (boot, name) in ["TERM", "INT", "HUP"].into_iter().enumerate() {
+            let (mut daemon, ready) = serve(&root, &envs)?;
+            same(&ready["boot"].to_string(), &(boot + 1).to_string())?;
+            let mut idle = greet(&root)?;
+            let begun = Instant::now();
+            same(&signal(&daemon, name)?, "")?;
+            same(&format!("{:?}", daemon.0.wait()?.code()), "Some(0)")?;
+            same(
+                &(begun.elapsed() >= Duration::from_millis(200)).to_string(),
+                "true",
+            )?;
+            same(&next(&mut idle)?, "")?;
+            let last = events(&root)?.pop().ok_or("no events")?;
+            same(
+                &last["e"].to_string(),
+                &format!(r#"{{"kind":"stop","reason":"signal {name}"}}"#),
+            )?;
+        }
+        let (mut daemon, ready) = serve(&root, &envs)?;
+        same(&ready["boot"].to_string(), "4")?;
+        same(
+            &say(&mut greet(&root)?, r#"{"id":"x","op":"shutdown"}"#)?,
+            r#"{"id":"x","ok":true}"#,
+        )?;
+        same(&format!("{:?}", daemon.0.wait()?.code()), "Some(0)")?;
+        let last = events(&root)?.pop().ok_or("no events")?;
+        same(
+            &last["e"].to_string(),
+            r#"{"kind":"stop","reason":"shutdown request"}"#,
+        )?;
+        let tail = |file: &str| -> Result<String, Box<dyn Error>> {
+            let line: Value =
+                serde_json::from_str(fs::read_to_string(format!("{root}/run/{file}"))?.trim())?;
+            Ok(format!("{} {}", line["event"], line["reason"]))
+        };
+        same(&tail("serve.log")?, r#""exit" "shutdown request""#)?;
+        same(&tail("serve.log.1")?, r#""start" null"#)?;
+        same(
+            &format!(
+                "{} {}",
+                fs::read_to_string(format!("{root}/serve.err.1"))?,
+                fs::exists(format!("{root}/serve.err"))?
+            ),
+            "launchd's false",
+        )
+    }
+
+    /// A stop signal during the boot (here, sent before the long log is read, the pid file not
+    /// yet written) is held until the daemon is up, then drains like any other: exit 0, the
+    /// `stop` event, the exit line.
+    #[test]
+    fn booting() -> Outcome {
+        let root = temp("booting")?;
+        let line = format!(
+            "{}\n",
+            json!({"boot": 1u8, "e": {"kind": "quiet", "on": false}, "seq": 1u8, "t": "2026-11-22T18:09:40.118Z"})
+        );
+        fs::write(format!("{root}/events.ndjson"), line.repeat(200_000))?;
+        let mut daemon = Daemon(
+            Command::new(env!("CARGO_BIN_EXE_rift"))
+                .env("RIFT_ROOT", &root)
+                .arg("serve")
+                .stdout(Stdio::null())
+                .spawn()?,
+        );
+        // frozen once the socket is bound, before the log is read: the TERM is pending mid-boot
+        let begun = Instant::now();
+        while !fs::exists(format!("{root}/run/serve.new"))? {
+            if begun.elapsed() > Duration::from_secs(10) {
+                return Err("never bound".into());
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        same(&signal(&daemon, "STOP")?, "")?;
+        same(
+            &fs::exists(format!("{root}/run/serve.pid"))?.to_string(),
+            "false",
+        )?;
+        same(&signal(&daemon, "TERM")?, "")?;
+        same(&signal(&daemon, "CONT")?, "")?;
+        same(&format!("{:?}", daemon.0.wait()?.code()), "Some(0)")?;
+        same(
+            &events(&root)?.pop().ok_or("no events")?["e"].to_string(),
+            r#"{"kind":"stop","reason":"signal TERM"}"#,
+        )?;
+        same(
+            &fs::read_to_string(format!("{root}/run/serve.log"))?
+                .contains(r#""event":"exit","reason":"signal TERM""#)
+                .to_string(),
+            "true",
+        )
+    }
+
+    /// A SIGKILL leaves a stale pid file and socket and, here, a torn last line; the next boot
+    /// cuts the line, counts boot 2 and keeps quiet; feeds replay from null, resume from a
+    /// position across the restart, reset on a position the log does not hold, go live, and end
+    /// with `stop`; `rift feed` is a real client of the same; a third boot takes the last quiet.
+    #[test]
+    fn recover() -> Outcome {
+        let root = temp("recover")?;
+        let (mut daemon, _) = serve(&root, &[])?;
+        same(
+            &rift(&root, &[], &["quiet", "on"])?,
+            "0\n{\"changed\":true,\"ok\":true,\"seq\":2}\n",
+        )?;
+        daemon.0.kill()?;
+        let _: ExitStatus = daemon.0.wait()?;
+        same(
+            &format!(
+                "{} {}",
+                fs::exists(format!("{root}/run/serve.pid"))?,
+                fs::exists(format!("{root}/run/rift.sock"))?
+            ),
+            "true true",
+        )?;
+        OpenOptions::new()
+            .append(true)
+            .open(format!("{root}/events.ndjson"))?
+            .write_all(br#"{"boot":1,"e":{"ki"#)?;
+        let (mut again, ready) = serve(&root, &[])?;
+        same(
+            &format!("{} {} {}", ready["boot"], ready["quiet"], ready["seq"]),
+            "2 true 1",
+        )?;
+        let pid = ready["pid"].clone();
+        let built = version()?;
+        let boot2 = format!("2:1 {{\"kind\":\"boot\",\"pid\":{pid},\"version\":\"{built}\"}}");
+        same(
+            &positions(&events(&root)?),
+            &format!(
+                "1:1 {{\"kind\":\"boot\",\"pid\":{},\"version\":\"{built}\"}}\n1:2 {{\"kind\":\"quiet\",\"on\":true}}\n{boot2}",
+                events(&root)?.first().ok_or("empty")?["e"]["pid"]
+            ),
+        )?;
+        let mut feeds = Vec::new();
+        for (after, reset, replay) in [
+            ("null", false, boot2.clone()),
+            (
+                r#"{"boot":1,"seq":1}"#,
+                false,
+                format!("1:2 {{\"kind\":\"quiet\",\"on\":true}}\n{boot2}"),
+            ),
+            (r#"{"boot":9,"seq":9}"#, true, boot2.clone()),
+            (r#"{"boot":2,"seq":1}"#, false, String::new()),
+        ] {
+            let mut conn = greet(&root)?;
+            same(
+                &say(&mut conn, &format!(r#"{{"after":{after},"op":"feed"}}"#))?,
+                &format!(r#"{{"ok":true,"reset":{reset}}}"#),
+            )?;
+            feeds.push((conn, replay));
+        }
+        let cli = |after: &str| {
+            Command::new(env!("CARGO_BIN_EXE_rift"))
+                .env("RIFT_ROOT", &root)
+                .args(["feed", "--after", after])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+        };
+        same(
+            &rift(&root, &[], &["quiet", "off"])?,
+            "0\n{\"changed\":true,\"ok\":true,\"seq\":2}\n",
+        )?;
+        // a CLI feed has subscribed once its first line arrives
+        let (mut held, mut lost) = (cli("2:1")?, cli("9:9")?);
+        let mut outs = Vec::new();
+        for child in [&mut held, &mut lost] {
+            let mut out = BufReader::new(child.stdout.take().ok_or("stdout")?);
+            let mut first = String::new();
+            let _: usize = out.read_line(&mut first)?;
+            outs.push((first, out));
+        }
+        same(
+            &say(&mut greet(&root)?, r#"{"op":"shutdown"}"#)?,
+            r#"{"ok":true}"#,
+        )?;
+        let rest = "2:2 {\"kind\":\"quiet\",\"on\":false}\n2:3 {\"kind\":\"stop\",\"reason\":\"shutdown request\"}";
+        for (mut conn, replay) in feeds {
+            same(
+                &positions(&drain(&mut conn)?),
+                &[replay.as_str(), rest]
+                    .into_iter()
+                    .filter(|part| !part.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )?;
+        }
+        let mut printed = Vec::new();
+        for (first, out) in outs {
+            let lines: Vec<Value> = iter::once(first)
+                .chain(out.lines().map_while(Result::ok))
+                .map(|line| serde_json::from_str(&line))
+                .collect::<Result<_, _>>()?;
+            printed.push(positions(&lines));
+        }
+        same(
+            &printed.join("\n--\n"),
+            &format!("{rest}\n--\n{boot2}\n{rest}"),
+        )?;
+        let mut said = String::new();
+        let _: usize =
+            io::Read::read_to_string(&mut lost.stderr.take().ok_or("stderr")?, &mut said)?;
+        same(
+            &said,
+            "rift feed: the log does not hold that position; from this boot's first event\n",
+        )?;
+        same(
+            &format!(
+                "{:?} {:?} {:?}",
+                held.wait()?.code(),
+                lost.wait()?.code(),
+                again.0.wait()?.code()
+            ),
+            "Some(0) Some(0) Some(0)",
+        )?;
+        let (_last, third) = serve(&root, &[])?;
+        same(&format!("{} {}", third["boot"], third["quiet"]), "3 false")
+    }
+
+    /// Running out of descriptors skips connections, never stops the daemon: under three
+    /// consecutive fd limits one makes `accept` itself fail (EMFILE), and each serves on after.
+    #[test]
+    fn exhaust() -> Outcome {
+        for limit in 28u8..=30 {
+            let root = temp(&format!("exhaust{limit}"))?;
+            let mut daemon = Daemon(
+                Command::new("sh")
+                    .args(["-c", &format!(r#"ulimit -n {limit}; exec "$0" serve"#)])
+                    .arg(env!("CARGO_BIN_EXE_rift"))
+                    .env("RIFT_ROOT", &root)
+                    .stdout(Stdio::piped())
+                    .spawn()?,
+            );
+            let mut ready = String::new();
+            let _: usize =
+                BufReader::new(daemon.0.stdout.take().ok_or("stdout")?).read_line(&mut ready)?;
+            let held = iter::repeat_with(|| dial(&root))
+                .take(15)
+                .collect::<io::Result<Vec<_>>>()?;
+            thread::sleep(Duration::from_millis(300));
+            drop(held);
+            thread::sleep(Duration::from_millis(300));
+            same(
+                &format!("{limit} {:?}", daemon.0.try_wait()?),
+                &format!("{limit} None"),
+            )?;
+            let health: Value =
+                serde_json::from_str(&say(&mut greet(&root)?, r#"{"op":"health"}"#)?)?;
+            same(
+                &format!("{limit} {}", health["state"]),
+                &format!("{limit} \"ready\""),
+            )?;
+            same(&signal(&daemon, "TERM")?, "")?;
+            same(
+                &format!("{limit} {:?}", daemon.0.wait()?.code()),
+                &format!("{limit} Some(0)"),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// A feed whose client hangs up is closed at once, not at the next event: twenty feeds opened
+    /// and dropped in turn with no event between fit under a 30-descriptor limit.
+    #[test]
+    fn hangup() -> Outcome {
+        let root = temp("hangup")?;
+        let mut daemon = Daemon(
+            Command::new("sh")
+                .args(["-c", r#"ulimit -n 30; exec "$0" serve"#])
+                .arg(env!("CARGO_BIN_EXE_rift"))
+                .env("RIFT_ROOT", &root)
+                .stdout(Stdio::piped())
+                .spawn()?,
+        );
+        let mut ready = String::new();
+        let _: usize =
+            BufReader::new(daemon.0.stdout.take().ok_or("stdout")?).read_line(&mut ready)?;
+        for _ in 0u8..20 {
+            let mut feed = greet(&root)?;
+            same(
+                &say(&mut feed, r#"{"after":null,"op":"feed"}"#)?,
+                r#"{"ok":true,"reset":false}"#,
+            )?;
+            drop(next(&mut feed)?);
+            drop(feed);
+            thread::sleep(Duration::from_millis(50));
+        }
+        same(&signal(&daemon, "TERM")?, "")?;
+        same(&format!("{:?}", daemon.0.wait()?.code()), "Some(0)")
+    }
+
+    /// A feed subscribed while another connection toggles quiet sees every event once, in order:
+    /// the replay meets the live events with no gap and no duplicate.
+    #[test]
+    fn seamless() -> Outcome {
+        let root = temp("seamless")?;
+        let (mut daemon, _) = serve(&root, &[])?;
+        let (halfway, waited) = mpsc::channel();
+        let mut toggling = greet(&root)?;
+        // the feed subscribes a quarter of the way through the toggles; the scope waits out the rest
+        let mut feed = thread::scope(|scope| -> Result<_, Box<dyn Error>> {
+            drop(scope.spawn(move || {
+                for (turn, on) in [true, false].into_iter().cycle().take(400).enumerate() {
+                    if turn == 100 {
+                        halfway.send(()).unwrap_or_default();
+                    }
+                    drop(say(
+                        &mut toggling,
+                        &format!(r#"{{"on":{on},"op":"quiet"}}"#),
+                    ));
+                }
+            }));
+            waited.recv()?;
+            let mut feed = greet(&root)?;
+            same(
+                &say(&mut feed, r#"{"after":null,"op":"feed"}"#)?,
+                r#"{"ok":true,"reset":false}"#,
+            )?;
+            Ok(feed)
+        })?;
+        same(&signal(&daemon, "TERM")?, "")?;
+        let seqs: Vec<String> = drain(&mut feed)?
+            .iter()
+            .map(|event| event["seq"].to_string())
+            .collect();
+        same(&format!("{:?}", daemon.0.wait()?.code()), "Some(0)")?;
+        same(
+            &seqs.join(","),
+            &(1..=402)
+                .map(|seq| seq.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+        )
+    }
+
+    /// A feed client that stops reading is dropped once it is more than 1024 events behind; the
+    /// daemon serves on, and the client resumes from its last position.
+    #[test]
+    fn slow() -> Outcome {
+        let root = temp("slow")?;
+        let (mut daemon, _) = serve(&root, &[])?;
+        let mut feed = greet(&root)?;
+        same(
+            &say(&mut feed, r#"{"after":null,"op":"feed"}"#)?,
+            r#"{"ok":true,"reset":false}"#,
+        )?;
+        let mut conn = greet(&root)?;
+        for on in [true, false].into_iter().cycle().take(5000) {
+            drop(say(&mut conn, &format!(r#"{{"on":{on},"op":"quiet"}}"#))?);
+        }
+        let got = drain(&mut feed)?;
+        let last = got.last().ok_or("nothing fed")?;
+        same(&(got.len() < 5001).to_string(), "true")?;
+        let mut again = greet(&root)?;
+        same(
+            &say(
+                &mut again,
+                &format!(
+                    r#"{{"after":{{"boot":1,"seq":{}}},"op":"feed"}}"#,
+                    last["seq"]
+                ),
+            )?,
+            r#"{"ok":true,"reset":false}"#,
+        )?;
+        same(&signal(&daemon, "TERM")?, "")?;
+        let rest = drain(&mut again)?;
+        same(&format!("{:?}", daemon.0.wait()?.code()), "Some(0)")?;
+        same(
+            &format!("{} {}", rest.first().ok_or("no resume")?["seq"], rest.len()),
+            &format!(
+                "{} {}",
+                last["seq"].as_u64().unwrap_or_default() + 1,
+                5002 - last["seq"].as_u64().unwrap_or_default()
+            ),
+        )
+    }
+
+    /// `serve` refuses a socket path over 103 bytes and a `run/` others can reach; a panic (the
+    /// ready line into a closed stdout) is logged before the process dies.
+    #[test]
+    fn refuse() -> Outcome {
+        let root = temp("refuse")?;
+        let deep = format!("{root}/{}", "x".repeat(90));
+        same(
+            &rift(&deep, &[], &["serve"])?,
+            &format!(
+                "1\nrift serve: {deep}/run/rift.sock is over a unix socket's 103 bytes; shorten RIFT_ROOT\n"
+            ),
+        )?;
+        let run = format!("{root}/run");
+        fs::create_dir_all(&run)?;
+        fs::set_permissions(&run, Permissions::from_mode(0o755))?;
+        same(
+            &rift(&root, &[], &["serve"])?,
+            &format!("1\nrift serve: {run} must be this user's, mode 0700\n"),
+        )?;
+        same(
+            &fs::read_to_string(format!("{run}/serve.log"))?
+                .contains(&format!(
+                    r#""event":"refused","reason":"{run} must be this user's, mode 0700""#
+                ))
+                .to_string(),
+            "true",
+        )?;
+        fs::set_permissions(&run, Permissions::from_mode(0o700))?;
+        // an unwritable pid file refuses before the boot event and the socket's rename
+        fs::create_dir_all(format!("{run}/serve.pid"))?;
+        same(
+            &format!(
+                "{} {} {:?}",
+                rift(&root, &[], &["serve"])?,
+                fs::exists(format!("{run}/rift.sock"))?,
+                fs::read_to_string(format!("{root}/events.ndjson"))?
+            ),
+            "1\nrift serve: Is a directory (os error 21)\n false \"\"",
+        )?;
+        fs::remove_dir(format!("{run}/serve.pid"))?;
+        let (reader, writer) = io::pipe()?;
+        drop(reader);
+        let out = Command::new(env!("CARGO_BIN_EXE_rift"))
+            .env("RIFT_ROOT", &root)
+            .arg("serve")
+            .stdout(writer)
+            .output()?;
+        let log = fs::read_to_string(format!("{run}/serve.log"))?;
+        same(
+            &format!(
+                "{:?} {} {}",
+                out.status.code(),
+                log.contains(r#","event":"panic","reason":"panicked at "#),
+                log.contains("failed printing to stdout")
+            ),
+            "Some(101) true true",
+        )
+    }
+
+    /// The clients: down without a daemon, usage on a bad line, the one-line protocol mismatch,
+    /// another refused hello printed as it came, a version mismatch named beside the health, a
+    /// refused request printed with exit 1, and `unknown` for a request sent but never answered.
+    #[test]
+    fn clients() -> Outcome {
+        let (root, built) = (temp("clients")?, version()?);
+        for args in [&["status"][..], &["quiet", "on"], &["feed"]] {
+            same(
+                &rift(&root, &[], args)?,
+                "1\n{\"code\":\"down\",\"ok\":false}\n",
+            )?;
+        }
+        let usage = "2\nusage: rift serve | status | quiet on|off | feed [--after <boot>:<seq>] | setup [--print | --remove] | upgrade [--check | --back | --retry] | version\n";
+        for args in [
+            &[][..],
+            &["quiet", "maybe"],
+            &["feed", "--after", "1"],
+            &["feed", "--after", "a:1"],
+            &["setup", "--now"],
+            &["nope"],
+        ] {
+            same(&rift(&root, &[], args)?, usage)?;
+        }
+        fake(
+            &root,
+            &[r#"{"code":"proto","ok":false,"proto":2,"version":"9.9.9-new"}"#],
+        )?;
+        same(
+            &rift(&root, &[], &["status"])?,
+            &format!(
+                "1\nrift status: the daemon speaks protocol 2 (9.9.9-new), this client protocol 1 ({built}); fix: rift setup, so both are one release\n"
+            ),
+        )?;
+        fake(
+            &root,
+            &[
+                r#"{"ok":true,"version":"0.0.0-old"}"#,
+                r#"{"ok":true,"state":"ready"}"#,
+            ],
+        )?;
+        same(
+            &rift(&root, &[], &["status"])?,
+            &format!(
+                "0\n{{\"ok\":true,\"state\":\"ready\"}}\nrift status: the daemon is 0.0.0-old, this client {built}; fix: rift setup\n"
+            ),
+        )?;
+        fake(&root, &[r#"{"code":"bad_request","ok":false}"#])?;
+        same(
+            &rift(&root, &[], &["status"])?,
+            "1\n{\"code\":\"bad_request\",\"ok\":false}\n",
+        )?;
+        let greeted = format!(r#"{{"ok":true,"version":"{built}"}}"#);
+        fake(&root, &[&greeted, r#"{"code":"stopping","ok":false}"#])?;
+        same(
+            &rift(&root, &[], &["feed"])?,
+            "1\n{\"code\":\"stopping\",\"ok\":false}\n",
+        )?;
+        // the hello answered, the request read, then the connection ends with no reply
+        fake(&root, &[&greeted])?;
+        same(
+            &rift(&root, &[], &["quiet", "on"])?,
+            "1\n{\"code\":\"unknown\",\"ok\":false}\n",
+        )
+    }
+
+    /// `setup --print` prints the plist on hotswap's link and writes nothing; without `launchctl`
+    /// nothing is written; against a stub `launchctl` (`launchctl.log` its calls and, at each
+    /// bootstrap, the root's mode when it is 0700; `loaded/` its jobs; a bootout letting go one
+    /// `print` later) over a HOME hotswap already laid out, it retires an earlier install (another
+    /// label running the link's `serve`), moving its root here while this one is absent and
+    /// leaving it otherwise, has hotswap link `~/.local/bin/rift` and load the upgrade agent,
+    /// makes the root 0700 before the agent loads, bootstraps a new plist, kickstarts the same one
+    /// loaded (its respawn held back a second, as by `ThrottleInterval`), reloads a changed one,
+    /// returns only once the loaded daemon answers health ready, fails on a failed bootstrap, a
+    /// job still loaded past `$RIFT_BOOTOUT_MS` or none ready past `$RIFT_READY_MS`; `upgrade`
+    /// swaps under the manifest, green once the swapped daemon answers with the new version;
+    /// `--remove` has hotswap forget the layout and the upgrade agent, then boots the daemon and
+    /// any earlier install out and removes their plists and the link.
+    #[test]
+    fn setup() -> Outcome {
+        let root = temp("setup")?;
+        let (home, bin) = (format!("{root}/home"), format!("{root}/bin"));
+        let file = format!("{home}/Library/LaunchAgents/dev.gigantic.rift.plist");
+        let exe = format!("{home}/.local/bin/rift");
+        let plist = |data: &str| {
+            format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>EnvironmentVariables</key>
+  <dict><key>RIFT_ROOT</key><string>{data}</string></dict>
+  <key>ExitTimeOut</key>
+  <integer>3</integer>
+  <key>KeepAlive</key>
+  <dict><key>SuccessfulExit</key><false/></dict>
+  <key>Label</key>
+  <string>dev.gigantic.rift</string>
+  <key>ProgramArguments</key>
+  <array><string>{exe}</string><string>serve</string></array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardErrorPath</key>
+  <string>{data}/serve.err</string>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+</dict>
+</plist>
+"#
+            )
+        };
+        let data = format!("{root}/data");
+        let run = |path: &str, envs: &[(&str, &str)], args: &[&str]| {
+            rift(
+                &data,
+                &[
+                    &[
+                        ("HOME", home.as_str()),
+                        ("HOTSWAP_TEST_HOME", home.as_str()),
+                        ("PATH", path),
+                    ],
+                    envs,
+                ]
+                .concat(),
+                &[&["setup"], args].concat(),
+            )
+        };
+        same(
+            &run("/usr/bin:/bin", &[], &["--print"])?,
+            &format!("0\n{}", plist(&data)),
+        )?;
+        // no RIFT_ROOT: the default under HOME
+        let out = Command::new(env!("CARGO_BIN_EXE_rift"))
+            .env("HOME", &home)
+            .env_remove("RIFT_ROOT")
+            .args(["setup", "--print"])
+            .output()?;
+        same(
+            &String::from_utf8(out.stdout)?,
+            &plist(&format!("{home}/.local/state/rift")),
+        )?;
+        // a relative RIFT_ROOT: made absolute against where setup ran, as launchd runs from /
+        let relative = Command::new(env!("CARGO_BIN_EXE_rift"))
+            .current_dir(&root)
+            .env("HOME", &home)
+            .env("RIFT_ROOT", "data")
+            .args(["setup", "--print"])
+            .output()?;
+        same(&String::from_utf8(relative.stdout)?, &plist(&data))?;
+        same(
+            &run("/usr/bin", &[], &[])?,
+            "1\nrift setup: launchctl: No such file or directory (os error 2) (setup installs a launchd agent, macOS only; --print prints the plist)\n",
+        )?;
+        same(&fs::exists(&home)?.to_string(), "false")?;
+        fs::create_dir_all(&bin)?;
+        fs::create_dir_all(format!("{root}/loaded"))?;
+        fs::write(
+            format!("{bin}/launchctl"),
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> {root}/launchctl.log
+job=${{2##*/}}
+start() {{ [ -f {root}/dead ] && return; RIFT_ROOT=$(sed -n 's|.*<key>RIFT_ROOT</key><string>\(.*\)</string>.*|\1|p' $1) {serve} serve >/dev/null 2>&1 & echo $! > {root}/loaded/$(basename $1 .plist); }}
+case $1 in
+print) [ -f {root}/loaded/$job.going ] && {{ rm {root}/loaded/$job.going; exit 0; }}; [ -f {root}/loaded/$job ] || exit 113;;
+bootout) kill $(cat {root}/loaded/$job) 2>/dev/null; [ -f {root}/stuck ] || mv {root}/loaded/$job {root}/loaded/$job.going;;
+bootstrap) case $3 in *.upgrade.plist) touch {root}/loaded/$(basename $3 .plist); exit;; esac; held=$(sed -n 's|.*<key>RIFT_ROOT</key><string>\(.*\)</string>.*|\1|p' $3); [ -n "$(find "$held" -maxdepth 0 -perm 700)" ] && echo root 0700 >> {root}/launchctl.log; [ -f {root}/fail ] && {{ echo 'Bootstrap failed: 5: Input/output error' >&2; exit 5; }}; start $3;;
+kickstart) kill $(cat {root}/loaded/${{3##*/}}); {{ sleep 1; start {file}; }} >/dev/null 2>&1 &;;
+esac
+"#,
+                serve = env!("CARGO_BIN_EXE_rift")
+            ),
+        )?;
+        fs::write(
+            format!("{bin}/curl"),
+            "#!/bin/sh\nprintf https://github.com/jgeschwendt/rift/releases/tag/v1\n",
+        )?;
+        for tool in ["curl", "launchctl"] {
+            fs::set_permissions(format!("{bin}/{tool}"), Permissions::from_mode(0o755))?;
+        }
+        // hotswap's layout, its version 1 this build
+        let layout = format!("{home}/.local/share/hotswap/rift");
+        let lay = || -> Outcome {
+            fs::create_dir_all(format!("{layout}/1"))?;
+            symlink(env!("CARGO_BIN_EXE_rift"), format!("{layout}/1/rift"))?;
+            Ok(symlink("1", format!("{layout}/current"))?)
+        };
+        lay()?;
+        let linked = format!(
+            "linked {exe} \u{2192} {}\n",
+            fs::canonicalize(env!("CARGO_BIN_EXE_rift"))?.display()
+        );
+        let stubbed = format!("{bin}:/usr/bin:/bin");
+        let gui = format!(
+            "gui/{}",
+            String::from_utf8(Command::new("id").arg("-u").output()?.stdout)?.trim()
+        );
+        let job = format!("{gui}/dev.gigantic.rift");
+        let agents = format!("{home}/Library/LaunchAgents");
+        let upgrade = format!("{agents}/dev.gigantic.rift.upgrade.plist");
+        let tended = format!(
+            "print {gui}/dev.gigantic.rift.upgrade\nprint-disabled {gui}\nbootstrap {gui} {upgrade}\n"
+        );
+        let calls = || -> Result<String, Box<dyn Error>> {
+            let log = fs::read_to_string(format!("{root}/launchctl.log"))?;
+            fs::remove_file(format!("{root}/launchctl.log"))?;
+            Ok(log)
+        };
+        // an earlier install, loaded, its root 0744 as launchd made it; and another program's agent
+        let (old, earlier) = (
+            format!("{root}/old"),
+            format!("{agents}/dev.example.old.plist"),
+        );
+        let former = format!("{gui}/dev.example.old");
+        let plant = |held: &str| -> Outcome {
+            fs::create_dir_all(held)?;
+            fs::create_dir_all(&agents)?;
+            fs::write(
+                &earlier,
+                plist(held).replace("dev.gigantic.rift", "dev.example.old"),
+            )?;
+            Ok(fs::write(format!("{held}/events.ndjson"), "the log\n")?)
+        };
+        plant(&old)?;
+        fs::set_permissions(&old, Permissions::from_mode(0o744))?;
+        fs::write(format!("{root}/loaded/dev.example.old"), "")?;
+        let other = format!("{agents}/com.example.other.plist");
+        fs::write(&other, plist(&old).replace(&exe, "/usr/bin/true"))?;
+        same(
+            &format!("{}{}", run(&stubbed, &[], &[])?, calls()?),
+            &format!(
+                "0\nlaunchctl bootout {former}\nmoved {old} to {data}\nremoved {earlier}\n{linked}wrote {file}\nlaunchctl bootstrap {gui} {file}\nprint {job}\nprint {former}\nbootout {former}\nprint {former}\nprint {former}\n{tended}print {job}\nprint {job}\nbootstrap {gui} {file}\nroot 0700\n"
+            ),
+        )?;
+        same(
+            &format!(
+                "{} {} {} {}",
+                fs::read_to_string(format!("{data}/events.ndjson"))?
+                    .lines()
+                    .next()
+                    .unwrap_or_default(),
+                fs::exists(&old)?,
+                fs::exists(&earlier)?,
+                fs::exists(&other)?
+            ),
+            "the log false false true",
+        )?;
+        same(&fs::read_to_string(&file)?, &plist(&data))?;
+        same(&fs::exists(format!("{file}.new"))?.to_string(), "false")?;
+        same(
+            &format!("{}{}", run(&stubbed, &[], &[])?, calls()?),
+            &format!(
+                "0\n{linked}wrote {file}\nlaunchctl kickstart -k {job}\nprint {job}\n{tended}kickstart -k {job}\n"
+            ),
+        )?;
+        // the swap returns once the respawn, held back as by ThrottleInterval, answers ready
+        let health: Value = serde_json::from_str(&say(&mut greet(&data)?, r#"{"op":"health"}"#)?)?;
+        same(&health["state"].to_string(), "\"ready\"")?;
+        same(
+            &fs::read_link(&exe)?.display().to_string(),
+            &format!("{layout}/current/rift"),
+        )?;
+        // the swap: setup through the link, its kickstart, then the smoke against the new daemon
+        same(
+            &format!(
+                "{}{}",
+                rift(
+                    &data,
+                    &[
+                        ("HOME", home.as_str()),
+                        ("HOTSWAP_TEST_HOME", home.as_str()),
+                        ("PATH", stubbed.as_str())
+                    ],
+                    &["upgrade"]
+                )?,
+                calls()?
+            ),
+            &format!("0\nrift 1: green, 2 smoke probes\nprint {job}\n{tended}kickstart -k {job}\n"),
+        )?;
+        same(
+            &rift(&data, &[("HOME", home.as_str())], &["upgrade", "--x"])?,
+            "2\nusage: rift upgrade [--check | --back | --retry]\n",
+        )?;
+        // a changed plist: booted out, waited out, bootstrapped; its absent root made first
+        let moved = format!("{root}/moved");
+        let rerun = |args: &[&str], envs: &[(&str, &str)]| {
+            rift(
+                &moved,
+                &[
+                    &[
+                        ("HOME", home.as_str()),
+                        ("HOTSWAP_TEST_HOME", home.as_str()),
+                        ("PATH", stubbed.as_str()),
+                    ],
+                    envs,
+                ]
+                .concat(),
+                &[&["setup"], args].concat(),
+            )
+        };
+        same(
+            &format!("{}{}", rerun(&[], &[])?, calls()?),
+            &format!(
+                "0\n{linked}wrote {file}\nlaunchctl bootout {job}\nlaunchctl bootstrap {gui} {file}\nprint {job}\n{tended}print {job}\nbootout {job}\nprint {job}\nprint {job}\nbootstrap {gui} {file}\nroot 0700\n"
+            ),
+        )?;
+        // an earlier install, unloaded, beside a root that exists: retired, its root left alone
+        plant(&old)?;
+        fs::write(format!("{root}/fail"), "")?;
+        same(
+            &format!("{}{}", run(&stubbed, &[], &[])?, calls()?),
+            &format!(
+                "1\nremoved {earlier}\n{linked}wrote {file}\nlaunchctl bootout {job}\nrift setup: launchctl bootstrap {gui} {file}: Bootstrap failed: 5: Input/output error\nprint {job}\nprint {former}\nprint {former}\n{tended}print {job}\nbootout {job}\nprint {job}\nprint {job}\nbootstrap {gui} {file}\nroot 0700\n"
+            ),
+        )?;
+        same(
+            &fs::exists(format!("{old}/events.ndjson"))?.to_string(),
+            "true",
+        )?;
+        fs::remove_file(format!("{root}/fail"))?;
+        fs::write(format!("{root}/loaded/dev.gigantic.rift"), "")?;
+        fs::write(format!("{root}/stuck"), "")?;
+        same(
+            &format!("{}{}", rerun(&[], &[("RIFT_BOOTOUT_MS", "0")])?, calls()?),
+            &format!(
+                "1\n{linked}wrote {file}\nlaunchctl bootout {job}\nrift setup: dev.gigantic.rift still loaded 0 ms after its bootout\nprint {job}\n{tended}print {job}\nbootout {job}\nprint {job}\n"
+            ),
+        )?;
+        fs::remove_file(format!("{root}/stuck"))?;
+        // a load that never answers ready fails past $RIFT_READY_MS
+        fs::write(format!("{root}/dead"), "")?;
+        same(
+            &format!(
+                "{}{}",
+                run(&stubbed, &[("RIFT_READY_MS", "0")], &[])?,
+                calls()?
+            ),
+            &format!(
+                "1\n{linked}wrote {file}\nlaunchctl bootout {job}\nlaunchctl bootstrap {gui} {file}\nrift setup: dev.gigantic.rift not ready 0 ms after its load; see {data}/serve.err\nprint {job}\n{tended}print {job}\nbootout {job}\nprint {job}\nprint {job}\nbootstrap {gui} {file}\nroot 0700\n"
+            ),
+        )?;
+        fs::remove_file(format!("{root}/dead"))?;
+        fs::write(format!("{root}/loaded/dev.gigantic.rift"), "")?;
+        plant(&old)?;
+        same(
+            &format!("{}{}", rerun(&["--remove"], &[])?, calls()?),
+            &format!(
+                "0\nremoved {earlier}\nlaunchctl bootout {job}\nremoved {file}\nremoved {exe}\nprint {gui}/dev.gigantic.rift.upgrade\nprint {former}\nprint {former}\nprint {job}\nbootout {job}\nprint {job}\nprint {job}\n"
+            ),
+        )?;
+        same(
+            &format!("{}{}", rerun(&["--remove"], &[])?, calls()?),
+            &format!("0\nprint {gui}/dev.gigantic.rift.upgrade\nprint {job}\nprint {job}\n"),
+        )?;
+        same(
+            &format!("{} {}", fs::exists(&upgrade)?, fs::exists(&layout)?),
+            "false false",
+        )
+    }
+}

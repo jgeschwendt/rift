@@ -1,0 +1,35 @@
+# Pinned: Cargo.toml's [lints] enumerate this toolchain's lints.
+[tools]
+"cargo:cargo-llvm-cov" = "0.9.1"
+# hk runs the pre-push gate (hk.pkl); `hk install --mise` wires it.
+hk = "2.5.0"
+rust = "1.94.0"
+
+[tasks.check]
+description = "the gate hk's pre-push runs: fmt, clippy, 100 % line coverage"
+run = [
+  "cargo fmt --check",
+  "cargo clippy --all-targets -- -D warnings",
+  { task = "cover" },
+]
+
+[tasks.cover]
+description = "the end-to-end suite under llvm-cov; anything under 100 % of lines fails, naming the lines"
+run = "cargo llvm-cov --fail-under-lines 100 --show-missing-lines"
+
+[tasks.dist]
+description = "this host's release archive as release.yaml builds it, its next YYYY.M.N stamped, to dist/; signing and publishing stay the workflow's"
+run = """
+set -euo pipefail
+month=$(date -u +%Y.%-m)
+version=$month.$(git tag -l "v$month.*" | wc -l | tr -d ' ')
+target=$(rustc -vV | sed -n 's/^host: //p')
+RIFT_VERSION=$version cargo build --release --locked
+mkdir -p dist
+tar -czf "dist/rift-$target.tar.gz" -C target/release rift
+echo "dist/rift-$target.tar.gz: rift $(target/release/rift version)"
+"""
+
+[tasks.install]
+description = "a dev build to ~/.local/bin/rift-next, beside the release"
+run = "cargo build --release && mkdir -p ~/.local/bin && install -m 755 target/release/rift ~/.local/bin/rift-next"

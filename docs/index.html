@@ -1,0 +1,238 @@
+<!doctype html>
+<html lang="en" class="ui">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>rift — design</title>
+<link rel="stylesheet" href="https://gigantic.dev/ui/ui.css" />
+<link rel="stylesheet" href="https://gigantic.dev/ui/docs.css" />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%23476349'/%3E%3Cpath d='M11.5 9.5A5 5 0 0 1 6.5 4.5 5 5 0 1 0 11.5 9.5Z' fill='white'/%3E%3C/svg%3E" />
+<style>
+/* the one figure: static svg, tokens only */
+#path-figure .figure-scroll { overflow-x: auto; }
+#path-figure svg { display: block; height: auto; max-width: 100%; min-width: 700px; }
+#path-figure .rf-arrow { fill: none; stroke: var(--ui-fg-muted); stroke-width: 1.5; }
+#path-figure .rf-box { fill: var(--ui-surface); stroke: var(--ui-border); }
+#path-figure .rf-core { fill: var(--ui-surface-raised); stroke: var(--ui-accent); stroke-width: 2; }
+#path-figure .rf-head { fill: var(--ui-fg-muted); }
+#path-figure .rf-label { fill: var(--ui-fg-muted); font-family: var(--ui-font-sans); font-size: 12px; }
+#path-figure .rf-later { stroke-dasharray: 3 3; }
+#path-figure .rf-name { fill: var(--ui-fg); font-family: var(--ui-font-mono); font-size: 13px; }
+</style>
+</head>
+<body data-page="rift">
+<svg xmlns="http://www.w3.org/2000/svg" style="display:none" aria-hidden="true">
+<!-- Phosphor Icons (regular), MIT (c) 2023 Phosphor Icons — via jgeschwendt/ui icons/ -->
+<symbol id="ph-circle-half" viewBox="0 0 256 256" fill="currentColor"><path d="M128,24A104,104,0,1,0,232,128,104.11,104.11,0,0,0,128,24Zm8,16.37a86.4,86.4,0,0,1,16,3V212.67a86.4,86.4,0,0,1-16,3Zm32,9.26a87.81,87.81,0,0,1,16,10.54V195.83a87.81,87.81,0,0,1-16,10.54ZM40,128a88.11,88.11,0,0,1,80-87.63V215.63A88.11,88.11,0,0,1,40,128Zm160,50.54V77.46a87.82,87.82,0,0,1,0,101.08Z"/></symbol>
+<symbol id="ph-moon" viewBox="0 0 256 256" fill="currentColor"><path d="M233.54,142.23a8,8,0,0,0-8-2,88.08,88.08,0,0,1-109.8-109.8,8,8,0,0,0-10-10,104.84,104.84,0,0,0-52.91,37A104,104,0,0,0,136,224a103.09,103.09,0,0,0,62.52-20.88,104.84,104.84,0,0,0,37-52.91A8,8,0,0,0,233.54,142.23ZM188.9,190.34A88,88,0,0,1,65.66,67.11a89,89,0,0,1,31.4-26A106,106,0,0,0,96,56,104.11,104.11,0,0,0,200,160a106,106,0,0,0,14.92-1.06A89,89,0,0,1,188.9,190.34Z"/></symbol>
+<symbol id="ph-sun" viewBox="0 0 256 256" fill="currentColor"><path d="M120,40V16a8,8,0,0,1,16,0V40a8,8,0,0,1-16,0Zm72,88a64,64,0,1,1-64-64A64.07,64.07,0,0,1,192,128Zm-16,0a48,48,0,1,0-48,48A48.05,48.05,0,0,0,176,128ZM58.34,69.66A8,8,0,0,0,69.66,58.34l-16-16A8,8,0,0,0,42.34,53.66Zm0,116.68-16,16a8,8,0,0,0,11.32,11.32l16-16a8,8,0,0,0-11.32-11.32ZM192,72a8,8,0,0,0,5.66-2.34l16-16a8,8,0,0,0-11.32-11.32l-16,16A8,8,0,0,0,192,72Zm5.66,114.34a8,8,0,0,0-11.32,11.32l16,16a8,8,0,0,0,11.32-11.32ZM48,128a8,8,0,0,0-8-8H16a8,8,0,0,0,0,16H40A8,8,0,0,0,48,128Zm80,80a8,8,0,0,0-8,8v24a8,8,0,0,0,16,0V216A8,8,0,0,0,128,208Zm112-88H216a8,8,0,0,0,0,16h24a8,8,0,0,0,0-16Z"/></symbol>
+<symbol id="ph-waveform" viewBox="0 0 256 256" fill="currentColor"><path d="M56,96v64a8,8,0,0,1-16,0V96a8,8,0,0,1,16,0ZM88,24a8,8,0,0,0-8,8V224a8,8,0,0,0,16,0V32A8,8,0,0,0,88,24Zm40,32a8,8,0,0,0-8,8V192a8,8,0,0,0,16,0V64A8,8,0,0,0,128,56Zm40,32a8,8,0,0,0-8,8v64a8,8,0,0,0,16,0V96A8,8,0,0,0,168,88Zm40-16a8,8,0,0,0-8,8v96a8,8,0,0,0,16,0V80A8,8,0,0,0,208,72Z"/></symbol>
+</svg>
+
+<header class="appbar">
+  <h1 class="appbar-title">
+    <svg class="icon" aria-hidden="true"><use href="#ph-waveform" /></svg>
+    rift <small>· design</small>
+  </h1>
+  <span class="spacer"></span>
+  <div class="segmented" role="group" aria-label="theme">
+    <button type="button" data-theme-set="light" aria-pressed="false" title="light">
+      <svg class="icon icon-sm" aria-hidden="true"><use href="#ph-sun" /></svg>light
+    </button>
+    <button type="button" data-theme-set="auto" aria-pressed="true" title="follow the system">
+      <svg class="icon icon-sm" aria-hidden="true"><use href="#ph-circle-half" /></svg>auto
+    </button>
+    <button type="button" data-theme-set="dark" aria-pressed="false" title="dark">
+      <svg class="icon icon-sm" aria-hidden="true"><use href="#ph-moon" /></svg>dark
+    </button>
+  </div>
+</header>
+
+<main class="docs-shell" data-container>
+
+<header class="stack">
+  <p class="eyebrow">a local audio daemon, plumbing first</p>
+  <p class="lead docs-lead"><code class="code">rift</code> is one process, kept running by launchd,
+    that will turn the sound of a room into an append-only log of who said which words when, and
+    play speech back. Today it is the plumbing only: one instance, its socket, the event log, a
+    quiet switch and a clean stop. No audio yet.</p>
+  <nav class="row docs-toc" aria-label="sections">
+    <a class="pill" href="#today">today</a>
+    <a class="pill" href="#designed">designed</a>
+    <a class="pill" href="#paths">paths</a>
+    <a class="pill" href="#cli">command line</a>
+  </nav>
+</header>
+
+<section class="docs-section" id="today" data-component="today">
+  <header>
+    <h2 class="h2">Today</h2>
+  </header>
+  <ul class="stack">
+    <li><strong>One instance.</strong> An exclusive <code class="code">flock</code> held for the
+      process's life; a second <code class="code">serve</code> is refused and logged.</li>
+    <li><strong>The socket.</strong> A unix socket in a 0700 directory the daemon checks is this user's,
+      speaking NDJSON: a hello with a protocol number, then <code class="code">health</code>,
+      <code class="code">quiet</code>, <code class="code">feed</code> and
+      <code class="code">shutdown</code>; errors are typed codes (<a href="protocol.html">the protocol</a>).</li>
+    <li><strong>The event log.</strong> <code class="code">events.ndjson</code>, the only durable
+      state: each event appended whole before any client hears of it. A restart re-derives
+      everything from it, a torn last line cut off.</li>
+    <li><strong>The feed.</strong> A connection replays the log from a position and stays live, one
+      gapless sequence; a client that falls 1024 events behind is dropped and resumes from its
+      last position.</li>
+    <li><strong>Quiet.</strong> One switch, logged as an event, kept across restarts. It will
+      silence playback; today nothing plays.</li>
+    <li><strong>A clean stop.</strong> SIGTERM, SIGINT, SIGHUP and the shutdown request drain alike:
+      stop accepting, log <code class="code">stop</code>, end the feeds, cut open connections
+      after a budget that fits launchd's kill timeout, exit 0.</li>
+  </ul>
+</section>
+
+<section class="docs-section" id="designed" data-component="designed">
+  <header>
+    <h2 class="h2">Designed, not built</h2>
+    <p class="docs-note">The audio path, in the order sound crosses it. Every stage writes its
+      results to the same log, so a client reads the room as events.</p>
+  </header>
+  <figure class="figure" id="path-figure">
+    <div class="figure-scroll">
+    <svg width="736" height="300" viewBox="0 0 736 300" role="img" aria-label="rift's path: sound from devices becomes one stream on one clock, voices are split apart and given ids, words get times, and each lands in the event log; the log feeds clients live, clients send requests, and playback goes back out to a device and can stop mid-word; the log, the feed and the clients are built, the rest is designed">
+      <defs>
+        <marker id="rf-head" markerUnits="userSpaceOnUse" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path class="rf-head" d="M0 0 10 5 0 10z" /></marker>
+      </defs>
+      <rect class="rf-box rf-later" x="16" y="24" width="148" height="64" rx="8" />
+      <text class="rf-name" x="30" y="50">① devices</text>
+      <text class="rf-label" x="30" y="72">ears · speakers</text>
+      <rect class="rf-box rf-later" x="200" y="24" width="148" height="64" rx="8" />
+      <text class="rf-name" x="214" y="50">② one stream</text>
+      <text class="rf-label" x="214" y="72">every ear on one clock</text>
+      <rect class="rf-box rf-later" x="384" y="24" width="148" height="64" rx="8" />
+      <text class="rf-name" x="398" y="50">③ voices</text>
+      <text class="rf-label" x="398" y="72">split apart, given ids</text>
+      <rect class="rf-box rf-later" x="568" y="24" width="152" height="64" rx="8" />
+      <text class="rf-name" x="582" y="50">④ words</text>
+      <text class="rf-label" x="582" y="72">each with its times</text>
+
+      <rect class="rf-core" x="568" y="164" width="152" height="64" rx="8" />
+      <text class="rf-name" x="582" y="190">event log</text>
+      <text class="rf-label" x="582" y="212">append-only, on disk</text>
+      <rect class="rf-box" x="384" y="164" width="148" height="64" rx="8" />
+      <text class="rf-name" x="398" y="190">feed</text>
+      <text class="rf-label" x="398" y="212">replay, then live</text>
+      <rect class="rf-box" x="200" y="164" width="148" height="64" rx="8" />
+      <text class="rf-name" x="214" y="190">clients</text>
+      <text class="rf-label" x="214" y="212">on the unix socket</text>
+      <rect class="rf-box rf-later" x="16" y="164" width="148" height="64" rx="8" />
+      <text class="rf-name" x="30" y="190">⑤ playback</text>
+      <text class="rf-label" x="30" y="212">stops mid-word</text>
+
+      <path class="rf-arrow rf-later" d="M164 56H200" marker-end="url(#rf-head)" />
+      <path class="rf-arrow rf-later" d="M348 56H384" marker-end="url(#rf-head)" />
+      <path class="rf-arrow rf-later" d="M532 56H568" marker-end="url(#rf-head)" />
+      <path class="rf-arrow rf-later" d="M644 88V164" marker-end="url(#rf-head)" />
+      <text class="rf-label" x="654" y="130">every result</text>
+      <path class="rf-arrow" d="M568 196H532" marker-end="url(#rf-head)" />
+      <path class="rf-arrow" d="M384 196H348" marker-end="url(#rf-head)" />
+      <path class="rf-arrow" d="M274 228V264H644V228" marker-end="url(#rf-head)" />
+      <text class="rf-label" x="459" y="284" text-anchor="middle">requests: quiet, shutdown</text>
+      <path class="rf-arrow rf-later" d="M200 196H164" marker-end="url(#rf-head)" />
+      <text class="rf-label" x="182" y="186" text-anchor="middle">say</text>
+      <path class="rf-arrow rf-later" d="M90 164V88" marker-end="url(#rf-head)" />
+    </svg>
+    </div>
+    <figcaption>The accented log is the daemon's memory; solid is built, dashed is designed.
+      Playback runs on the same clock as the ears, so it can stop at a word boundary the moment
+      quiet is set.</figcaption>
+  </figure>
+  <div class="table-wrap">
+    <table data-table>
+      <thead><tr><th>stage</th><th>what it does</th></tr></thead>
+      <tbody>
+        <tr><td>① devices</td><td>each microphone and speaker is a device rift holds; one on another machine is a later protocol</td></tr>
+        <tr><td>② one stream</td><td>every input resampled onto one clock, so a moment means the same instant on every ear</td></tr>
+        <tr><td>③ voices</td><td>overlapping speakers split into separate voices, each given an id that holds across the stream</td></tr>
+        <tr><td>④ words</td><td>each voice transcribed to words, each word with its start and end on that clock</td></tr>
+        <tr><td>⑤ playback</td><td>speech a client asks for, played on a device and stoppable mid-word, its progress logged</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section class="docs-section" id="paths" data-component="paths">
+  <header>
+    <h2 class="h2">Paths</h2>
+  </header>
+  <div class="table-wrap">
+    <table data-table>
+      <thead><tr><th>path</th><th>what</th></tr></thead>
+      <tbody>
+        <tr><td class="table-mono">~/.local/state/rift</td><td>the state root, mode 0700; <code class="code">$RIFT_ROOT</code> overrides</td></tr>
+        <tr><td class="table-mono">&lt;root&gt;/events.ndjson</td><td>the event log, the only durable state</td></tr>
+        <tr><td class="table-mono">&lt;root&gt;/run/rift.sock</td><td>the socket, in <code class="code">run/</code> (0700) beside the lock, the pid file and the daemon's own log</td></tr>
+        <tr><td class="table-mono">&lt;root&gt;/serve.err</td><td>launchd's stderr, for a failure before the daemon's log</td></tr>
+        <tr><td class="table-mono">~/.local/bin/rift</td><td>the binary: <a class="link" href="https://gigantic.dev/hotswap/">hotswap</a>'s link through <code class="code">~/.local/share/hotswap/rift/current</code>, the release installed</td></tr>
+        <tr><td class="table-mono">~/Library/LaunchAgents/dev.gigantic.rift.upgrade.plist</td><td>hotswap's upgrade agent: <code class="code">rift upgrade</code> every 900 s</td></tr>
+        <tr><td class="table-mono">~/Library/LaunchAgents/dev.gigantic.rift.plist</td><td>the launchd agent: <code class="code">KeepAlive</code> on an unclean exit only, <code class="code">RunAtLoad</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section class="docs-section" id="cli" data-component="cli">
+  <header>
+    <h2 class="h2">Command line</h2>
+    <p class="docs-note">Releases come from <code class="code">.github/workflows/release.yaml</code>, one per
+      merge to main, <code class="code">YYYY.M.N</code>, signed by packslip.</p>
+  </header>
+  <pre class="snippet">mise use -g packslip:jgeschwendt/rift   # the latest release, verified by packslip
+rift setup                              # into hotswap's layout, the ~/.local/bin/rift link, the agent
+rift upgrade --check                    # what the next swap would run
+mise run install                        # a checkout: a dev build as ~/.local/bin/rift-next
+mise run dist                           # a checkout: this host's release archive, to dist/</pre>
+  <div class="table-wrap">
+    <table data-table>
+      <thead><tr><th>command</th><th>does</th></tr></thead>
+      <tbody>
+        <tr><td class="table-mono">rift serve</td><td>the daemon, in the foreground; launchd runs it</td></tr>
+        <tr><td class="table-mono">rift status</td><td>prints the daemon's health, or <code class="code">{"code":"down","ok":false}</code></td></tr>
+        <tr><td class="table-mono">rift quiet on|off</td><td>sets the quiet switch</td></tr>
+        <tr><td class="table-mono">rift feed [--after &lt;boot&gt;:&lt;seq&gt;]</td><td>prints the events, from this boot or after a position, then live</td></tr>
+        <tr><td class="table-mono">rift setup [--print | --remove]</td><td>brings the release into hotswap's layout and links <code class="code">~/.local/bin/rift</code> (with none installed, the latest, through packslip), then writes and loads the agent on that link, or swaps it with one <code class="code">kickstart -k</code>, then waits for the new daemon to answer health ready; <code class="code">--print</code> prints the plist, <code class="code">--remove</code> has hotswap forget the layout and the upgrade agent, unloads the agent and removes the plist and the link</td></tr>
+        <tr><td class="table-mono">rift upgrade [--check | --back | --retry]</td><td>hotswap's swap onto a newer release: installed beside the running one, <code class="code">current</code> moved, <code class="code">rift setup</code>, then the smoke (<code class="code">rift version</code>, <code class="code">rift status</code> until the daemon answers with it); a failure rolls back. Exit 0 green or settled, 1 red, 2 unable to try</td></tr>
+        <tr><td class="table-mono">rift version</td><td>the build, as the hello reports it</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<nav class="row link-row" aria-label="links">
+  <a class="pill" href="protocol.html">protocol · docs/protocol.html</a>
+  <a class="pill" href="https://github.com/jgeschwendt/rift">repo · jgeschwendt/rift</a>
+</nav>
+
+</main>
+<script>
+/* The theme contract, verbatim from jgeschwendt/ui docs.js — same localStorage
+   key, so a theme chosen on the ui pages is the theme this one opens in. */
+const THEME_KEY = "ui-theme";
+function applyTheme(mode) {
+  const root = document.documentElement;
+  if (mode === "auto") {
+    root.removeAttribute("data-theme");
+    localStorage.removeItem(THEME_KEY);
+  } else {
+    root.dataset.theme = mode;
+    localStorage.setItem(THEME_KEY, mode);
+  }
+  for (const b of document.querySelectorAll("[data-theme-set]")) {
+    b.setAttribute("aria-pressed", String(b.dataset.themeSet === mode));
+  }
+}
+for (const b of document.querySelectorAll("[data-theme-set]")) {
+  b.addEventListener("click", () => applyTheme(b.dataset.themeSet));
+}
+applyTheme(localStorage.getItem(THEME_KEY) || "auto");
+</script>
+</body>
+</html>

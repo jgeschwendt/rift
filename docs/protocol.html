@@ -1,0 +1,256 @@
+<!doctype html>
+<html lang="en" class="ui">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>rift — protocol</title>
+<link rel="stylesheet" href="https://gigantic.dev/ui/ui.css" />
+<link rel="stylesheet" href="https://gigantic.dev/ui/docs.css" />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%23476349'/%3E%3Cpath d='M11.5 9.5A5 5 0 0 1 6.5 4.5 5 5 0 1 0 11.5 9.5Z' fill='white'/%3E%3C/svg%3E" />
+</head>
+<body data-page="protocol">
+<svg xmlns="http://www.w3.org/2000/svg" style="display:none" aria-hidden="true">
+<!-- Phosphor Icons (regular), MIT (c) 2023 Phosphor Icons — via jgeschwendt/ui icons/ -->
+<symbol id="ph-circle-half" viewBox="0 0 256 256" fill="currentColor"><path d="M128,24A104,104,0,1,0,232,128,104.11,104.11,0,0,0,128,24Zm8,16.37a86.4,86.4,0,0,1,16,3V212.67a86.4,86.4,0,0,1-16,3Zm32,9.26a87.81,87.81,0,0,1,16,10.54V195.83a87.81,87.81,0,0,1-16,10.54ZM40,128a88.11,88.11,0,0,1,80-87.63V215.63A88.11,88.11,0,0,1,40,128Zm160,50.54V77.46a87.82,87.82,0,0,1,0,101.08Z"/></symbol>
+<symbol id="ph-moon" viewBox="0 0 256 256" fill="currentColor"><path d="M233.54,142.23a8,8,0,0,0-8-2,88.08,88.08,0,0,1-109.8-109.8,8,8,0,0,0-10-10,104.84,104.84,0,0,0-52.91,37A104,104,0,0,0,136,224a103.09,103.09,0,0,0,62.52-20.88,104.84,104.84,0,0,0,37-52.91A8,8,0,0,0,233.54,142.23ZM188.9,190.34A88,88,0,0,1,65.66,67.11a89,89,0,0,1,31.4-26A106,106,0,0,0,96,56,104.11,104.11,0,0,0,200,160a106,106,0,0,0,14.92-1.06A89,89,0,0,1,188.9,190.34Z"/></symbol>
+<symbol id="ph-sun" viewBox="0 0 256 256" fill="currentColor"><path d="M120,40V16a8,8,0,0,1,16,0V40a8,8,0,0,1-16,0Zm72,88a64,64,0,1,1-64-64A64.07,64.07,0,0,1,192,128Zm-16,0a48,48,0,1,0-48,48A48.05,48.05,0,0,0,176,128ZM58.34,69.66A8,8,0,0,0,69.66,58.34l-16-16A8,8,0,0,0,42.34,53.66Zm0,116.68-16,16a8,8,0,0,0,11.32,11.32l16-16a8,8,0,0,0-11.32-11.32ZM192,72a8,8,0,0,0,5.66-2.34l16-16a8,8,0,0,0-11.32-11.32l-16,16A8,8,0,0,0,192,72Zm5.66,114.34a8,8,0,0,0-11.32,11.32l16,16a8,8,0,0,0,11.32-11.32ZM48,128a8,8,0,0,0-8-8H16a8,8,0,0,0,0,16H40A8,8,0,0,0,48,128Zm80,80a8,8,0,0,0-8,8v24a8,8,0,0,0,16,0V216A8,8,0,0,0,128,208Zm112-88H216a8,8,0,0,0,0,16h24a8,8,0,0,0,0-16Z"/></symbol>
+<symbol id="ph-waveform" viewBox="0 0 256 256" fill="currentColor"><path d="M56,96v64a8,8,0,0,1-16,0V96a8,8,0,0,1,16,0ZM88,24a8,8,0,0,0-8,8V224a8,8,0,0,0,16,0V32A8,8,0,0,0,88,24Zm40,32a8,8,0,0,0-8,8V192a8,8,0,0,0,16,0V64A8,8,0,0,0,128,56Zm40,32a8,8,0,0,0-8,8v64a8,8,0,0,0,16,0V96A8,8,0,0,0,168,88Zm40-16a8,8,0,0,0-8,8v96a8,8,0,0,0,16,0V80A8,8,0,0,0,208,72Z"/></symbol>
+</svg>
+
+<header class="appbar">
+  <h1 class="appbar-title">
+    <svg class="icon" aria-hidden="true"><use href="#ph-waveform" /></svg>
+    rift <small>· protocol</small>
+  </h1>
+  <span class="spacer"></span>
+  <div class="segmented" role="group" aria-label="theme">
+    <button type="button" data-theme-set="light" aria-pressed="false" title="light">
+      <svg class="icon icon-sm" aria-hidden="true"><use href="#ph-sun" /></svg>light
+    </button>
+    <button type="button" data-theme-set="auto" aria-pressed="true" title="follow the system">
+      <svg class="icon icon-sm" aria-hidden="true"><use href="#ph-circle-half" /></svg>auto
+    </button>
+    <button type="button" data-theme-set="dark" aria-pressed="false" title="dark">
+      <svg class="icon icon-sm" aria-hidden="true"><use href="#ph-moon" /></svg>dark
+    </button>
+  </div>
+</header>
+
+<main class="docs-shell" data-container>
+
+<header class="stack">
+  <p class="eyebrow">the rift wire contract, protocol 1</p>
+  <p class="lead docs-lead">Between the rift daemon (<code class="code">dev.gigantic.rift</code>)
+    and its clients: the <code class="code">rift</code> command line and any program on its socket.
+    Clients are written against this page; a change here breaks them unless it is
+    <a href="#events">additive</a>. What rift is: <a href="index.html">the design</a>.</p>
+  <nav class="row docs-toc" aria-label="sections">
+    <a class="pill" href="#transport">transport</a>
+    <a class="pill" href="#framing">framing</a>
+    <a class="pill" href="#hello">hello</a>
+    <a class="pill" href="#requests">requests</a>
+    <a class="pill" href="#events">events</a>
+    <a class="pill" href="#log">the log</a>
+    <a class="pill" href="#feed">feed</a>
+    <a class="pill" href="#clients">client rules</a>
+  </nav>
+</header>
+
+<section class="docs-section" id="transport" data-component="transport">
+  <header>
+    <h2 class="h2">Transport</h2>
+  </header>
+  <ul class="stack">
+    <li>A unix stream socket at <code class="code">&lt;root&gt;/run/rift.sock</code>; <code class="code">&lt;root&gt;</code>
+      is <code class="code">$RIFT_ROOT</code>, default <code class="code">~/.local/state/rift</code>.</li>
+    <li><code class="code">&lt;root&gt;/run</code> is mode 0700 and the user's; the daemon refuses to start otherwise.</li>
+    <li>No TCP listener: devices on other machines are a later protocol.</li>
+  </ul>
+</section>
+
+<section class="docs-section" id="framing" data-component="framing">
+  <header>
+    <h2 class="h2">Framing</h2>
+  </header>
+  <ul class="stack">
+    <li>NDJSON: UTF-8, one JSON object per line, <code class="code">\n</code> terminated.</li>
+    <li>The daemon writes keys in alphabetical order, with no insignificant whitespace.</li>
+    <li>A line over 65536 bytes, its <code class="code">\n</code> not counted, is answered
+      <code class="code">too_long</code> and the connection is closed.</li>
+  </ul>
+</section>
+
+<section class="docs-section" id="hello" data-component="hello">
+  <header>
+    <h2 class="h2">Hello</h2>
+  </header>
+  <p class="docs-note">The first line on every connection is the client's hello, <code class="code">client</code>
+    a string and <code class="code">proto</code> an integer:</p>
+  <pre class="tree">{"client":"example/1.0.0","op":"hello","proto":1}</pre>
+  <p class="docs-note">The reply when the protocol matches:</p>
+  <pre class="tree">{"boot":7,"ok":true,"pid":4211,"proto":1,"since":"2026-11-22T18:04:11.201Z","state":"ready","version":"2026.11.0-abc1234"}</pre>
+  <ul class="stack">
+    <li><code class="code">state</code> is <code class="code">ready</code>, <code class="code">degraded</code>
+      (the log refused the last append; <code class="code">ready</code> again once one succeeds, and
+      no event carries either: a client sees it in its next hello or health) or
+      <code class="code">stopping</code>. The socket is bound only once the daemon has derived its state from <a href="#log">the log</a>,
+      so no client sees it booting: until then a connect is refused, as when it is down.</li>
+    <li><code class="code">boot</code> counts daemon starts from 1, derived from the log.</li>
+    <li>Any other first line (not JSON, not an object, not a hello, or a hello whose
+      <code class="code">client</code> or <code class="code">proto</code> is missing or mistyped) is answered
+      <code class="code">bad_request</code> and closed.</li>
+  </ul>
+  <p class="docs-note">Another <code class="code">proto</code> is answered, and the connection closed:</p>
+  <pre class="tree">{"code":"proto","ok":false,"proto":1,"version":"2026.11.0-abc1234"}</pre>
+  <p class="docs-note"><code class="code">version</code> is <code class="code">&lt;release&gt;-&lt;build&gt;</code>:
+    the release's <code class="code">YYYY.M.N</code> (a checkout's build: the crate version), then the
+    short commit it was built from, <code class="code">-dirty</code> over uncommitted work.</p>
+</section>
+
+<section class="docs-section" id="requests" data-component="requests">
+  <header>
+    <h2 class="h2">Requests</h2>
+  </header>
+  <p class="docs-note">After hello the connection carries requests, one per line, each answered by
+    one line. Any line, hello included, may carry <code class="code">"id"</code>, a string or number,
+    and its reply echoes it, an error included; <code class="code">"id":null</code> is no id, and an
+    id of another type is <code class="code">bad_request</code>, not echoed.</p>
+  <div class="table-wrap">
+    <table data-table>
+      <thead><tr><th>op</th><th>request</th><th>reply</th></tr></thead>
+      <tbody>
+        <tr><td class="table-mono">feed</td><td class="table-mono">{"after":null,"op":"feed"}<br />{"after":{"boot":7,"seq":12},"op":"feed"}</td><td><code class="code">{"ok":true,"reset":false}</code>, then the connection is a <a href="#feed">feed</a>; <code class="code">after</code> is required</td></tr>
+        <tr><td class="table-mono">health</td><td class="table-mono">{"op":"health"}</td><td>the hello reply's fields, plus <code class="code">"quiet":false</code> and <code class="code">"seq":12</code>, the last event's <code class="code">seq</code> in this boot</td></tr>
+        <tr><td class="table-mono">quiet</td><td class="table-mono">{"on":true,"op":"quiet"}</td><td><code class="code">{"changed":true,"ok":true,"seq":13}</code>; the value it already has appends nothing and answers <code class="code">"changed":false</code> with the current <code class="code">seq</code></td></tr>
+        <tr><td class="table-mono">shutdown</td><td class="table-mono">{"op":"shutdown"}</td><td><code class="code">{"ok":true}</code>, then the daemon drains and exits 0; the agent does not respawn it</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="docs-note">Errors are <code class="code">{"code":"&lt;code&gt;","ok":false}</code>, and clients
+    match on <code class="code">code</code>, never on other text. A request error leaves the connection
+    open; only <code class="code">too_long</code> and a refused hello close it.</p>
+  <div class="table-wrap">
+    <table data-table>
+      <thead><tr><th>code</th><th>when</th></tr></thead>
+      <tbody>
+        <tr><td class="table-mono">bad_request</td><td>not JSON, not an object, a missing or mistyped field</td></tr>
+        <tr><td class="table-mono">io</td><td>the log refused the append; nothing changed</td></tr>
+        <tr><td class="table-mono">proto</td><td>the hello's protocol is not the daemon's</td></tr>
+        <tr><td class="table-mono">stopping</td><td>a request other than <code class="code">health</code> while draining</td></tr>
+        <tr><td class="table-mono">too_long</td><td>the line is over the <a href="#framing">limit</a></td></tr>
+        <tr><td class="table-mono">unknown_op</td><td>an op this protocol does not have, a second hello included</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section class="docs-section" id="events" data-component="events">
+  <header>
+    <h2 class="h2">Events</h2>
+  </header>
+  <p class="docs-note">Every event is one line, in the log and on a feed:</p>
+  <pre class="tree">{"boot":7,"e":{"kind":"quiet","on":true},"seq":13,"t":"2026-11-22T18:09:40.118Z"}</pre>
+  <ul class="stack">
+    <li><code class="code">seq</code> starts at 1 in each boot and rises by 1. <code class="code">(boot, seq)</code>
+      is an event's position, ordered by <code class="code">boot</code>, then <code class="code">seq</code>.</li>
+    <li><code class="code">t</code> is UTC, RFC 3339, to the millisecond.</li>
+  </ul>
+  <div class="table-wrap">
+    <table data-table>
+      <thead><tr><th>kind</th><th>fields</th><th>when</th></tr></thead>
+      <tbody>
+        <tr><td class="table-mono">boot</td><td class="table-mono">pid, version</td><td>the first event of every boot</td></tr>
+        <tr><td class="table-mono">quiet</td><td class="table-mono">on</td><td>the quiet setting changed: health's <code class="code">quiet</code> is <code class="code">on</code> from here</td></tr>
+        <tr><td class="table-mono">stop</td><td class="table-mono">reason</td><td>the drain began: health's <code class="code">state</code> is <code class="code">stopping</code> from here, and nothing follows it in this boot; a killed boot has none</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="docs-note">Additive, so no <code class="code">proto</code> bump: a new kind, a new field on
+    an event or a reply, a new op, a new error code. Clients ignore kinds and fields they do not know.</p>
+</section>
+
+<section class="docs-section" id="log" data-component="log">
+  <header>
+    <h2 class="h2">The log</h2>
+  </header>
+  <ul class="stack">
+    <li><code class="code">&lt;root&gt;/events.ndjson</code>, append-only, one event per line, written in
+      one unbuffered write before the event reaches any feed and before the request that caused it
+      is answered. There is no fsync: an event survives a kill, not a power loss.</li>
+    <li>It is the daemon's only durable state. On boot the daemon derives <code class="code">boot</code>
+      (the log's last boot plus 1) and <code class="code">quiet</code> (the last <code class="code">quiet</code>
+      event's <code class="code">on</code>, default <code class="code">false</code>) from it. A torn last
+      line, left by a kill mid-write, is cut off.</li>
+  </ul>
+</section>
+
+<section class="docs-section" id="feed" data-component="feed">
+  <header>
+    <h2 class="h2">Feed</h2>
+  </header>
+  <ul class="stack">
+    <li>After the <code class="code">feed</code> reply the daemon sends events, one per line, and reads
+      nothing more but the end of stream, which ends the feed at once; a client with a request
+      opens another connection.</li>
+    <li><code class="code">"after":null</code> starts at the current boot's first event.
+      <code class="code">"after":{"boot":b,"seq":s}</code> starts after the event at exactly that
+      position, later boots included; a position the log does not hold starts at the current boot's
+      first event, and the reply says <code class="code">"reset":true</code>.</li>
+    <li>Replay and live events are one gapless, duplicate-free sequence.</li>
+    <li>A feed with 1024 events queued and unsent is disconnected (what the socket buffers hold is on
+      top of that); it reconnects from its last position.</li>
+    <li>End of stream means the daemon stopped or dropped the client; there is no heartbeat.</li>
+  </ul>
+</section>
+
+<section class="docs-section" id="clients" data-component="clients">
+  <header>
+    <h2 class="h2">Client rules</h2>
+  </header>
+  <ul class="stack">
+    <li><code class="code">health</code>, <code class="code">feed</code> and <code class="code">quiet</code>
+      are safe to retry; <code class="code">shutdown</code> only when the request was provably not sent.</li>
+    <li>A request whose connection ends before its reply, after it was sent, has an unknown outcome,
+      as does an error code the client does not know.</li>
+    <li>A client's own codes, beside the daemon's: <code class="code">down</code>, the request provably
+      not sent (no connection, or none past hello), and <code class="code">unknown</code>, its outcome
+      unknown. The <code class="code">rift</code> command line prints either as
+      <code class="code">{"code":"&lt;code&gt;","ok":false}</code>, and a refused hello as it came.</li>
+    <li>An event moves a health read only when it is of that health's <code class="code">boot</code>:
+      a replay from an earlier position carries earlier boots' events, which the fresher read
+      already supersedes.</li>
+    <li>A client whose hello is refused <code class="code">proto</code> says so in one line naming the
+      daemon's protocol and version, its own, and the fix.</li>
+  </ul>
+</section>
+
+<nav class="row link-row" aria-label="links">
+  <a class="pill" href="index.html">design · docs/index.html</a>
+  <a class="pill" href="https://github.com/jgeschwendt/rift">repo · jgeschwendt/rift</a>
+</nav>
+
+</main>
+<script>
+/* The theme contract, verbatim from jgeschwendt/ui docs.js — same localStorage
+   key, so a theme chosen on the ui pages is the theme this one opens in. */
+const THEME_KEY = "ui-theme";
+function applyTheme(mode) {
+  const root = document.documentElement;
+  if (mode === "auto") {
+    root.removeAttribute("data-theme");
+    localStorage.removeItem(THEME_KEY);
+  } else {
+    root.dataset.theme = mode;
+    localStorage.setItem(THEME_KEY, mode);
+  }
+  for (const b of document.querySelectorAll("[data-theme-set]")) {
+    b.setAttribute("aria-pressed", String(b.dataset.themeSet === mode));
+  }
+}
+for (const b of document.querySelectorAll("[data-theme-set]")) {
+  b.addEventListener("click", () => applyTheme(b.dataset.themeSet));
+}
+applyTheme(localStorage.getItem(THEME_KEY) || "auto");
+</script>
+</body>
+</html>
