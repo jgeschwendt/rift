@@ -113,9 +113,9 @@ unable to try; another argument `usage: rift upgrade [--check | --back | --retry
 manifest: repo `jgeschwendt/rift`, bin `rift`, setup `rift setup`, smoke `rift version` then
 `/bin/sh -c` polling `rift status` once a second, 30 tries, until its health's `version` is `rift
 version`'s; no agents to kickstart and no drain step, since setup's own `kickstart -k` is the swap
-and its SIGTERM the daemon's drain. The signer is empty until the first release: `packslip pin` on
-that release's `packslip.sigstore.json` prints the `ps1_…` fingerprint it takes, and until then an
-install or upgrade through packslip is refused.
+and its SIGTERM the daemon's drain. The signer is `ps1_fby5zwdz6ddvk4frxkhs4mmpny`,
+what `packslip pin` prints for a release's `packslip.sigstore.json`; `v2026.11.0` was cut before
+the pin, so an install of it cannot upgrade.
 
 ### `rift version`
 

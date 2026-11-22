@@ -163,7 +163,7 @@ fn manifest() -> hotswap::Manifest {
         repo: "jgeschwendt/rift".into(),
         setup: owned(&["rift", "setup"]),
         // packslip's fingerprint of the repository, printed by `packslip pin` on its first release
-        signer: String::new(),
+        signer: "ps1_fby5zwdz6ddvk4frxkhs4mmpny".into(),
         smoke: vec![
             owned(&["rift", "version"]),
             owned(&[
@@ -436,12 +436,13 @@ fn main() -> ExitCode {
                 if let Some(why) = STOP.get() {
                     break why.clone();
                 }
-                // a failed accept (EMFILE, ECONNABORTED) skips one connection, never stops
+                // a failed accept (EMFILE, ECONNABORTED) skips one connection, never stops; the
+                // backoff first, since opening serve.log takes the descriptor EMFILE just denied
                 let stream = match accepted {
                     Ok((stream, _)) => stream,
                     Err(why) => {
-                        write(json!({"event": "accept", "reason": why.to_string()}));
                         thread::sleep(Duration::from_millis(100));
+                        write(json!({"event": "accept", "reason": why.to_string()}));
                         continue;
                     }
                 };

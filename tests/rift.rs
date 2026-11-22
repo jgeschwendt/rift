@@ -658,11 +658,13 @@ mod tests {
         same(&format!("{} {}", third["boot"], third["quiet"]), "3 false")
     }
 
-    /// Running out of descriptors skips connections, never stops the daemon: under three
-    /// consecutive fd limits one makes `accept` itself fail (EMFILE), and each serves on after.
+    /// Running out of descriptors skips connections, never stops the daemon. A connection holds
+    /// three, so of three consecutive fd limits one leaves none spare with dials still queued and
+    /// `accept` itself fails (EMFILE); the limits climb until serve.log shows that `accept` line,
+    /// and each serves on after.
     #[test]
     fn exhaust() -> Outcome {
-        for limit in 28u8..=30 {
+        for limit in 28u8..=36 {
             let root = temp(&format!("exhaust{limit}"))?;
             let mut daemon = Daemon(
                 Command::new("sh")
@@ -676,7 +678,7 @@ mod tests {
             let _: usize =
                 BufReader::new(daemon.0.stdout.take().ok_or("stdout")?).read_line(&mut ready)?;
             let held = iter::repeat_with(|| dial(&root))
-                .take(15)
+                .take(100)
                 .collect::<io::Result<Vec<_>>>()?;
             thread::sleep(Duration::from_millis(300));
             drop(held);
@@ -696,8 +698,12 @@ mod tests {
                 &format!("{limit} {:?}", daemon.0.wait()?.code()),
                 &format!("{limit} Some(0)"),
             )?;
+            if fs::read_to_string(format!("{root}/run/serve.log"))?.contains(r#""event":"accept""#)
+            {
+                return Ok(());
+            }
         }
-        Ok(())
+        Err("no fd limit in 28..=36 logged an accept failure".into())
     }
 
     /// A feed whose client hangs up is closed at once, not at the next event: twenty feeds opened
