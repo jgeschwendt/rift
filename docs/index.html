@@ -8,7 +8,20 @@
 <link rel="stylesheet" href="https://gigantic.dev/ui/docs.css" />
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%23476349'/%3E%3Cpath d='M11.5 9.5A5 5 0 0 1 6.5 4.5 5 5 0 1 0 11.5 9.5Z' fill='white'/%3E%3C/svg%3E" />
 <style>
-/* the one figure: static svg, tokens only */
+/* the figures: static svg, tokens only */
+#stream-figure .figure-scroll { overflow-x: auto; }
+#stream-figure svg { display: block; height: auto; max-width: 100%; min-width: 700px; }
+#stream-figure .st-arrow { fill: none; stroke: var(--ui-fg-muted); stroke-width: 1.5; }
+#stream-figure .st-box { fill: var(--ui-surface); stroke: var(--ui-border); }
+#stream-figure .st-clock { stroke: var(--ui-accent); stroke-width: 2; }
+#stream-figure .st-edge { stroke: var(--ui-fg-muted); stroke-dasharray: 4 3; }
+#stream-figure .st-gone { fill: var(--ui-surface); stroke: var(--ui-border); stroke-dasharray: 3 3; }
+#stream-figure .st-head { fill: var(--ui-fg-muted); }
+#stream-figure .st-hole { stroke: var(--ui-fg-muted); stroke-dasharray: 2 3; stroke-width: 1.5; }
+#stream-figure .st-label { fill: var(--ui-fg-muted); font-family: var(--ui-font-sans); font-size: 12px; }
+#stream-figure .st-name { fill: var(--ui-fg); font-family: var(--ui-font-mono); font-size: 13px; }
+#stream-figure .st-open { fill: var(--ui-surface); stroke: var(--ui-border-strong); }
+#stream-figure .st-seg { fill: var(--ui-surface-raised); stroke: var(--ui-border-strong); }
 #path-figure .figure-scroll { overflow-x: auto; }
 #path-figure svg { display: block; height: auto; max-width: 100%; min-width: 700px; }
 #path-figure .rf-arrow { fill: none; stroke: var(--ui-fg-muted); stroke-width: 1.5; }
@@ -51,15 +64,18 @@
 <main class="docs-shell" data-container>
 
 <header class="stack">
-  <p class="eyebrow">a local audio daemon, plumbing first</p>
+  <p class="eyebrow">a local audio daemon</p>
   <p class="lead docs-lead"><code class="code">rift</code> is one process, kept running by launchd,
-    that will turn the sound of a room into an append-only log of who said which words when, and
-    play speech back. Today it is the plumbing only: one instance, its socket, the event log, a
-    quiet switch and a clean stop. No audio yet.</p>
+    that will turn the sound its devices hear into an append-only log of which words were said when,
+    and play speech back. Today: one instance, its socket, the event log, and the stream, every
+    connected device's sound on one clock, kept on disk for a window, then archived. The one device
+    yet is a file player; microphones come next.</p>
   <nav class="row docs-toc" aria-label="sections">
     <a class="pill" href="#today">today</a>
+    <a class="pill" href="#stream">the stream</a>
     <a class="pill" href="#designed">designed</a>
     <a class="pill" href="#paths">paths</a>
+    <a class="pill" href="#environment">environment</a>
     <a class="pill" href="#cli">command line</a>
   </nav>
 </header>
@@ -73,40 +89,138 @@
       process's life; a second <code class="code">serve</code> is refused and logged.</li>
     <li><strong>The socket.</strong> A unix socket in a 0700 directory the daemon checks is this user's,
       speaking NDJSON: a hello with a protocol number, then <code class="code">health</code>,
-      <code class="code">quiet</code>, <code class="code">feed</code> and
-      <code class="code">shutdown</code>; errors are typed codes (<a href="protocol.html">the protocol</a>).</li>
-    <li><strong>The event log.</strong> <code class="code">events.ndjson</code>, the only durable
-      state: each event appended whole before any client hears of it. A restart re-derives
+      <code class="code">quiet</code>, <code class="code">feed</code>, <code class="code">shutdown</code>
+      and the stream's ops; errors are typed codes (<a href="protocol.html">the protocol</a>).</li>
+    <li><strong>The event log.</strong> <code class="code">events.ndjson</code>, the durable state
+      beside the audio: each event appended whole before any client hears of it. A restart re-derives
       everything from it, a torn last line cut off.</li>
+    <li><strong>The stream.</strong> <a href="#stream">Below</a>: devices, tracks, one clock,
+      segments, holes, a window, an archive, readers.</li>
     <li><strong>The feed.</strong> A connection replays the log from a position and stays live, one
       gapless sequence; a client that falls 1024 events behind is dropped and resumes from its
       last position.</li>
     <li><strong>Quiet.</strong> One switch, logged as an event, kept across restarts. It will
       silence playback; today nothing plays.</li>
     <li><strong>A clean stop.</strong> SIGTERM, SIGINT, SIGHUP and the shutdown request drain alike:
-      stop accepting, log <code class="code">stop</code>, end the feeds, cut open connections
-      after a budget that fits launchd's kill timeout, exit 0.</li>
+      stop accepting, close the open segments, log <code class="code">stop</code>, end the feeds,
+      cut open connections after a budget that fits launchd's kill timeout, exit 0.</li>
+  </ul>
+</section>
+
+<section class="docs-section" id="stream" data-component="stream">
+  <header>
+    <h2 class="h2">The stream</h2>
+    <p class="docs-note">Mechanical: it carries sound onto one timeline and keeps it a while, and
+      decides nothing about what the sound is. The wire is <a href="protocol.html#stream">the
+      protocol's</a>.</p>
+  </header>
+  <figure class="figure" id="stream-figure">
+    <div class="figure-scroll">
+    <svg width="736" height="316" viewBox="0 0 736 316" role="img" aria-label="sample: three devices, each on its own clock, feed three tracks on the daemon's one clock; each track is cut into 10 second segments; one track has a hole where its device dropped; segments older than the window's trailing edge leave for the archive; readers read a range or follow a track live at now">
+      <defs>
+        <marker id="st-head" markerUnits="userSpaceOnUse" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path class="st-head" d="M0 0 10 5 0 10z" /></marker>
+      </defs>
+      <text class="st-label" x="358" y="20" text-anchor="middle">window's trailing edge</text>
+      <text class="st-label" x="702" y="20" text-anchor="middle">now</text>
+
+      <rect class="st-box" x="16" y="40" width="140" height="36" rx="6" />
+      <text class="st-name" x="28" y="63">ear-desk</text>
+      <rect class="st-box" x="16" y="92" width="140" height="36" rx="6" />
+      <text class="st-name" x="28" y="115">mouth-desk</text>
+      <rect class="st-box" x="16" y="144" width="140" height="36" rx="6" />
+      <text class="st-name" x="28" y="167">ear-hall</text>
+      <path class="st-arrow" d="M156 58H188" marker-end="url(#st-head)" />
+      <path class="st-arrow" d="M156 110H188" marker-end="url(#st-head)" />
+      <path class="st-arrow" d="M156 162H188" marker-end="url(#st-head)" />
+
+      <g aria-hidden="true">
+        <rect class="st-gone" x="190" y="40" width="83" height="36" rx="4" />
+        <rect class="st-gone" x="275" y="40" width="83" height="36" rx="4" />
+        <rect class="st-seg" x="360" y="40" width="83" height="36" rx="4" />
+        <rect class="st-seg" x="445" y="40" width="83" height="36" rx="4" />
+        <rect class="st-seg" x="530" y="40" width="83" height="36" rx="4" />
+        <rect class="st-open" x="615" y="40" width="85" height="36" rx="4" />
+        <rect class="st-gone" x="190" y="92" width="83" height="36" rx="4" />
+        <rect class="st-gone" x="275" y="92" width="83" height="36" rx="4" />
+        <rect class="st-seg" x="360" y="92" width="83" height="36" rx="4" />
+        <rect class="st-seg" x="445" y="92" width="83" height="36" rx="4" />
+        <rect class="st-seg" x="530" y="92" width="83" height="36" rx="4" />
+        <rect class="st-open" x="615" y="92" width="85" height="36" rx="4" />
+        <rect class="st-gone" x="190" y="144" width="83" height="36" rx="4" />
+        <rect class="st-gone" x="275" y="144" width="83" height="36" rx="4" />
+        <rect class="st-seg" x="360" y="144" width="83" height="36" rx="4" />
+        <rect class="st-seg" x="445" y="144" width="83" height="36" rx="4" />
+        <rect class="st-seg" x="575" y="144" width="83" height="36" rx="4" />
+        <rect class="st-open" x="660" y="144" width="40" height="36" rx="4" />
+      </g>
+      <text class="st-name" x="402" y="63" text-anchor="middle">&lt;n&gt;.pcm</text>
+      <text class="st-label" x="487" y="63" text-anchor="middle">10 s</text>
+      <text class="st-label" x="657" y="63" text-anchor="middle">open</text>
+      <path class="st-hole" d="M531 170H573" />
+      <text class="st-label" x="552" y="160" text-anchor="middle">hole</text>
+
+      <path class="st-edge" d="M358 28V188" />
+      <path class="st-edge" d="M702 28V188" />
+      <path class="st-clock" d="M190 196H702" />
+      <text class="st-label" x="190" y="214" text-anchor="middle">−60 s</text>
+      <text class="st-label" x="360" y="214" text-anchor="middle">−40 s</text>
+      <text class="st-label" x="530" y="214" text-anchor="middle">−20 s</text>
+      <text class="st-label" x="446" y="232" text-anchor="middle">the daemon's clock: every frame placed on it</text>
+
+      <path class="st-arrow" d="M274 180V250" marker-end="url(#st-head)" />
+      <rect class="st-box" x="190" y="252" width="168" height="48" rx="6" />
+      <text class="st-name" x="202" y="273">archive</text>
+      <text class="st-label" x="202" y="291">past the window, indexed</text>
+      <path class="st-arrow" d="M618 180V250" marker-end="url(#st-head)" />
+      <rect class="st-box" x="534" y="252" width="168" height="48" rx="6" />
+      <text class="st-name" x="546" y="273">readers</text>
+      <text class="st-label" x="546" y="291">read a range · listen live</text>
+      <text class="st-label" x="86" y="200" text-anchor="middle">each on its own clock,</text>
+      <text class="st-label" x="86" y="216" text-anchor="middle">offset measured by ping</text>
+    </svg>
+    </div>
+    <figcaption>Sample: three devices become three tracks on the daemon's one clock, each cut into
+      10 s segments as frames arrive; the hall's device dropped for a few seconds, a hole that holds
+      no file and reads as silence. Segments behind the window's trailing edge (dashed) leave
+      <code class="code">audio/</code> for the archive, or are deleted when none is set.</figcaption>
+  </figure>
+  <ul class="stack">
+    <li><strong>Devices.</strong> A device is a client of the socket, never inside the daemon: it
+      says it is an ear (what it hears) or a mouth (what it plays, as played) and its name, answers
+      the daemon's clock pings, and streams 20 ms frames stamped on its own clock.</li>
+    <li><strong>One clock.</strong> The daemon measures each device's offset by ping on connect and
+      again as it streams, and places every frame on its own timeline; events carry that time.</li>
+    <li><strong>On disk.</strong> Each track's frames append to 10 s segments, each closed one an
+      event; a gap is a hole event and writes nothing. After a kill the next boot cuts a torn segment
+      to whole frames and closes it: a restart loses at most the frames not yet written.</li>
+    <li><strong>The ears.</strong> One switch opens and closes the stream, kept across restarts;
+      closed, devices stay connected and are told, and their frames are refused.</li>
+    <li><strong>Window and archive.</strong> A window (default 600 s) and an optional archive
+      directory, both kept; a closed segment older than the window moves to the archive with an index
+      line, or is deleted with none. Nothing deletes from the archive.</li>
+    <li><strong>Readers.</strong> A range read streams from disk with silence for holes; a live
+      follow gets each frame as it is placed, within a frame plus transit.</li>
   </ul>
 </section>
 
 <section class="docs-section" id="designed" data-component="designed">
   <header>
-    <h2 class="h2">Designed, not built</h2>
-    <p class="docs-note">The audio path, in the order sound crosses it. Every stage writes its
-      results to the same log, so a client reads the room as events.</p>
+    <h2 class="h2">The path</h2>
+    <p class="docs-note">The audio path, in the order sound crosses it, part built. Every stage
+      writes its results to the same log, so a client reads the sound as events.</p>
   </header>
   <figure class="figure" id="path-figure">
     <div class="figure-scroll">
-    <svg width="736" height="300" viewBox="0 0 736 300" role="img" aria-label="rift's path: sound from devices becomes one stream on one clock, voices are split apart and given ids, words get times, and each lands in the event log; the log feeds clients live, clients send requests, and playback goes back out to a device and can stop mid-word; the log, the feed and the clients are built, the rest is designed">
+    <svg width="736" height="300" viewBox="0 0 736 300" role="img" aria-label="rift's path: sound from devices becomes one stream on one clock, voices are split apart and given ids, words get times, and each lands in the event log; the log feeds clients live, clients send requests, and playback goes back out to a device and can stop mid-word; devices, the stream, the log, the feed and the clients are built, the rest is designed">
       <defs>
         <marker id="rf-head" markerUnits="userSpaceOnUse" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path class="rf-head" d="M0 0 10 5 0 10z" /></marker>
       </defs>
-      <rect class="rf-box rf-later" x="16" y="24" width="148" height="64" rx="8" />
+      <rect class="rf-box" x="16" y="24" width="148" height="64" rx="8" />
       <text class="rf-name" x="30" y="50">① devices</text>
-      <text class="rf-label" x="30" y="72">ears · speakers</text>
-      <rect class="rf-box rf-later" x="200" y="24" width="148" height="64" rx="8" />
+      <text class="rf-label" x="30" y="72">ears · mouths</text>
+      <rect class="rf-box" x="200" y="24" width="148" height="64" rx="8" />
       <text class="rf-name" x="214" y="50">② one stream</text>
-      <text class="rf-label" x="214" y="72">every ear on one clock</text>
+      <text class="rf-label" x="214" y="72">every track on one clock</text>
       <rect class="rf-box rf-later" x="384" y="24" width="148" height="64" rx="8" />
       <text class="rf-name" x="398" y="50">③ voices</text>
       <text class="rf-label" x="398" y="72">split apart, given ids</text>
@@ -127,7 +241,7 @@
       <text class="rf-name" x="30" y="190">⑤ playback</text>
       <text class="rf-label" x="30" y="212">stops mid-word</text>
 
-      <path class="rf-arrow rf-later" d="M164 56H200" marker-end="url(#rf-head)" />
+      <path class="rf-arrow" d="M164 56H200" marker-end="url(#rf-head)" />
       <path class="rf-arrow rf-later" d="M348 56H384" marker-end="url(#rf-head)" />
       <path class="rf-arrow rf-later" d="M532 56H568" marker-end="url(#rf-head)" />
       <path class="rf-arrow rf-later" d="M644 88V164" marker-end="url(#rf-head)" />
@@ -142,15 +256,15 @@
     </svg>
     </div>
     <figcaption>The accented log is the daemon's memory; solid is built, dashed is designed.
-      Playback runs on the same clock as the ears, so it can stop at a word boundary the moment
+      Playback runs on the same clock as the tracks, so it can stop at a word boundary the moment
       quiet is set.</figcaption>
   </figure>
   <div class="table-wrap">
     <table data-table>
       <thead><tr><th>stage</th><th>what it does</th></tr></thead>
       <tbody>
-        <tr><td>① devices</td><td>each microphone and speaker is a device rift holds; one on another machine is a later protocol</td></tr>
-        <tr><td>② one stream</td><td>every input resampled onto one clock, so a moment means the same instant on every ear</td></tr>
+        <tr><td>① devices</td><td>clients of the socket, each an ear or a mouth; built with a file player (<code class="code">rift device</code>), microphones next; one on another machine is a later protocol</td></tr>
+        <tr><td>② one stream</td><td>built: every track on the daemon's clock, so a moment means the same instant on every track (<a href="#stream">the stream</a>)</td></tr>
         <tr><td>③ voices</td><td>overlapping speakers split into separate voices, each given an id that holds across the stream</td></tr>
         <tr><td>④ words</td><td>each voice transcribed to words, each word with its start and end on that clock</td></tr>
         <tr><td>⑤ playback</td><td>speech a client asks for, played on a device and stoppable mid-word, its progress logged</td></tr>
@@ -168,12 +282,34 @@
       <thead><tr><th>path</th><th>what</th></tr></thead>
       <tbody>
         <tr><td class="table-mono">~/.local/state/rift</td><td>the state root, mode 0700; <code class="code">$RIFT_ROOT</code> overrides</td></tr>
-        <tr><td class="table-mono">&lt;root&gt;/events.ndjson</td><td>the event log, the only durable state</td></tr>
-        <tr><td class="table-mono">&lt;root&gt;/run/rift.sock</td><td>the socket, in <code class="code">run/</code> (0700) beside the lock, the pid file and the daemon's own log</td></tr>
+        <tr><td class="table-mono">&lt;root&gt;/audio/&lt;boot&gt;/&lt;track&gt;/&lt;n&gt;.pcm</td><td>a segment's raw frames: the closed ones still in the window and each track's open one</td></tr>
+        <tr><td class="table-mono">&lt;root&gt;/events.ndjson</td><td>the event log, the durable state beside the audio</td></tr>
+        <tr><td class="table-mono">&lt;root&gt;/run/rift.sock</td><td>the socket, in <code class="code">run/</code> (0700) beside <code class="code">serve.lock</code> (the <code class="code">flock</code> that admits one instance), <code class="code">serve.pid</code> (a hint) and <code class="code">serve.log</code> (start, refused, accept, degraded, exit and panic lines)</td></tr>
         <tr><td class="table-mono">&lt;root&gt;/serve.err</td><td>launchd's stderr, for a failure before the daemon's log</td></tr>
-        <tr><td class="table-mono">~/.local/bin/rift</td><td>the binary: <a class="link" href="https://gigantic.dev/hotswap/">hotswap</a>'s link through <code class="code">~/.local/share/hotswap/rift/current</code>, the release installed</td></tr>
+        <tr><td class="table-mono">&lt;archive&gt;/audio/…, &lt;archive&gt;/index.ndjson</td><td>the archive, when one is set: every segment that left the window at its path, and its <code class="code">segment</code> event, one line each (<a href="protocol.html#audio">a repeated line</a> after a kill); nothing deletes there</td></tr>
+        <tr><td class="table-mono">~/.local/bin/rift</td><td>the binary: <a class="link" href="https://gigantic.dev/hotswap/">hotswap</a>'s link through <code class="code">~/.local/share/hotswap/rift/current</code>, the release installed; hotswap's record is under <code class="code">~/.local/state/hotswap/</code></td></tr>
         <tr><td class="table-mono">~/Library/LaunchAgents/dev.gigantic.rift.upgrade.plist</td><td>hotswap's upgrade agent: <code class="code">rift upgrade</code> every 900 s</td></tr>
         <tr><td class="table-mono">~/Library/LaunchAgents/dev.gigantic.rift.plist</td><td>the launchd agent: <code class="code">KeepAlive</code> on an unclean exit only, <code class="code">RunAtLoad</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section class="docs-section" id="environment" data-component="environment">
+  <header>
+    <h2 class="h2">Environment</h2>
+  </header>
+  <div class="table-wrap">
+    <table data-table>
+      <thead><tr><th>var</th><th>effect</th></tr></thead>
+      <tbody>
+        <tr><td class="table-mono">RIFT_BOOTOUT_MS</td><td><code class="code">setup</code>'s wait for launchd to let go of a job after a bootout, default 30000</td></tr>
+        <tr><td class="table-mono">RIFT_DRAIN_MS</td><td>the drain's budget for open connections before they are cut, default 1000 (launchd's <code class="code">ExitTimeOut</code> is 3 s)</td></tr>
+        <tr><td class="table-mono">RIFT_LOG_CAP</td><td>the size at which <code class="code">serve.log</code> and <code class="code">serve.err</code> each rotate to <code class="code">.1</code>, default 1 MiB</td></tr>
+        <tr><td class="table-mono">RIFT_PING_MS</td><td>how long after a device's last ping a frame's reply carries the next, default 10000</td></tr>
+        <tr><td class="table-mono">RIFT_READY_MS</td><td><code class="code">setup</code>'s wait for the loaded daemon to answer health ready, default 30000</td></tr>
+        <tr><td class="table-mono">RIFT_ROOT</td><td>the state root, default <code class="code">~/.local/state/rift</code>; the socket path under it must fit 103 bytes</td></tr>
+        <tr><td class="table-mono">RIFT_SEGMENT_MS</td><td>a segment's length, in whole 20 ms frames, at least one, default 10000</td></tr>
       </tbody>
     </table>
   </div>
@@ -197,7 +333,12 @@ mise run dist                           # a checkout: this host's release archiv
         <tr><td class="table-mono">rift serve</td><td>the daemon, in the foreground; launchd runs it</td></tr>
         <tr><td class="table-mono">rift status</td><td>prints the daemon's health, or <code class="code">{"code":"down","ok":false}</code></td></tr>
         <tr><td class="table-mono">rift quiet on|off</td><td>sets the quiet switch</td></tr>
+        <tr><td class="table-mono">rift ears on|off</td><td>opens or closes the ears</td></tr>
+        <tr><td class="table-mono">rift keep &lt;window s&gt; [&lt;archive&gt;]</td><td>sets the window and the archive, resolved against the working directory; none given, segments leaving the window are deleted</td></tr>
         <tr><td class="table-mono">rift feed [--after &lt;boot&gt;:&lt;seq&gt;]</td><td>prints the events, from this boot or after a position, then live</td></tr>
+        <tr><td class="table-mono">rift listen &lt;track&gt;</td><td>prints each frame placed on the track, live</td></tr>
+        <tr><td class="table-mono">rift read &lt;track&gt; &lt;from us&gt; &lt;to us&gt;</td><td>prints the range's frames, silence where nothing is held</td></tr>
+        <tr><td class="table-mono">rift device ear|mouth &lt;name&gt; &lt;file.pcm&gt; [--fast]</td><td>a device, its own process: plays a raw PCM file (16 kHz, mono, 16-bit little-endian) as the track's frames, a short tail dropped, answering every ping, paced in real time and stamped from now, or with <code class="code">--fast</code> sent as fast as each is answered and stamped as if captured ending now; prints its reply, then each notice and refusal; exit 0 once every frame is answered, <code class="code">{"code":"unknown","ok":false}</code> and exit 1 if the connection ends first; an unreadable file is <code class="code">rift device: &lt;cause&gt;</code>, exit 1</td></tr>
         <tr><td class="table-mono">rift setup [--print | --remove]</td><td>brings the release into hotswap's layout and links <code class="code">~/.local/bin/rift</code> (with none installed, the latest, through packslip), then writes and loads the agent on that link, or swaps it with one <code class="code">kickstart -k</code>, then waits for the new daemon to answer health ready; <code class="code">--print</code> prints the plist, <code class="code">--remove</code> has hotswap forget the layout and the upgrade agent, unloads the agent and removes the plist and the link</td></tr>
         <tr><td class="table-mono">rift upgrade [--check | --back | --retry]</td><td>hotswap's swap onto a newer release: installed beside the running one, <code class="code">current</code> moved, <code class="code">rift setup</code>, then the smoke (<code class="code">rift version</code>, <code class="code">rift status</code> until the daemon answers with it); a failure rolls back. Exit 0 green or settled, 1 red, 2 unable to try</td></tr>
         <tr><td class="table-mono">rift version</td><td>the build, as the hello reports it</td></tr>

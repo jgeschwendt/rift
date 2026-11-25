@@ -52,6 +52,10 @@
     <a class="pill" href="#events">events</a>
     <a class="pill" href="#log">the log</a>
     <a class="pill" href="#feed">feed</a>
+    <a class="pill" href="#stream">the stream</a>
+    <a class="pill" href="#devices">devices</a>
+    <a class="pill" href="#audio">audio on disk</a>
+    <a class="pill" href="#readers">readers</a>
     <a class="pill" href="#clients">client rules</a>
   </nav>
 </header>
@@ -91,7 +95,7 @@
   <pre class="tree">{"boot":7,"ok":true,"pid":4211,"proto":1,"since":"2026-11-22T18:04:11.201Z","state":"ready","version":"2026.11.0-abc1234"}</pre>
   <ul class="stack">
     <li><code class="code">state</code> is <code class="code">ready</code>, <code class="code">degraded</code>
-      (the log refused the last append; <code class="code">ready</code> again once one succeeds, and
+      (the last write to the log or a segment failed; <code class="code">ready</code> again once one succeeds, and
       no event carries either: a client sees it in its next hello or health) or
       <code class="code">stopping</code>. The socket is bound only once the daemon has derived its state from <a href="#log">the log</a>,
       so no client sees it booting: until then a connect is refused, as when it is down.</li>
@@ -112,16 +116,23 @@
     <h2 class="h2">Requests</h2>
   </header>
   <p class="docs-note">After hello the connection carries requests, one per line, each answered by
-    one line. Any line, hello included, may carry <code class="code">"id"</code>, a string or number,
+    one line (a <code class="code">pong</code> by none). Any line, hello included, may carry <code class="code">"id"</code>, a string or number,
     and its reply echoes it, an error included; <code class="code">"id":null</code> is no id, and an
     id of another type is <code class="code">bad_request</code>, not echoed.</p>
   <div class="table-wrap">
     <table data-table>
       <thead><tr><th>op</th><th>request</th><th>reply</th></tr></thead>
       <tbody>
+        <tr><td class="table-mono">device</td><td class="table-mono">{"kind":"ear","name":"desk","op":"device"}</td><td><code class="code">{"ears":true,"ok":true,"ping":1764000000000000,"track":"ear-desk"}</code>, then the connection is that track's <a href="#devices">device</a></td></tr>
+        <tr><td class="table-mono">ears</td><td class="table-mono">{"on":true,"op":"ears"}</td><td>as <code class="code">quiet</code>, for <a href="#stream">the ears</a></td></tr>
         <tr><td class="table-mono">feed</td><td class="table-mono">{"after":null,"op":"feed"}<br />{"after":{"boot":7,"seq":12},"op":"feed"}</td><td><code class="code">{"ok":true,"reset":false}</code>, then the connection is a <a href="#feed">feed</a>; <code class="code">after</code> is required</td></tr>
-        <tr><td class="table-mono">health</td><td class="table-mono">{"op":"health"}</td><td>the hello reply's fields, plus <code class="code">"quiet":false</code> and <code class="code">"seq":12</code>, the last event's <code class="code">seq</code> in this boot</td></tr>
+        <tr><td class="table-mono">frame</td><td class="table-mono">{"op":"frame","pcm":"…","t":81234567}</td><td>a device's: <code class="code">{"ok":true,"t":1764000000020000}</code>, the frame's time on its track, perhaps with a <code class="code">ping</code></td></tr>
+        <tr><td class="table-mono">health</td><td class="table-mono">{"op":"health"}</td><td>the hello reply's fields, plus <code class="code">"quiet":false</code>, <code class="code">"seq":12</code> (the last event's <code class="code">seq</code> in this boot), and the stream's <code class="code">"archive":null</code>, <code class="code">"devices":["ear-desk"]</code> (the live tracks), <code class="code">"ears":true</code> and <code class="code">"window":600</code></td></tr>
+        <tr><td class="table-mono">keep</td><td class="table-mono">{"archive":"/Volumes/a/rift","op":"keep","window":600}</td><td><code class="code">{"ok":true,"seq":14}</code>: the <a href="#audio">window</a> in seconds and the archive, an absolute directory or <code class="code">null</code>; then a sweep</td></tr>
+        <tr><td class="table-mono">listen</td><td class="table-mono">{"op":"listen","track":"ear-desk"}</td><td><code class="code">{"ok":true}</code>, then the connection follows the track <a href="#readers">live</a></td></tr>
+        <tr><td class="table-mono">pong</td><td class="table-mono">{"op":"pong","ping":1764000000000000,"t":81234000}</td><td>a device's answer to a <a href="#devices">ping</a>; none</td></tr>
         <tr><td class="table-mono">quiet</td><td class="table-mono">{"on":true,"op":"quiet"}</td><td><code class="code">{"changed":true,"ok":true,"seq":13}</code>; the value it already has appends nothing and answers <code class="code">"changed":false</code> with the current <code class="code">seq</code></td></tr>
+        <tr><td class="table-mono">read</td><td class="table-mono">{"from":1764000000000000,"op":"read","to":1764000010000000,"track":"ear-desk"}</td><td><code class="code">{"ok":true}</code>, then <a href="#readers">the range</a>, then end of stream</td></tr>
         <tr><td class="table-mono">shutdown</td><td class="table-mono">{"op":"shutdown"}</td><td><code class="code">{"ok":true}</code>, then the daemon drains and exits 0; the agent does not respawn it</td></tr>
       </tbody>
     </table>
@@ -133,12 +144,17 @@
     <table data-table>
       <thead><tr><th>code</th><th>when</th></tr></thead>
       <tbody>
-        <tr><td class="table-mono">bad_request</td><td>not JSON, not an object, a missing or mistyped field</td></tr>
-        <tr><td class="table-mono">io</td><td>the log refused the append; nothing changed</td></tr>
+        <tr><td class="table-mono">bad_frame</td><td><code class="code">pcm</code> is not 640 bytes as hex</td></tr>
+        <tr><td class="table-mono">bad_request</td><td>not JSON, not an object, a missing or mistyped field; a kind, name or track not of <a href="#stream">the form</a>; <code class="code">frame</code> or <code class="code">pong</code> off a device, <code class="code">device</code>, <code class="code">feed</code>, <code class="code">listen</code> or <code class="code">read</code> on one; a <code class="code">read</code> whose <code class="code">from</code> is not before its <code class="code">to</code></td></tr>
+        <tr><td class="table-mono">closed</td><td>a frame while the ears are closed; it was not taken</td></tr>
+        <tr><td class="table-mono">gone</td><td>a <code class="code">read</code> from before now less the window</td></tr>
+        <tr><td class="table-mono">io</td><td>a write to the log or a segment failed; nothing changed</td></tr>
         <tr><td class="table-mono">proto</td><td>the hello's protocol is not the daemon's</td></tr>
         <tr><td class="table-mono">stopping</td><td>a request other than <code class="code">health</code> while draining</td></tr>
+        <tr><td class="table-mono">taken</td><td>a <code class="code">device</code> for a track another device is streaming</td></tr>
         <tr><td class="table-mono">too_long</td><td>the line is over the <a href="#framing">limit</a></td></tr>
         <tr><td class="table-mono">unknown_op</td><td>an op this protocol does not have, a second hello included</td></tr>
+        <tr><td class="table-mono">unsynced</td><td>a frame before its device's first <code class="code">pong</code>: it has no place on the timeline yet</td></tr>
       </tbody>
     </table>
   </div>
@@ -160,8 +176,13 @@
       <thead><tr><th>kind</th><th>fields</th><th>when</th></tr></thead>
       <tbody>
         <tr><td class="table-mono">boot</td><td class="table-mono">pid, version</td><td>the first event of every boot</td></tr>
+        <tr><td class="table-mono">ears</td><td class="table-mono">on</td><td>the ears opened or closed</td></tr>
+        <tr><td class="table-mono">hole</td><td class="table-mono">samples, start, track</td><td>a gap in a track's frames this boot, logged as the frame after it arrives</td></tr>
+        <tr><td class="table-mono">keep</td><td class="table-mono">archive, window</td><td>the window or archive was set</td></tr>
         <tr><td class="table-mono">quiet</td><td class="table-mono">on</td><td>the quiet setting changed: health's <code class="code">quiet</code> is <code class="code">on</code> from here</td></tr>
+        <tr><td class="table-mono">segment</td><td class="table-mono">n, path, samples, start, track</td><td>a segment closed; <code class="code">path</code> is under the root, <code class="code">audio/&lt;boot&gt;/&lt;track&gt;/&lt;n&gt;.pcm</code></td></tr>
         <tr><td class="table-mono">stop</td><td class="table-mono">reason</td><td>the drain began: health's <code class="code">state</code> is <code class="code">stopping</code> from here, and nothing follows it in this boot; a killed boot has none</td></tr>
+        <tr><td class="table-mono">track</td><td class="table-mono">start, track</td><td>a track's first frame this boot</td></tr>
       </tbody>
     </table>
   </div>
@@ -177,10 +198,12 @@
     <li><code class="code">&lt;root&gt;/events.ndjson</code>, append-only, one event per line, written in
       one unbuffered write before the event reaches any feed and before the request that caused it
       is answered. There is no fsync: an event survives a kill, not a power loss.</li>
-    <li>It is the daemon's only durable state. On boot the daemon derives <code class="code">boot</code>
-      (the log's last boot plus 1) and <code class="code">quiet</code> (the last <code class="code">quiet</code>
-      event's <code class="code">on</code>, default <code class="code">false</code>) from it. A torn last
-      line, left by a kill mid-write, is cut off.</li>
+    <li>It is the daemon's durable state beside <a href="#audio">the audio</a>. On boot the daemon
+      derives from it <code class="code">boot</code> (the log's last boot plus 1),
+      <code class="code">quiet</code> and <code class="code">ears</code> (the last such event's
+      <code class="code">on</code>, default <code class="code">false</code>), the window and archive (the
+      last <code class="code">keep</code>, default 600 s and none), and the closed segments still under
+      <code class="code">audio/</code>. A torn last line, left by a kill mid-write, is cut off.</li>
   </ul>
 </section>
 
@@ -203,13 +226,103 @@
   </ul>
 </section>
 
+<section class="docs-section" id="stream" data-component="stream">
+  <header>
+    <h2 class="h2">The stream</h2>
+  </header>
+  <ul class="stack">
+    <li>One timeline: the daemon's clock, microseconds since the epoch. Every <code class="code">start</code>,
+      <code class="code">from</code>, <code class="code">to</code> and <code class="code">ping</code>, and the
+      <code class="code">t</code> of a reply or a frame sent to a reader, is on it; only the
+      <code class="code">t</code> a device sends is on the device's own clock.</li>
+    <li>A frame is 20 ms of 16 kHz mono 16-bit little-endian PCM, 640 bytes, carried as 1280 lowercase hex
+      digits so every message stays one JSON line. 320 samples; a sample is 62.5 µs, and a time
+      between two samples takes the earlier.</li>
+    <li>A track is <code class="code">&lt;kind&gt;-&lt;name&gt;</code>: kind <code class="code">ear</code> (what a
+      device heard) or <code class="code">mouth</code> (what it played, as played), name 1 to 64 of
+      <code class="code">A–Z a–z 0–9 - _</code>. One device streams a track at a time.</li>
+    <li>The ears are open or closed, closed by default, kept across restarts. Closed, devices stay
+      connected and their frames are refused <code class="code">closed</code>; closing them closes every
+      open segment. Every device is told each change: <code class="code">{"ears":false}</code>.</li>
+  </ul>
+</section>
+
+<section class="docs-section" id="devices" data-component="devices">
+  <header>
+    <h2 class="h2">Devices</h2>
+  </header>
+  <ul class="stack">
+    <li>After its <code class="code">device</code> reply a connection sends frames and pongs. What it
+      reads back is a reply (it carries <code class="code">ok</code>, answering its last frame) or a
+      notice of the ears; any line carrying <code class="code">ping</code> is answered with a
+      <code class="code">pong</code> holding that ping and the device's clock.</li>
+    <li>The device reply carries a ping, and a frame's reply carries the next once
+      <code class="code">$RIFT_PING_MS</code> (<a href="index.html#environment">default</a> 10 s) has
+      passed since the last. The daemon takes the midpoint between sending a ping and reading its pong
+      as the instant the device's clock read the pong's <code class="code">t</code>, and places each
+      later frame by that offset. A frame before the first pong is refused
+      <code class="code">unsynced</code>. Pings ride frame replies, so an idle device is not
+      re-measured until it sends again.</li>
+    <li>A track's first frame in a boot starts it (<code class="code">track</code>). A frame half a
+      frame or more past the track's end closes the open segment and is a <code class="code">hole</code>
+      from that end; any other frame goes at the end, so jitter never splits a track. Each frame is
+      on disk and with every listener before its reply.</li>
+  </ul>
+</section>
+
+<section class="docs-section" id="audio" data-component="audio">
+  <header>
+    <h2 class="h2">Audio on disk</h2>
+  </header>
+  <ul class="stack">
+    <li><code class="code">&lt;root&gt;/audio/&lt;boot&gt;/&lt;track&gt;/&lt;n&gt;.pcm</code>, raw frames appended as they
+      arrive. A segment closes, with its <code class="code">segment</code> event, once
+      <code class="code">$RIFT_SEGMENT_MS</code> long (default 10 s, in whole frames), at a hole, as its
+      device leaves, as the ears close and in the drain; <code class="code">n</code> counts a track's
+      segments in its boot.</li>
+    <li>A hole writes nothing; a reader gets silence for it. It is logged when the track's next frame
+      arrives in the same boot, so a device that never returns, or returns after a restart, leaves no
+      hole event: a gap is always derivable from segment starts and samples.</li>
+    <li>A kill leaves the open segments without events. The next boot cuts each one to whole frames and
+      closes it with its event, its start where its track's last event of that boot ended: a restart
+      loses at most the frames not yet written.</li>
+    <li>The sweep, at each segment's close, each <code class="code">keep</code> and each boot: a closed
+      segment that ended more than the window ago leaves <code class="code">audio/</code>. With an
+      archive it is copied to the same path under it, its <code class="code">segment</code> event as
+      logged is appended to the archive's <code class="code">index.ndjson</code>, then it is removed;
+      with none it is deleted. One that fails stays for the next sweep. A kill between the index line
+      and the removal repeats the line at the next sweep: a reader of the index takes the last line per
+      <code class="code">path</code>. Nothing deletes from the archive.</li>
+  </ul>
+</section>
+
+<section class="docs-section" id="readers" data-component="readers">
+  <header>
+    <h2 class="h2">Readers</h2>
+  </header>
+  <ul class="stack">
+    <li>After the <code class="code">read</code> reply the daemon sends the range as frames,
+      <code class="code">{"pcm":"…","t":1764000000000000}</code>, from <code class="code">from</code> in
+      20 ms steps (the last may be shorter), silence wherever nothing is held, <code class="code">to</code>
+      capped at now; then the end of stream. It streams from disk a segment at a time, so a read of any
+      length holds a segment or two. A range starting before now less the window is
+      <code class="code">gone</code>; the archive is for other readers.</li>
+    <li>After the <code class="code">listen</code> reply the daemon sends each frame placed on the track,
+      the same shape, until it drops the client, as a <a href="#feed">feed</a> does (1024 frames
+      behind). There is no replay: a client wanting the recent past reads it first.</li>
+  </ul>
+</section>
+
 <section class="docs-section" id="clients" data-component="clients">
   <header>
     <h2 class="h2">Client rules</h2>
   </header>
   <ul class="stack">
-    <li><code class="code">health</code>, <code class="code">feed</code> and <code class="code">quiet</code>
-      are safe to retry; <code class="code">shutdown</code> only when the request was provably not sent.</li>
+    <li><code class="code">health</code>, <code class="code">feed</code>, <code class="code">quiet</code>,
+      <code class="code">ears</code>, <code class="code">keep</code>, <code class="code">listen</code> and
+      <code class="code">read</code> are safe to retry; <code class="code">shutdown</code> and a
+      <code class="code">frame</code> only when the request was provably not sent, since a frame sent
+      twice lands twice.</li>
     <li>A request whose connection ends before its reply, after it was sent, has an unknown outcome,
       as does an error code the client does not know.</li>
     <li>A client's own codes, beside the daemon's: <code class="code">down</code>, the request provably
