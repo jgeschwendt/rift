@@ -87,7 +87,8 @@ anything is written), `gui/<id -u>` the domain, each call that changes something
    `$RIFT_SIGN_MS`: a password (`wrote <root>/rift.keychain-pass`, 16 random bytes as hex, 0600)
    when absent, which also drops a keychain left without one; `security create-keychain -p <pw>`
    and `set-keychain-settings` (no timeout) when the keychain is absent (`made <keychain>`);
-   `security unlock-keychain -p <pw>` every run, before anything that could ask at the screen; the
+   `security unlock-keychain -p <pw>` every run (the file read with trailing whitespace cut: a
+   hand-made file's newline failed the unlock), before anything that could ask at the screen; the
    SHA-1 the first 40-hex word of `security find-identity -p codesigning <keychain>`, and, when none,
    one `sh -c`: `openssl req -x509 -newkey rsa:2048 -nodes -days 36500 -subj /CN=rift` with
    `keyUsage=critical,digitalSignature` and `extendedKeyUsage=critical,codeSigning`, `openssl
@@ -118,12 +119,26 @@ anything is written), `gui/<id -u>` the domain, each call that changes something
    wrong, end both (`mic` and `late` in the suite; verified 2026-11-25 · a 200 s run, twenty
    full segments, then a restart, its one hole, and a 300 ms freeze with none);
 5. the plist by temp + rename (`wrote <path>`);
-6. the same plist already loaded: `kickstart -k`, the swap; else booted out when loaded, then
-   `bootstrap`;
+6. the same plist already loaded and the release not re-signed this run: `kickstart -k`, the
+   swap; else the reload: booted out when loaded, then `bootstrap`;
 7. health polled every 100 ms until a daemon answers ready (after a swap, not the one it
-   replaced), at most `$RIFT_READY_MS`: `<label> not ready <ms> ms after its load; see
-   <root>/serve.err`, exit 1. launchd holds a respawn until 10 s after the last launch, so a swap
-   soon after a load waits that out.
+   replaced). None past `$RIFT_RELOAD_MS`: `<label> not ready <ms> ms after its load; loading it
+   again`, the reload once more, then at most `$RIFT_READY_MS`: `<label> not ready <ms> ms after
+   its load; see <root>/serve.err`, exit 1. launchd holds a kickstart's respawn until 10 s after
+   the last launch, so a swap soon after a load waits that out, inside the first budget.
+
+Observed (observed 2026-11-25 · `/usr/bin/log show`, since zsh shadows `log`): the first upgrade
+onto a signing release re-signed it, then `kickstart -k`; launchd refused the spawn (`Launch
+Constraint Violation`, `OS_REASON_CODESIGNING`; `launchctl print`: `job state = spawn failed`, `last
+exit code = 78: EX_CONFIG`). The background-task manager's record for a plist in
+`~/Library/LaunchAgents` still held the ad-hoc identity and changed about 100 ms after the refusal;
+a refused job stays refused through every later kickstart, and a bootout then a bootstrap spawned
+it at once. It needs a job the system already holds a record for, so the suite stands it in with
+the stub's `refuse`. Hence a reload after any re-sign, and one reload past the first budget for
+whatever else refuses. A rollback onto a release older than this runs that release's setup, which
+only kickstarts a loaded job: a job refused before it, or refused onto that release's ad-hoc
+signature, stays down until a setup of this release or `launchctl bootout` then `bootstrap` by
+hand.
 
 After each bootout `launchctl print` is polled every 100 ms until it fails, at most
 `$RIFT_BOOTOUT_MS`: `<label> still loaded <ms> ms after its bootout`, exit 1. `setup --remove`
@@ -144,8 +159,8 @@ grant is its own.
 unable to try; another argument `usage: rift upgrade [--check | --back | --retry]`, 2). The
 manifest: repo `jgeschwendt/rift`, bin `rift`, setup `rift setup`, smoke `rift version` then
 `/bin/sh -c` polling `rift status` once a second, 30 tries, until its health's `version` is `rift
-version`'s; no agents to kickstart and no drain step, since setup's own `kickstart -k` is the swap
-and its SIGTERM the daemon's drain. The signer is `ps1_fby5zwdz6ddvk4frxkhs4mmpny`,
+version`'s; no agents to kickstart and no drain step, since setup's own swap sends the SIGTERM
+that is the daemon's drain. The signer is `ps1_fby5zwdz6ddvk4frxkhs4mmpny`,
 what `packslip pin` prints for a release's `packslip.sigstore.json`; `v2026.11.0` was cut before
 the pin, so an install of it cannot upgrade.
 

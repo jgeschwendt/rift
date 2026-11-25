@@ -2048,9 +2048,11 @@ mod tests {
     /// label running the link's `serve`), moving its root here while this one is absent and
     /// leaving it otherwise, has hotswap link `~/.local/bin/rift` and load the upgrade agent,
     /// makes the root 0700 before the agent loads, bootstraps a new plist, kickstarts the same one
-    /// loaded (its respawn held back a second, as by `ThrottleInterval`), reloads a changed one,
-    /// returns only once the loaded daemon answers health ready, fails on a failed bootstrap, a
-    /// job still loaded past `$RIFT_BOOTOUT_MS` or none ready past `$RIFT_READY_MS`; `upgrade`
+    /// loaded (its respawn held back a second, as by `ThrottleInterval`), reloads a changed one or
+    /// a re-signed release, returns only once the loaded daemon answers health ready, reloads once
+    /// a job none answers for past `$RIFT_RELOAD_MS` (`refuse`: a kickstart launchd refuses to
+    /// spawn), fails on a failed bootstrap, a job still loaded past `$RIFT_BOOTOUT_MS` or none
+    /// ready past `$RIFT_READY_MS` after that reload; `upgrade`
     /// swaps under the manifest, green once the swapped daemon answers with the new version;
     /// `--remove` has hotswap forget the layout and the upgrade agent, then boots the daemon and
     /// any earlier install out and removes their plists and the link.
@@ -2143,7 +2145,7 @@ case $1 in
 print) [ -f {root}/loaded/$job.going ] && {{ rm {root}/loaded/$job.going; exit 0; }}; [ -f {root}/loaded/$job ] || exit 113;;
 bootout) kill $(cat {root}/loaded/$job) 2>/dev/null; [ -f {root}/stuck ] || mv {root}/loaded/$job {root}/loaded/$job.going;;
 bootstrap) case $3 in *.upgrade.plist) touch {root}/loaded/$(basename $3 .plist); exit;; esac; held=$(sed -n 's|.*<key>RIFT_ROOT</key><string>\(.*\)</string>.*|\1|p' $3); [ -n "$(find "$held" -maxdepth 0 -perm 700)" ] && echo root 0700 >> {root}/launchctl.log; [ -f {root}/fail ] && {{ echo 'Bootstrap failed: 5: Input/output error' >&2; exit 5; }}; start $3;;
-kickstart) kill $(cat {root}/loaded/${{3##*/}}); {{ sleep 1; start {file}; }} >/dev/null 2>&1 &;;
+kickstart) kill $(cat {root}/loaded/${{3##*/}}); [ -f {root}/refuse ] && exit; {{ sleep 1; start {file}; }} >/dev/null 2>&1 &;;
 esac
 "#,
                 serve = env!("CARGO_BIN_EXE_rift")
@@ -2155,7 +2157,8 @@ esac
         )?;
         // the signing tools, each call logged to sign.log by its first word: `fail-<word>` fails it,
         // `locked` stands for a locked keychain, which only an unlock lifts and codesign then
-        // refuses, `hang` holds codesign as a prompt at the screen would; the keychain file holds
+        // refuses, `hang` holds codesign as a prompt at the screen would; an unlock refuses any
+        // password but the password file's, its trailing newline cut; the keychain file holds
         // its identity, an import's SHA-1 of its path, and `signature` the requirement codesign
         // last signed to
         fs::write(
@@ -2168,7 +2171,7 @@ case $1 in
 create-keychain) : > "$4";;
 find-identity) [ -s "$4" ] && printf '  1) %s "rift" (CSSMERR_TP_NOT_TRUSTED)\n     1 identities found\n' "$(cat "$4")";;
 import) printf %s "$4" | shasum | cut -c1-40 > "$4";;
-unlock-keychain) rm -f {root}/locked;;
+unlock-keychain) [ "$3" = "$(cat "${{4%db}}pass")" ] || {{ echo 'The user name or passphrase you entered is not correct.' >&2; exit 51; }}; rm -f {root}/locked;;
 esac
 exit 0
 "#
@@ -2297,7 +2300,10 @@ esac
         )?;
         same(&fs::read_to_string(&file)?, &plist(&data))?;
         same(&fs::exists(format!("{file}.new"))?.to_string(), "false")?;
-        // a second run remakes nothing and signs nothing
+        // a second run, its password file ending in a hand-made newline, remakes nothing and
+        // signs nothing
+        let secret = format!("{data}/rift.keychain-pass");
+        fs::write(&secret, format!("{}\n", fs::read_to_string(&secret)?))?;
         same(
             &format!("{}{}{}", run(&stubbed, &[], &[])?, calls()?, signs()?),
             &format!(
@@ -2311,6 +2317,20 @@ esac
             &fs::read_link(&exe)?.display().to_string(),
             &format!("{layout}/current/rift"),
         )?;
+        // a kickstart launchd refuses to spawn: loaded afresh past $RIFT_RELOAD_MS, then ready
+        fs::write(format!("{root}/refuse"), "")?;
+        same(
+            &format!(
+                "{}{}{}",
+                run(&stubbed, &[("RIFT_RELOAD_MS", "0")], &[])?,
+                calls()?,
+                signs()?
+            ),
+            &format!(
+                "0\n{linked}wrote {file}\nlaunchctl kickstart -k {job}\ndev.gigantic.rift not ready 0 ms after its load; loading it again\nlaunchctl bootout {job}\nlaunchctl bootstrap {gui} {file}\nprint {job}\n{tended}kickstart -k {job}\nprint {job}\nbootout {job}\nprint {job}\nprint {job}\nbootstrap {gui} {file}\nroot 0700\n{steady}"
+            ),
+        )?;
+        fs::remove_file(format!("{root}/refuse"))?;
         // the swap: setup through the link, its kickstart, then the smoke against the new daemon
         same(
             &format!(
@@ -2335,7 +2355,8 @@ esac
             &rift(&data, &[("HOME", home.as_str())], &["upgrade", "--x"])?,
             "2\nusage: rift upgrade [--check | --back | --retry]\n",
         )?;
-        // a rebuilt release (its signature gone) under a locked keychain: unlocked, then signed
+        // a rebuilt release (its signature gone) under a locked keychain: unlocked, signed, then
+        // loaded afresh rather than kickstarted
         let hash = id(&data)?;
         fs::remove_file(format!("{root}/signature"))?;
         fs::write(format!("{root}/locked"), "")?;
@@ -2348,7 +2369,7 @@ esac
                 fs::exists(format!("{root}/locked"))?
             ),
             &format!(
-                "0\n{linked}signed {release} as dev.gigantic.rift by {hash}\nwrote {file}\nlaunchctl kickstart -k {job}\nprint {job}\n{tended}kickstart -k {job}\n{steady}codesign -f {release}.new\n false"
+                "0\n{linked}signed {release} as dev.gigantic.rift by {hash}\nwrote {file}\nlaunchctl bootout {job}\nlaunchctl bootstrap {gui} {file}\nprint {job}\n{tended}print {job}\nbootout {job}\nprint {job}\nprint {job}\nbootstrap {gui} {file}\nroot 0700\n{steady}codesign -f {release}.new\n false"
             ),
         )?;
         // each failure is one line, exit 1, before the daemon is touched; a failed signing
@@ -2498,17 +2519,22 @@ esac
             ),
         )?;
         fs::remove_file(format!("{root}/stuck"))?;
-        // a load that never answers ready fails past $RIFT_READY_MS
+        // a load that never answers ready is loaded afresh past $RIFT_RELOAD_MS, then fails past
+        // $RIFT_READY_MS
         fs::write(format!("{root}/dead"), "")?;
         same(
             &format!(
                 "{}{}{}",
-                run(&stubbed, &[("RIFT_READY_MS", "0")], &[])?,
+                run(
+                    &stubbed,
+                    &[("RIFT_READY_MS", "0"), ("RIFT_RELOAD_MS", "0")],
+                    &[]
+                )?,
                 calls()?,
                 signs()?
             ),
             &format!(
-                "1\n{linked}signed {release} as dev.gigantic.rift by {hash}\nwrote {file}\nlaunchctl bootout {job}\nlaunchctl bootstrap {gui} {file}\nrift setup: dev.gigantic.rift not ready 0 ms after its load; see {data}/serve.err\nprint {job}\n{tended}print {job}\nbootout {job}\nprint {job}\nprint {job}\nbootstrap {gui} {file}\nroot 0700\n{steady}codesign -f {release}.new\n"
+                "1\n{linked}signed {release} as dev.gigantic.rift by {hash}\nwrote {file}\nlaunchctl bootout {job}\nlaunchctl bootstrap {gui} {file}\ndev.gigantic.rift not ready 0 ms after its load; loading it again\nlaunchctl bootstrap {gui} {file}\nrift setup: dev.gigantic.rift not ready 0 ms after its load; see {data}/serve.err\nprint {job}\n{tended}print {job}\nbootout {job}\nprint {job}\nprint {job}\nbootstrap {gui} {file}\nroot 0700\nprint {job}\nprint {job}\nbootstrap {gui} {file}\nroot 0700\n{steady}codesign -f {release}.new\n"
             ),
         )?;
         fs::remove_file(format!("{root}/dead"))?;

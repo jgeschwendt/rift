@@ -292,8 +292,8 @@ fn lock(live: &Mutex<Live>) -> MutexGuard<'_, Live> {
 
 /// rift's hotswap manifest (gigantic.dev/hotswap/): releases from jgeschwendt/rift under its
 /// packslip signer and `rift setup` after each swap. No agent to kickstart and no drain step:
-/// setup itself swaps the daemon with one `kickstart -k`, whose SIGTERM is the daemon's own drain,
-/// and returns once the new one answers ready. The smoke is the new binary's `version`, then
+/// setup itself swaps the daemon, whose SIGTERM is the daemon's own drain, and returns once the
+/// new one answers ready. The smoke is the new binary's `version`, then
 /// `status` until the daemon answers with that same version, 30 s at most.
 fn manifest() -> hotswap::Manifest {
     let owned = |words: &[&str]| words.iter().map(|&word| word.to_owned()).collect();
@@ -1613,7 +1613,8 @@ fn main() -> ExitCode {
                         .write_all(hex(&noise).as_bytes())?;
                     println!("wrote {}", pass.display());
                 }
-                let secret = fs::read_to_string(&pass)?;
+                // trimmed: a hand-made file's newline would be part of the password
+                let secret = fs::read_to_string(&pass)?.trim_end().to_owned();
                 if !fs::exists(&keychain)? {
                     need("security", &["create-keychain", "-p", &secret, &kc])?;
                     // no lock timeout and none at sleep: only a reboot locks it
@@ -1676,10 +1677,10 @@ security import "$1/identity.p12" -k "$3" -P "$2" -T /usr/bin/codesign"#,
                 let program = target.to_string_lossy();
                 let wanted =
                     format!("-R=identifier \"{label}\" and certificate leaf = H\"{hash}\"");
-                if !ask("codesign", &["-v", &wanted, &program])?
+                let signed = !ask("codesign", &["-v", &wanted, &program])?
                     .status
-                    .success()
-                {
+                    .success();
+                if signed {
                     // a copy signed and renamed over it: a running rift keeps the file it mapped
                     let copy = target.with_added_extension("new");
                     let _: u64 = fs::copy(&target, &copy)?;
@@ -1716,34 +1717,54 @@ security import "$1/identity.p12" -k "$3" -P "$2" -T /usr/bin/codesign"#,
                         serde_json::from_str(&BufReader::new(stream).lines().nth(1)?.ok()?).ok()?;
                     (reply["state"] == "ready").then(|| reply["pid"].clone())
                 };
-                // the same plist loaded: a swap is one kickstart; else it is loaded afresh
-                let before = if swap {
+                let load = || -> io::Result<()> {
+                    unload(label)?;
+                    must(&["bootstrap", &gui, &path.to_string_lossy()])
+                };
+                // the same plist loaded and the release not re-signed: a swap is one kickstart;
+                // else it is loaded afresh, since launchd refused a kickstart onto a changed
+                // signature (AGENTS.md, observed 2026-11-25)
+                let before = if swap && !signed {
                     let before = serving();
                     must(&["kickstart", "-k", &job])?;
                     before
                 } else {
-                    unload(label)?;
-                    must(&["bootstrap", &gui, &path.to_string_lossy()])?;
+                    load()?;
                     None
                 };
                 // launchd holds a respawn until ThrottleInterval after the last launch: wait it out
-                let (begun, patience) = (
-                    Instant::now(),
+                let ready = |wait: Duration| {
+                    let begun = Instant::now();
+                    while !serving().is_some_and(|now| Some(now) != before) {
+                        if begun.elapsed() > wait {
+                            return false;
+                        }
+                        thread::sleep(Duration::from_millis(100));
+                    }
+                    true
+                };
+                let (first, patience) = (
+                    Duration::from_millis(setting("RIFT_RELOAD_MS", 15_000)),
                     Duration::from_millis(setting("RIFT_READY_MS", 30_000)),
                 );
-                loop {
-                    if serving().is_some_and(|now| Some(now) != before) {
-                        return Ok(());
-                    }
-                    if begun.elapsed() > patience {
-                        return Err(io::Error::other(format!(
-                            "{label} not ready {} ms after its load; see {}",
-                            patience.as_millis(),
-                            root.join("serve.err").display()
-                        )));
-                    }
-                    thread::sleep(Duration::from_millis(100));
+                if ready(first) {
+                    return Ok(());
                 }
+                // a job launchd refused to spawn stays refused through any kickstart: loaded
+                // afresh, once
+                println!(
+                    "{label} not ready {} ms after its load; loading it again",
+                    first.as_millis()
+                );
+                load()?;
+                if ready(patience) {
+                    return Ok(());
+                }
+                Err(io::Error::other(format!(
+                    "{label} not ready {} ms after its load; see {}",
+                    patience.as_millis(),
+                    root.join("serve.err").display()
+                )))
             };
             install().map_or_else(
                 |cause| {

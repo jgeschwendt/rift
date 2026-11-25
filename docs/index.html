@@ -268,12 +268,18 @@
       and none at sleep, kept off the search list, and in it a self-signed code-signing certificate,
       <code class="code">CN=rift</code>, RSA 2048, 100 years, its key usable by
       <code class="code">codesign</code> with no prompt. Each run unlocks the keychain (a reboot locks
-      it) and signs the release itself, the file behind <code class="code">current</code>, with
+      it), the password file read without a trailing newline, and signs the release itself, the file behind <code class="code">current</code>, with
       identifier <code class="code">dev.gigantic.rift</code>, unless that identity already signed it:
       a copy beside it is signed, then renamed over it, so a running rift keeps the file it
       mapped. Each tool call has <code class="code">$RIFT_SIGN_MS</code>; one that would ask at the
       screen is killed and named, and a failure is <code class="code">rift setup: &lt;line&gt;</code>,
       exit 1, before the daemon is touched.</li>
+    <li><strong>A new signature, a fresh load.</strong> macOS checks a launch agent's program
+      against the signature it last recorded for it, and updates that record only after a launch:
+      a kickstart onto a re-signed release was refused, and the job stayed refused through every
+      later kickstart, while a bootout then a bootstrap started it at once. So a run that re-signs
+      the release reloads the agent instead of kickstarting it, and any load not ready within
+      <code class="code">$RIFT_RELOAD_MS</code> is reloaded once more before setup gives up.</li>
     <li><strong>What <code class="code">--remove</code> deletes.</strong> The keychain and its
       password file, as files; the root is left. The next <code class="code">setup</code> makes a new
       certificate, so the microphone is asked for again.</li>
@@ -389,6 +395,7 @@
         <tr><td class="table-mono">RIFT_PING_MS</td><td>how long after a device's last ping a frame's reply carries the next, default 10000</td></tr>
         <tr><td class="table-mono">RIFT_POLL_MS</td><td>how often <code class="code">--mic</code> lists the inputs, how long one may fall silent before it closes, and the wait after a failed open, doubled per failure in a row to 64 times, default 1000</td></tr>
         <tr><td class="table-mono">RIFT_READY_MS</td><td><code class="code">setup</code>'s wait for the loaded daemon to answer health ready, default 30000</td></tr>
+        <tr><td class="table-mono">RIFT_RELOAD_MS</td><td><code class="code">setup</code>'s wait for health ready before it loads the agent afresh, once, default 15000 (past launchd's 10 s respawn hold)</td></tr>
         <tr><td class="table-mono">RIFT_ROOT</td><td>the state root, default <code class="code">~/.local/state/rift</code>; the socket path under it must fit 103 bytes</td></tr>
         <tr><td class="table-mono">RIFT_SEGMENT_MS</td><td>a segment's length, in whole 20 ms frames, at least one, default 10000</td></tr>
         <tr><td class="table-mono">RIFT_SIGN_MS</td><td>how long <code class="code">setup</code> lets each <code class="code">security</code>, <code class="code">openssl</code> and <code class="code">codesign</code> call run before killing it, default 30000</td></tr>
@@ -423,7 +430,7 @@ mise run dist                           # a checkout: this host's release archiv
         <tr><td class="table-mono">rift read &lt;track&gt; &lt;from us&gt; &lt;to us&gt;</td><td>prints the range's frames, silence where nothing is held</td></tr>
         <tr><td class="table-mono">rift device ear|mouth &lt;name&gt; &lt;file.pcm&gt; [--fast]</td><td>a device, its own process: plays a raw PCM file (16 kHz, mono, 16-bit little-endian) as the track's frames, a short tail dropped, answering every ping, paced in real time and stamped from now, a pause or clock step of over 100 ms playing on from the clock as a hole, or with <code class="code">--fast</code> sent as fast as each is answered and stamped as if captured ending now; prints its reply, then each notice and refusal; exit 0 once every frame is answered, <code class="code">{"code":"unknown","ok":false}</code> and exit 1 if the connection ends first; an unreadable file is <code class="code">rift device: &lt;cause&gt;</code>, exit 1</td></tr>
         <tr><td class="table-mono">rift device ear &lt;name&gt; --mic [&lt;microphone&gt;]</td><td>a device, its own process, macOS only: hears the default input, or the one named, while the ears are open (<a href="#microphone">the microphone</a>); prints its reply, then each notice and refusal; <code class="code">{"code":"unknown","ok":false}</code> and exit 1 when the connection ends, its only exit; a withheld grant or a failed open is one stderr line, and it keeps trying; on Linux exit 2</td></tr>
-        <tr><td class="table-mono">rift setup [--print | --remove]</td><td>brings the release into hotswap's layout and links <code class="code">~/.local/bin/rift</code> (with none installed, the latest, through packslip), signs the release with <a href="#identity">rift's identity</a>, then writes and loads the agent on that link, or swaps it with one <code class="code">kickstart -k</code>, then waits for the new daemon to answer health ready; <code class="code">--print</code> prints the plist, <code class="code">--remove</code> has hotswap forget the layout and the upgrade agent, unloads the agent and removes the plist, the link, the keychain and its password</td></tr>
+        <tr><td class="table-mono">rift setup [--print | --remove]</td><td>brings the release into hotswap's layout and links <code class="code">~/.local/bin/rift</code> (with none installed, the latest, through packslip), signs the release with <a href="#identity">rift's identity</a>, then writes and loads the agent on that link, or swaps it with one <code class="code">kickstart -k</code> (a bootout then a bootstrap when it re-signed the release), then waits for the new daemon to answer health ready, loading it afresh once when none has past <code class="code">$RIFT_RELOAD_MS</code>; <code class="code">--print</code> prints the plist, <code class="code">--remove</code> has hotswap forget the layout and the upgrade agent, unloads the agent and removes the plist, the link, the keychain and its password</td></tr>
         <tr><td class="table-mono">rift upgrade [--check | --back | --retry]</td><td>hotswap's swap onto a newer release: installed beside the running one, <code class="code">current</code> moved, <code class="code">rift setup</code>, then the smoke (<code class="code">rift version</code>, <code class="code">rift status</code> until the daemon answers with it); a failure rolls back. Exit 0 green or settled, 1 red, 2 unable to try</td></tr>
         <tr><td class="table-mono">rift version</td><td>the build, as the hello reports it</td></tr>
       </tbody>
