@@ -2,6 +2,8 @@
 //! a daemon a test starts is drained by it, or killed when its guard drops.
 
 // the binary's dependencies, unused by the suite
+#[cfg(target_os = "macos")]
+use cpal as _;
 use hotswap as _;
 use signal_hook as _;
 
@@ -1940,7 +1942,7 @@ mod tests {
                 "1\n{\"code\":\"down\",\"ok\":false}\n",
             )?;
         }
-        let usage = "2\nusage: rift serve | status | quiet on|off | ears on|off | keep <window s> [<archive>] | feed [--after <boot>:<seq>] | listen <track> | read <track> <from us> <to us> | device ear|mouth <name> <file.pcm> [--fast] | setup [--print | --remove] | upgrade [--check | --back | --retry] | version\n";
+        let usage = "2\nusage: rift serve | status | quiet on|off | ears on|off | keep <window s> [<archive>] | feed [--after <boot>:<seq>] | listen <track> | read <track> <from us> <to us> | device ear|mouth <name> <file.pcm> [--fast] | device ear <name> --mic [<microphone>] | setup [--print | --remove] | upgrade [--check | --back | --retry] | version\n";
         for args in [
             &[][..],
             &["device", "ear", "a"],
@@ -2108,21 +2110,64 @@ esac
             format!("{bin}/curl"),
             "#!/bin/sh\nprintf https://github.com/jgeschwendt/rift/releases/tag/v1\n",
         )?;
-        for tool in ["curl", "launchctl"] {
+        // the signing tools, each call logged to sign.log by its first word: `fail-<word>` fails it,
+        // `locked` stands for a locked keychain, which only an unlock lifts and codesign then
+        // refuses, `hang` holds codesign as a prompt at the screen would; the keychain file holds
+        // its identity, an import's SHA-1 of its path, and `signature` the requirement codesign
+        // last signed to
+        fs::write(
+            format!("{bin}/security"),
+            format!(
+                r#"#!/bin/sh
+echo "security $1" >> {root}/sign.log
+[ -f {root}/fail-$1 ] && {{ echo "$1 failed" >&2; exit 1; }}
+case $1 in
+create-keychain) : > "$4";;
+find-identity) [ -s "$4" ] && printf '  1) %s "rift" (CSSMERR_TP_NOT_TRUSTED)\n     1 identities found\n' "$(cat "$4")";;
+import) printf %s "$4" | shasum | cut -c1-40 > "$4";;
+unlock-keychain) rm -f {root}/locked;;
+esac
+exit 0
+"#
+            ),
+        )?;
+        fs::write(
+            format!("{bin}/openssl"),
+            format!(
+                "#!/bin/sh\necho \"openssl $1\" >> {root}/sign.log\n[ -f {root}/fail-openssl ] && {{ echo \"$1 failed\" >&2; exit 1; }}\nexit 0\n"
+            ),
+        )?;
+        fs::write(
+            format!("{bin}/codesign"),
+            format!(
+                r#"#!/bin/sh
+echo "codesign $1 ${{8:-$3}}" >> {root}/sign.log
+[ -f {root}/hang ] && exec sleep 10
+case $1 in
+-v) [ "$(cat {root}/signature 2>/dev/null)" = "$2" ];;
+-f) [ -f {root}/locked ] && {{ echo errSecInternalComponent >&2; exit 1; }}; [ -f {root}/fail-codesign ] && {{ echo "$8: not a Mach-O file" >&2; exit 1; }}; echo "-R=identifier \"$7\" and certificate leaf = H\"$3\"" > {root}/signature;;
+esac
+"#
+            ),
+        )?;
+        for tool in ["codesign", "curl", "launchctl", "openssl", "security"] {
             fs::set_permissions(format!("{bin}/{tool}"), Permissions::from_mode(0o755))?;
         }
-        // hotswap's layout, its version 1 this build
+        // hotswap's layout, its version 1 a copy of this build: setup signs it in place
         let layout = format!("{home}/.local/share/hotswap/rift");
         let lay = || -> Outcome {
             fs::create_dir_all(format!("{layout}/1"))?;
-            symlink(env!("CARGO_BIN_EXE_rift"), format!("{layout}/1/rift"))?;
+            let _: u64 = fs::copy(env!("CARGO_BIN_EXE_rift"), format!("{layout}/1/rift"))?;
             Ok(symlink("1", format!("{layout}/current"))?)
         };
         lay()?;
-        let linked = format!(
-            "linked {exe} \u{2192} {}\n",
-            fs::canonicalize(env!("CARGO_BIN_EXE_rift"))?.display()
-        );
+        let release = format!("{layout}/1/rift");
+        let linked = format!("linked {exe} \u{2192} {release}\n");
+        let signs = || -> Result<String, Box<dyn Error>> {
+            let log = fs::read_to_string(format!("{root}/sign.log")).unwrap_or_default();
+            drop(fs::remove_file(format!("{root}/sign.log")));
+            Ok(log)
+        };
         let stubbed = format!("{bin}:/usr/bin:/bin");
         let gui = format!(
             "gui/{}",
@@ -2159,11 +2204,39 @@ esac
         fs::write(format!("{root}/loaded/dev.example.old"), "")?;
         let other = format!("{agents}/com.example.other.plist");
         fs::write(&other, plist(&old).replace(&exe, "/usr/bin/true"))?;
+        // the signing a run does: in a fresh keychain an identity made and the release signed;
+        // after it, the unlock, the identity found and the signature checked
+        let id = |at: &str| -> Result<String, Box<dyn Error>> {
+            Ok(fs::read_to_string(format!("{at}/rift.keychain-db"))?
+                .trim()
+                .to_owned())
+        };
+        let made = |at: &str, hash: &str| {
+            format!(
+                "wrote {at}/rift.keychain-pass\nmade {at}/rift.keychain-db\nmade the code-signing identity {hash} in {at}/rift.keychain-db\nsigned {release} as dev.gigantic.rift by {hash}\n"
+            )
+        };
+        let steady =
+            format!("security unlock-keychain\nsecurity find-identity\ncodesign -v {release}\n");
+        let fresh = format!(
+            "security create-keychain\nsecurity set-keychain-settings\nsecurity unlock-keychain\nsecurity find-identity\nopenssl req\nopenssl pkcs12\nsecurity import\nsecurity set-key-partition-list\nsecurity find-identity\ncodesign -v {release}\ncodesign -f {release}.new\n"
+        );
+        let first = format!("{}{}{}", run(&stubbed, &[], &[])?, calls()?, signs()?);
         same(
-            &format!("{}{}", run(&stubbed, &[], &[])?, calls()?),
+            &first,
             &format!(
-                "0\nlaunchctl bootout {former}\nmoved {old} to {data}\nremoved {earlier}\n{linked}wrote {file}\nlaunchctl bootstrap {gui} {file}\nprint {job}\nprint {former}\nbootout {former}\nprint {former}\nprint {former}\n{tended}print {job}\nprint {job}\nbootstrap {gui} {file}\nroot 0700\n"
+                "0\nlaunchctl bootout {former}\nmoved {old} to {data}\nremoved {earlier}\n{linked}{}wrote {file}\nlaunchctl bootstrap {gui} {file}\nprint {job}\nprint {former}\nbootout {former}\nprint {former}\nprint {former}\n{tended}print {job}\nprint {job}\nbootstrap {gui} {file}\nroot 0700\n{fresh}",
+                made(&data, &id(&data)?)
             ),
+        )?;
+        same(
+            &format!(
+                "{:o} {} {}",
+                fs::metadata(format!("{data}/rift.keychain-pass"))?.mode() & 0o777,
+                fs::read_to_string(format!("{data}/rift.keychain-pass"))?.len(),
+                fs::exists(format!("{release}.new"))?
+            ),
+            "600 32 false",
         )?;
         same(
             &format!(
@@ -2180,10 +2253,11 @@ esac
         )?;
         same(&fs::read_to_string(&file)?, &plist(&data))?;
         same(&fs::exists(format!("{file}.new"))?.to_string(), "false")?;
+        // a second run remakes nothing and signs nothing
         same(
-            &format!("{}{}", run(&stubbed, &[], &[])?, calls()?),
+            &format!("{}{}{}", run(&stubbed, &[], &[])?, calls()?, signs()?),
             &format!(
-                "0\n{linked}wrote {file}\nlaunchctl kickstart -k {job}\nprint {job}\n{tended}kickstart -k {job}\n"
+                "0\n{linked}wrote {file}\nlaunchctl kickstart -k {job}\nprint {job}\n{tended}kickstart -k {job}\n{steady}"
             ),
         )?;
         // the swap returns once the respawn, held back as by ThrottleInterval, answers ready
@@ -2196,7 +2270,7 @@ esac
         // the swap: setup through the link, its kickstart, then the smoke against the new daemon
         same(
             &format!(
-                "{}{}",
+                "{}{}{}",
                 rift(
                     &data,
                     &[
@@ -2206,13 +2280,114 @@ esac
                     ],
                     &["upgrade"]
                 )?,
-                calls()?
+                calls()?,
+                signs()?
             ),
-            &format!("0\nrift 1: green, 2 smoke probes\nprint {job}\n{tended}kickstart -k {job}\n"),
+            &format!(
+                "0\nrift 1: green, 2 smoke probes\nprint {job}\n{tended}kickstart -k {job}\n{steady}"
+            ),
         )?;
         same(
             &rift(&data, &[("HOME", home.as_str())], &["upgrade", "--x"])?,
             "2\nusage: rift upgrade [--check | --back | --retry]\n",
+        )?;
+        // a rebuilt release (its signature gone) under a locked keychain: unlocked, then signed
+        let hash = id(&data)?;
+        fs::remove_file(format!("{root}/signature"))?;
+        fs::write(format!("{root}/locked"), "")?;
+        same(
+            &format!(
+                "{}{}{} {}",
+                run(&stubbed, &[], &[])?,
+                calls()?,
+                signs()?,
+                fs::exists(format!("{root}/locked"))?
+            ),
+            &format!(
+                "0\n{linked}signed {release} as dev.gigantic.rift by {hash}\nwrote {file}\nlaunchctl kickstart -k {job}\nprint {job}\n{tended}kickstart -k {job}\n{steady}codesign -f {release}.new\n false"
+            ),
+        )?;
+        // each failure is one line, exit 1, before the daemon is touched; a failed signing
+        // leaves no copy behind
+        let failed = |marker: &str, envs: &[(&str, &str)]| -> Result<String, Box<dyn Error>> {
+            fs::write(format!("{root}/{marker}"), "")?;
+            let said = format!("{}{}{}", run(&stubbed, envs, &[])?, calls()?, signs()?);
+            fs::remove_file(format!("{root}/{marker}"))?;
+            Ok(said)
+        };
+        same(
+            &failed("fail-unlock-keychain", &[])?,
+            &format!(
+                "1\n{linked}rift setup: security unlock-keychain: unlock-keychain failed\nprint {job}\n{tended}security unlock-keychain\n"
+            ),
+        )?;
+        // a tool not on PATH, which holds only launchctl and what it and setup call before it
+        let bare = format!("{root}/bare");
+        fs::create_dir_all(&bare)?;
+        symlink(format!("{bin}/launchctl"), format!("{bare}/launchctl"))?;
+        for tool in ["id", "touch"] {
+            symlink(format!("/usr/bin/{tool}"), format!("{bare}/{tool}"))?;
+        }
+        same(
+            &format!("{}{}{}", run(&bare, &[], &[])?, calls()?, signs()?),
+            &format!(
+                "1\n{linked}rift setup: security unlock-keychain: No such file or directory (os error 2)\nprint {job}\n{tended}"
+            ),
+        )?;
+        same(
+            &failed("hang", &[("RIFT_SIGN_MS", "100")])?,
+            &format!(
+                "1\n{linked}rift setup: codesign -v: no answer in 100 ms; is it asking at the screen?\nprint {job}\n{tended}{steady}"
+            ),
+        )?;
+        fs::remove_file(format!("{root}/signature"))?;
+        same(
+            &format!(
+                "{} {}",
+                failed("fail-codesign", &[])?,
+                fs::exists(format!("{release}.new"))?
+            ),
+            &format!(
+                "1\n{linked}rift setup: codesign -f: {release}.new: not a Mach-O file\nprint {job}\n{tended}{steady}codesign -f {release}.new\n false"
+            ),
+        )?;
+        // in a fresh root: the keychain, the certificate, its import
+        let blank = format!("{root}/blank");
+        let anew = |marker: &str| -> Result<String, Box<dyn Error>> {
+            fs::write(format!("{root}/{marker}"), "")?;
+            let said = rift(
+                &blank,
+                &[
+                    ("HOME", home.as_str()),
+                    ("HOTSWAP_TEST_HOME", home.as_str()),
+                    ("PATH", stubbed.as_str()),
+                ],
+                &["setup"],
+            )?;
+            fs::remove_file(format!("{root}/{marker}"))?;
+            Ok(format!("{said}{}{}", calls()?, signs()?))
+        };
+        same(
+            &anew("fail-create-keychain")?,
+            &format!(
+                "1\n{linked}wrote {blank}/rift.keychain-pass\nrift setup: security create-keychain: create-keychain failed\nprint {job}\n{tended}security create-keychain\n"
+            ),
+        )?;
+        same(
+            &format!(
+                "{} {}",
+                anew("fail-openssl")?,
+                fs::exists(format!("{blank}/identity.new"))?
+            ),
+            &format!(
+                "1\n{linked}made {blank}/rift.keychain-db\nrift setup: sh -c: req failed\nprint {job}\n{tended}security create-keychain\nsecurity set-keychain-settings\nsecurity unlock-keychain\nsecurity find-identity\nopenssl req\n false"
+            ),
+        )?;
+        same(
+            &anew("fail-import")?,
+            &format!(
+                "1\n{linked}rift setup: sh -c: import failed\nprint {job}\n{tended}security unlock-keychain\nsecurity find-identity\nopenssl req\nopenssl pkcs12\nsecurity import\n"
+            ),
         )?;
         // a changed plist: booted out, waited out, bootstrapped; its absent root made first
         let moved = format!("{root}/moved");
@@ -2231,19 +2406,23 @@ esac
                 &[&["setup"], args].concat(),
             )
         };
+        // its own keychain and identity, so the release is signed again
+        let moving = format!("{}{}{}", rerun(&[], &[])?, calls()?, signs()?);
         same(
-            &format!("{}{}", rerun(&[], &[])?, calls()?),
+            &moving,
             &format!(
-                "0\n{linked}wrote {file}\nlaunchctl bootout {job}\nlaunchctl bootstrap {gui} {file}\nprint {job}\n{tended}print {job}\nbootout {job}\nprint {job}\nprint {job}\nbootstrap {gui} {file}\nroot 0700\n"
+                "0\n{linked}{}wrote {file}\nlaunchctl bootout {job}\nlaunchctl bootstrap {gui} {file}\nprint {job}\n{tended}print {job}\nbootout {job}\nprint {job}\nprint {job}\nbootstrap {gui} {file}\nroot 0700\n{fresh}",
+                made(&moved, &id(&moved)?)
             ),
         )?;
         // an earlier install, unloaded, beside a root that exists: retired, its root left alone
         plant(&old)?;
         fs::write(format!("{root}/fail"), "")?;
+        // data's identity signs the release once more
         same(
-            &format!("{}{}", run(&stubbed, &[], &[])?, calls()?),
+            &format!("{}{}{}", run(&stubbed, &[], &[])?, calls()?, signs()?),
             &format!(
-                "1\nremoved {earlier}\n{linked}wrote {file}\nlaunchctl bootout {job}\nrift setup: launchctl bootstrap {gui} {file}: Bootstrap failed: 5: Input/output error\nprint {job}\nprint {former}\nprint {former}\n{tended}print {job}\nbootout {job}\nprint {job}\nprint {job}\nbootstrap {gui} {file}\nroot 0700\n"
+                "1\nremoved {earlier}\n{linked}signed {release} as dev.gigantic.rift by {hash}\nwrote {file}\nlaunchctl bootout {job}\nrift setup: launchctl bootstrap {gui} {file}: Bootstrap failed: 5: Input/output error\nprint {job}\nprint {former}\nprint {former}\n{tended}print {job}\nbootout {job}\nprint {job}\nprint {job}\nbootstrap {gui} {file}\nroot 0700\n{steady}codesign -f {release}.new\n"
             ),
         )?;
         same(
@@ -2253,10 +2432,16 @@ esac
         fs::remove_file(format!("{root}/fail"))?;
         fs::write(format!("{root}/loaded/dev.gigantic.rift"), "")?;
         fs::write(format!("{root}/stuck"), "")?;
+        let resigned = format!("signed {release} as dev.gigantic.rift by {}\n", id(&moved)?);
         same(
-            &format!("{}{}", rerun(&[], &[("RIFT_BOOTOUT_MS", "0")])?, calls()?),
             &format!(
-                "1\n{linked}wrote {file}\nlaunchctl bootout {job}\nrift setup: dev.gigantic.rift still loaded 0 ms after its bootout\nprint {job}\n{tended}print {job}\nbootout {job}\nprint {job}\n"
+                "{}{}{}",
+                rerun(&[], &[("RIFT_BOOTOUT_MS", "0")])?,
+                calls()?,
+                signs()?
+            ),
+            &format!(
+                "1\n{linked}{resigned}wrote {file}\nlaunchctl bootout {job}\nrift setup: dev.gigantic.rift still loaded 0 ms after its bootout\nprint {job}\n{tended}print {job}\nbootout {job}\nprint {job}\n{steady}codesign -f {release}.new\n"
             ),
         )?;
         fs::remove_file(format!("{root}/stuck"))?;
@@ -2264,30 +2449,247 @@ esac
         fs::write(format!("{root}/dead"), "")?;
         same(
             &format!(
-                "{}{}",
+                "{}{}{}",
                 run(&stubbed, &[("RIFT_READY_MS", "0")], &[])?,
-                calls()?
+                calls()?,
+                signs()?
             ),
             &format!(
-                "1\n{linked}wrote {file}\nlaunchctl bootout {job}\nlaunchctl bootstrap {gui} {file}\nrift setup: dev.gigantic.rift not ready 0 ms after its load; see {data}/serve.err\nprint {job}\n{tended}print {job}\nbootout {job}\nprint {job}\nprint {job}\nbootstrap {gui} {file}\nroot 0700\n"
+                "1\n{linked}signed {release} as dev.gigantic.rift by {hash}\nwrote {file}\nlaunchctl bootout {job}\nlaunchctl bootstrap {gui} {file}\nrift setup: dev.gigantic.rift not ready 0 ms after its load; see {data}/serve.err\nprint {job}\n{tended}print {job}\nbootout {job}\nprint {job}\nprint {job}\nbootstrap {gui} {file}\nroot 0700\n{steady}codesign -f {release}.new\n"
             ),
         )?;
         fs::remove_file(format!("{root}/dead"))?;
         fs::write(format!("{root}/loaded/dev.gigantic.rift"), "")?;
         plant(&old)?;
+        // the keychain and its password go as files, the root stays
         same(
-            &format!("{}{}", rerun(&["--remove"], &[])?, calls()?),
+            &format!("{}{}{}", rerun(&["--remove"], &[])?, calls()?, signs()?),
             &format!(
-                "0\nremoved {earlier}\nlaunchctl bootout {job}\nremoved {file}\nremoved {exe}\nprint {gui}/dev.gigantic.rift.upgrade\nprint {former}\nprint {former}\nprint {job}\nbootout {job}\nprint {job}\nprint {job}\n"
+                "0\nremoved {earlier}\nlaunchctl bootout {job}\nremoved {file}\nremoved {exe}\nremoved {moved}/rift.keychain-db\nremoved {moved}/rift.keychain-pass\nprint {gui}/dev.gigantic.rift.upgrade\nprint {former}\nprint {former}\nprint {job}\nbootout {job}\nprint {job}\nprint {job}\n"
             ),
         )?;
         same(
             &format!("{}{}", rerun(&["--remove"], &[])?, calls()?),
             &format!("0\nprint {gui}/dev.gigantic.rift.upgrade\nprint {job}\nprint {job}\n"),
         )?;
+        same(&fs::exists(&moved)?.to_string(), "true")?;
         same(
             &format!("{} {}", fs::exists(&upgrade)?, fs::exists(&layout)?),
             "false false",
+        )
+    }
+
+    /// `device ear <name> --mic` over the fake inputs of `$RIFT_MIC`: nothing opened while the ears
+    /// are off; with them on, the default input's channel 0 at 16 kHz (a 48 kHz stereo input whose
+    /// other channel is full scale and whose swing at its Nyquist rate the filter takes out), each
+    /// event naming its microphone; the default changed, the segment closes and a hole opens the
+    /// next microphone's; ears off closes the microphone. A second device pinned to an absent
+    /// input says so and waits, records it once it appears and stops when it goes. A torn segment
+    /// keeps its microphone; a frame whose `mic` is not a string is refused; an open that never
+    /// returns, a refused open and exact zeros each exit 1 naming the grant.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mic() -> Outcome {
+        let root = temp("mic")?;
+        let fake = format!("{root}/fake");
+        fs::create_dir_all(format!("{fake}/inputs"))?;
+        fs::write(format!("{fake}/inputs/Desk Mic"), "48000 2 0.25 0.5")?;
+        fs::write(format!("{fake}/inputs/Room Mic"), "44100 1 -0.5 0")?;
+        fs::write(format!("{fake}/default"), "Desk Mic\n")?;
+        let envs = [("RIFT_MIC", fake.as_str()), ("RIFT_POLL_MS", "100")];
+        let (daemon, _) = serve(&root, &[("RIFT_SEGMENT_MS", "200")])?;
+        let spawn = |args: &[&str]| -> io::Result<Daemon> {
+            Ok(Daemon(
+                Command::new(env!("CARGO_BIN_EXE_rift"))
+                    .env("RIFT_ROOT", &root)
+                    .envs(envs)
+                    .args(args)
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()?,
+            ))
+        };
+        let log = || fs::read_to_string(format!("{fake}/log")).unwrap_or_default();
+        let stream = |track: &str| -> Result<Vec<Value>, Box<dyn Error>> {
+            Ok(events(&root)?
+                .into_iter()
+                .map(|event| event["e"].clone())
+                .filter(|event| event["track"] == track)
+                .collect())
+        };
+        let mut desk = spawn(&["device", "ear", "desk", "--mic"])?;
+        thread::sleep(Duration::from_millis(300));
+        same(&log(), "")?;
+        drop(rift(&root, &[], &["ears", "on"])?);
+        let mut heard = greet(&root)?;
+        same(
+            &say(&mut heard, r#"{"op":"listen","track":"ear-desk"}"#)?,
+            r#"{"ok":true}"#,
+        )?;
+        let frame: Value = serde_json::from_str(
+            &iter::repeat_with(|| next(&mut heard))
+                .nth(9)
+                .ok_or("frame")??,
+        )?;
+        let pcm = frame["pcm"].as_str().unwrap_or_default();
+        same(
+            &(0..pcm.len())
+                .step_by(4)
+                .map(|at| {
+                    let bytes = pcm.get(at..at + 4).unwrap_or_default();
+                    i16::from_le_bytes([
+                        u8::from_str_radix(bytes.get(..2).unwrap_or_default(), 16).unwrap_or(0),
+                        u8::from_str_radix(bytes.get(2..).unwrap_or_default(), 16).unwrap_or(0),
+                    ])
+                })
+                .all(|sample| (8191..=8193).contains(&sample))
+                .to_string(),
+            "true",
+        )?;
+        drop(heard);
+        // a second device pinned to an input not yet there
+        let mut spare = spawn(&["device", "ear", "spare", "--mic", "Spare Mic"])?;
+        let mut said = String::new();
+        let _: usize =
+            BufReader::new(spare.0.stderr.take().ok_or("stderr")?).read_line(&mut said)?;
+        same(
+            &said,
+            "rift device: waiting for \"Spare Mic\"; the inputs present: Desk Mic, Room Mic\n",
+        )?;
+        fs::write(format!("{fake}/inputs/Spare Mic"), "16000 1 0.5 0")?;
+        until(|| {
+            Ok(stream("ear-spare").is_ok_and(|held| {
+                held.iter()
+                    .any(|event| event["kind"] == "segment" && event["mic"] == "Spare Mic")
+            }))
+        })?;
+        fs::write(format!("{fake}/default"), "Room Mic\n")?;
+        fs::remove_file(format!("{fake}/inputs/Spare Mic"))?;
+        until(|| {
+            Ok(stream("ear-desk").is_ok_and(|held| {
+                held.iter()
+                    .any(|event| event["kind"] == "segment" && event["mic"] == "Room Mic")
+            }) && log().contains("close Spare Mic"))
+        })?;
+        // one microphone per segment: the change closes Desk Mic's and a hole opens Room Mic's
+        let desk_events = stream("ear-desk")?;
+        let change = desk_events
+            .iter()
+            .position(|event| event["mic"] == "Room Mic")
+            .ok_or("no change")?;
+        same(
+            &format!(
+                "{} {} {}",
+                desk_events[0]["kind"],
+                desk_events
+                    .get(change - 1)
+                    .map_or(Value::Null, |event| json!([event["kind"], event["mic"]])),
+                json!([desk_events[change]["kind"], desk_events[change]["mic"]])
+            ),
+            r#""track" ["segment","Desk Mic"] ["hole","Room Mic"]"#,
+        )?;
+        drop(rift(&root, &[], &["ears", "off"])?);
+        until(|| Ok(log().contains("close Room Mic")))?;
+        let mut opened: Vec<&str> = log().leak().lines().collect();
+        opened.sort_unstable();
+        same(
+            &opened.join("\n"),
+            "close Desk Mic\nclose Room Mic\nclose Spare Mic\nopen Desk Mic\nopen Room Mic\nopen Spare Mic",
+        )?;
+        // the ears on again, a segment torn by a kill keeps its microphone
+        drop(rift(&root, &[], &["ears", "on"])?);
+        until(|| Ok(log().matches("open Room Mic").count() == 2))?;
+        until(|| {
+            Ok(fs::read_dir(format!("{root}/audio/1/ear-desk"))?.count()
+                > desk_events
+                    .iter()
+                    .filter(|event| event["kind"] == "segment")
+                    .count()
+                    + 1)
+        })?;
+        drop(daemon);
+        let (mut out, mut ended) = (String::new(), desk.0.wait()?.code());
+        let _: usize =
+            io::Read::read_to_string(&mut desk.0.stdout.take().ok_or("stdout")?, &mut out)?;
+        same(
+            &format!(
+                "{:?} {}",
+                ended,
+                out.lines().skip(1).collect::<Vec<_>>().join(" ")
+            ),
+            &format!(
+                "Some(1) {{\"ears\":true}} {{\"ears\":false}} {{\"ears\":true}} {}",
+                code("unknown")
+            ),
+        )?;
+        ended = spare.0.wait()?.code();
+        same(&format!("{ended:?}"), "Some(1)")?;
+        let (mut again, _) = serve(&root, &[("RIFT_DRAIN_MS", "200")])?;
+        same(
+            &events(&root)?
+                .iter()
+                .rev()
+                .find(|event| event["boot"] == 2u8 && event["e"]["kind"] == "segment")
+                .map_or(Value::Null, |event| event["e"]["mic"].clone())
+                .to_string(),
+            "\"Room Mic\"",
+        )?;
+        let (mut raw, _) = device(&root, r#"{"kind":"ear","name":"raw","op":"device"}"#, 0)?;
+        let line = json!({"mic": 5u8, "op": "frame", "pcm": "00".repeat(640), "t": 1u8});
+        same(&say(&mut raw, &line.to_string())?, &code("bad_frame"))?;
+        drop(raw);
+        // each failure: one stderr line naming the grant, exit 1
+        let grant = "allow rift in System Settings \u{203a} Privacy & Security \u{203a} Microphone";
+        fs::write(format!("{fake}/inputs/Stuck"), "block")?;
+        fs::write(format!("{fake}/inputs/Broken"), "fail")?;
+        fs::write(format!("{fake}/inputs/Silent"), "48000 1 0 0")?;
+        for (name, knob, ending) in [
+            (
+                "Stuck",
+                ("RIFT_OPEN_MS", "100"),
+                format!(" did not open within 100 ms: the microphone is not granted; {grant}"),
+            ),
+            ("Broken", ("RIFT_OPEN_MS", "100"), ": refused".to_owned()),
+            (
+                "Silent",
+                ("RIFT_ZERO_MS", "200"),
+                format!(
+                    " gave only exact zeros for 200 ms after it opened: the microphone is not granted, or is muted; {grant}"
+                ),
+            ),
+        ] {
+            let ran = rift(
+                &root,
+                &[envs[0], knob],
+                &["device", "ear", "bad", "--mic", name],
+            )?;
+            same(
+                &format!(
+                    "{} {}",
+                    ran.lines().next().unwrap_or_default(),
+                    ran.lines().last().unwrap_or_default()
+                ),
+                &format!("1 rift device: \"{name}\"{ending}"),
+            )?;
+        }
+        // following the default while there is none: it says so and waits
+        fs::remove_file(format!("{fake}/default"))?;
+        let mut lost = spawn(&["device", "ear", "lost", "--mic"])?;
+        let mut waiting = String::new();
+        let _: usize =
+            BufReader::new(lost.0.stderr.take().ok_or("stderr")?).read_line(&mut waiting)?;
+        same(
+            &waiting,
+            "rift device: waiting for a default input; the inputs present: Broken, Desk Mic, Room Mic, Silent, Stuck\n",
+        )?;
+        same(
+            &say(&mut greet(&root)?, r#"{"op":"shutdown"}"#)?,
+            r#"{"ok":true}"#,
+        )?;
+        // the waiting device ends with the daemon, so its run counts toward coverage
+        same(
+            &format!("{:?} {:?}", again.0.wait()?.code(), lost.0.wait()?.code()),
+            "Some(0) Some(1)",
         )
     }
 }

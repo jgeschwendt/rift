@@ -1,10 +1,36 @@
 //! The build identity `rift version` prints and the daemon's hello carries: the release (else the
 //! crate version), then the short commit, `-dirty` over uncommitted work in this crate, `unknown`
-//! outside a git checkout; it never fails the build.
+//! outside a git checkout; it never fails the build. On macOS, the Info.plist the binary carries
+//! in `__TEXT,__info_plist`, which names it to the microphone's grant (docs/index.html#identity).
 
-use std::{env, process::Command};
+use std::{env, fs, path::Path, process::Command};
 
 fn main() {
+    let plist = Path::new(&env::var_os("OUT_DIR").unwrap_or_default()).join("Info.plist");
+    if env::var("CARGO_CFG_TARGET_OS").is_ok_and(|os| os == "macos")
+        && fs::write(
+            &plist,
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleIdentifier</key>
+  <string>dev.gigantic.rift</string>
+  <key>CFBundleName</key>
+  <string>rift</string>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>rift records the microphone onto its audio stream while its ears are on.</string>
+</dict>
+</plist>
+"#,
+        )
+        .is_ok()
+    {
+        println!(
+            "cargo::rustc-link-arg-bins=-Wl,-sectcreate,__TEXT,__info_plist,{}",
+            plist.display()
+        );
+    }
     let git = |args: &[&str]| {
         Command::new("git")
             .args(args)

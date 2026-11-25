@@ -1,8 +1,14 @@
 //! `rift`. `serve` is the daemon, an append-only event log served over a unix socket
 //! (docs/protocol.html, protocol 1) and an audio stream its devices feed onto one clock; `status`,
 //! `quiet`, `ears`, `keep`, `feed`, `listen` and `read` are thin clients of that socket, `device`
-//! one that plays a raw PCM file as frames; `setup` installs the release and its launchd agent,
-//! `upgrade` swaps in a newer release; `version` prints the build.
+//! one that plays a raw PCM file as frames or, on macOS, hears a microphone (`ear.rs`); `setup`
+//! installs the release, signs it and loads its launchd agent, `upgrade` swaps in a newer release;
+//! `version` prints the build.
+
+#[cfg(target_os = "macos")]
+mod ear;
+#[cfg(target_os = "macos")]
+mod mic;
 
 use serde_json::{Value, json};
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
@@ -16,11 +22,13 @@ use std::fs::{self, DirBuilder, OpenOptions, Permissions, TryLockError};
 use std::io::{self, BufRead as _, BufReader, Read as _, Write as _};
 use std::iter;
 use std::net::Shutdown;
-use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
+use std::os::unix::fs::{
+    DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
+};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::panic;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode, id};
+use std::process::{Command, ExitCode, Output, Stdio, id};
 use std::str::FromStr;
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
@@ -114,6 +122,8 @@ struct Track {
     conn: Option<u64>,
     /// Where its next frame goes on the timeline, once it has had one.
     end: Option<u64>,
+    /// The microphone its last frame named, else null.
+    mic: Value,
     /// The next segment's number.
     next: u64,
     /// The open segment's number, start and samples written.
@@ -131,7 +141,7 @@ impl Live {
             .filter(|entry| only.is_none_or(|one| one == entry.0.as_str()))
             .filter_map(|(name, track)| {
                 let (num, start, samples) = track.open?;
-                Some((name.clone(), json!({"kind": "segment", "n": num, "path": format!("audio/{boot}/{name}/{num}.pcm"), "samples": samples, "start": start, "track": name})))
+                Some((name.clone(), bare(json!({"kind": "segment", "mic": track.mic, "n": num, "path": format!("audio/{boot}/{name}/{num}.pcm"), "samples": samples, "start": start, "track": name}))))
             })
             .collect();
         for (name, event) in closing {
@@ -229,6 +239,13 @@ fn append(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let len = file.metadata()?.len();
     file.write_all(bytes)
         .inspect_err(|_| drop(file.set_len(len)))
+}
+
+/// `event` without its null fields: a stream event names a microphone only when its frames did.
+fn bare(mut event: Value) -> Value {
+    (event.as_object_mut().into_iter())
+        .for_each(|fields| fields.retain(|_, field| !field.is_null()));
+    event
 }
 
 /// Where a stream event's span ends on the daemon's clock: its `start` plus its `samples` (a
@@ -366,6 +383,9 @@ fn main() -> ExitCode {
     );
     let (rundir, sock) = (root.join("run"), root.join("run/rift.sock"));
     let asked = match *words.as_slice() {
+        ["device", "ear", name, "--mic"] | ["device", "ear", name, "--mic", _] => {
+            Some(json!({"kind": "ear", "name": name, "op": "device"}))
+        }
         ["device", kind, name, _] | ["device", kind, name, _, "--fast"] => {
             Some(json!({"kind": kind, "name": name, "op": "device"}))
         }
@@ -389,10 +409,16 @@ fn main() -> ExitCode {
     };
     match (words.as_slice(), asked) {
         (&[verb, ..], Some(wanted)) => {
+            let mic = verb == "device" && words.get(3) == Some(&"--mic");
+            #[cfg(not(target_os = "macos"))]
+            if mic {
+                eprintln!("rift device: --mic is macOS only; a file-fed device plays anywhere");
+                return ExitCode::from(2);
+            }
             // a device's file, read before it connects
             let pcm = match words
                 .get(3)
-                .filter(|_| verb == "device")
+                .filter(|_| verb == "device" && !mic)
                 .map(fs::read)
                 .transpose()
             {
@@ -447,6 +473,10 @@ fn main() -> ExitCode {
                     }
                     if verb == "device" && reply["ok"] == true {
                         println!("{reply}");
+                        #[cfg(target_os = "macos")]
+                        if mic {
+                            return ear::run(reader, &reply, words.get(4).copied());
+                        }
                         let fast = words.len() == 5;
                         // a reply carrying `ping` is answered with this device's clock
                         let pong = |conn: &mut BufReader<UnixStream>, ping: &Value| {
@@ -739,7 +769,8 @@ fn main() -> ExitCode {
                     else {
                         continue;
                     };
-                    let start = held_events
+                    // and its microphone that event's: a microphone's change opens with a hole
+                    let (start, mic) = held_events
                         .iter()
                         .rev()
                         .find(|event| {
@@ -747,9 +778,11 @@ fn main() -> ExitCode {
                                 && event["e"]["track"] == track
                                 && event["e"]["start"].is_u64()
                         })
-                        .map_or(0, |event| end(&event["e"]));
+                        .map_or((0, Value::Null), |event| {
+                            (end(&event["e"]), event["e"]["mic"].clone())
+                        });
                     let num: u64 = name.trim_end_matches(".pcm").parse().unwrap_or_default();
-                    let logged = guard.emit(&json!({"kind": "segment", "n": num, "path": path, "samples": frames.saturating_mul(320), "start": start, "track": track}))?;
+                    let logged = guard.emit(&bare(json!({"kind": "segment", "mic": mic, "n": num, "path": path, "samples": frames.saturating_mul(320), "start": start, "track": track})))?;
                     guard.held.push(logged);
                 }
                 guard.sweep();
@@ -855,7 +888,8 @@ fn main() -> ExitCode {
                             .as_str()
                             // lowercase digits only: from_str_radix alone takes uppercase and a `+`
                             .filter(|text| {
-                                text.len() == FRAME * 2
+                                (request["mic"].is_null() || request["mic"].is_string())
+                                    && text.len() == FRAME * 2
                                     && text
                                         .bytes()
                                         .all(|digit| matches!(digit, b'0'..=b'9' | b'a'..=b'f'))
@@ -967,20 +1001,28 @@ fn main() -> ExitCode {
                                             .min(now());
                                         let placed = (|| {
                                             // logged only once the frame is written, so a refused one changes nothing
-                                            let (start, event) = match state
-                                                .tracks
-                                                .get(&name)
+                                            let (known, mic) =
+                                                (state.tracks.get(&name), &request["mic"]);
+                                            let (start, event) = match known
                                                 .and_then(|held| held.end)
                                             {
                                                 None => (
                                                     at,
-                                                    Some(
-                                                        json!({"kind": "track", "start": at, "track": name}),
-                                                    ),
+                                                    Some(bare(
+                                                        json!({"kind": "track", "mic": mic, "start": at, "track": name}),
+                                                    )),
                                                 ),
-                                                // half a frame or more past the track's end is a hole
-                                                Some(last) if at >= last.saturating_add(10_000) => {
-                                                    let gap = json!({"kind": "hole", "samples": samples(at.saturating_sub(last)), "start": last, "track": name});
+                                                // half a frame or more past the track's end is a
+                                                // hole, as is another microphone's first frame
+                                                Some(last)
+                                                    if at >= last.saturating_add(10_000)
+                                                        || known.is_some_and(|held| {
+                                                            held.mic != *mic
+                                                        }) =>
+                                                {
+                                                    let gap = bare(
+                                                        json!({"kind": "hole", "mic": mic, "samples": samples(at.saturating_sub(last)), "start": last, "track": name}),
+                                                    );
                                                     (end(&gap), Some(gap))
                                                 }
                                                 // as far before it is a clock running fast, dropped
@@ -991,7 +1033,6 @@ fn main() -> ExitCode {
                                                 Some(last) => (last, None),
                                             };
                                             // the open segment, unless a hole closes it, else the next, which counts only once written
-                                            let known = state.tracks.get(&name);
                                             let (num, first, written) = known
                                                 .and_then(|held| held.open)
                                                 .filter(|_| event.is_none())
@@ -1019,10 +1060,11 @@ fn main() -> ExitCode {
                                                 state.tracks.entry(name.clone()).or_default(),
                                                 written.saturating_add(320),
                                             );
-                                            (held.next, held.open, held.end) = (
+                                            (held.next, held.open, held.end, held.mic) = (
                                                 num.saturating_add(1),
                                                 Some((num, first, full)),
                                                 Some(start.saturating_add(20_000)),
+                                                request["mic"].clone(),
                                             );
                                             // the frame is placed: a close that fails to log
                                             // leaves the segment open for the next frame's close
@@ -1452,6 +1494,50 @@ fn main() -> ExitCode {
                     })
                     .collect();
                 older.sort();
+                // rift's own keychain and code-signing identity (docs/index.html#identity), so a
+                // rebuild keeps the microphone's grant; a tool call past `$RIFT_SIGN_MS` is killed,
+                // since a keychain asking at the screen would hold setup forever
+                let (keychain, pass) = (
+                    root.join("rift.keychain-db"),
+                    root.join("rift.keychain-pass"),
+                );
+                let (kc, allowed) = (
+                    keychain.to_string_lossy(),
+                    Duration::from_millis(setting("RIFT_SIGN_MS", 30_000)),
+                );
+                let ask = |name: &str, line: &[&str]| -> io::Result<Output> {
+                    let said = format!("{name} {}", line.first().unwrap_or(&""));
+                    let mut child = Command::new(name)
+                        .args(line)
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .spawn()
+                        .map_err(|cause| io::Error::other(format!("{said}: {cause}")))?;
+                    let begun = Instant::now();
+                    while child.try_wait()?.is_none() {
+                        if begun.elapsed() > allowed {
+                            drop(child.kill());
+                            return Err(io::Error::other(format!(
+                                "{said}: no answer in {} ms; is it asking at the screen?",
+                                allowed.as_millis()
+                            )));
+                        }
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    child.wait_with_output()
+                };
+                let need = |name: &str, line: &[&str]| -> io::Result<()> {
+                    let out = ask(name, line)?;
+                    if !out.status.success() {
+                        return Err(io::Error::other(format!(
+                            "{name} {}: {}",
+                            line.first().unwrap_or(&""),
+                            String::from_utf8_lossy(&out.stderr).trim()
+                        )));
+                    }
+                    Ok(())
+                };
                 if words.contains(&"--remove") {
                     // first: it refuses while a swap runs, before anything is booted out
                     hotswap::forget("rift").map_err(io::Error::other)?;
@@ -1462,6 +1548,10 @@ fn main() -> ExitCode {
                     unload(label)?;
                     gone(&path);
                     gone(&exe);
+                    // files, never `security delete-keychain`, which might ask at the screen to
+                    // unlock it; setup never puts it on the search list
+                    gone(&keychain);
+                    gone(&pass);
                     return Ok(());
                 }
                 // asked before anything is written: no launchctl (Linux) leaves nothing behind
@@ -1493,6 +1583,94 @@ fn main() -> ExitCode {
                     .mode(0o700)
                     .create(&root)?;
                 fs::set_permissions(&root, Permissions::from_mode(0o700))?;
+                if !fs::exists(&pass)? {
+                    // a keychain whose password is gone opens no more: it is made again
+                    drop(fs::remove_file(&keychain));
+                    let mut noise = [0u8; 16];
+                    fs::File::open("/dev/urandom")?.read_exact(&mut noise)?;
+                    OpenOptions::new()
+                        .create_new(true)
+                        .mode(0o600)
+                        .write(true)
+                        .open(&pass)?
+                        .write_all(hex(&noise).as_bytes())?;
+                    println!("wrote {}", pass.display());
+                }
+                let secret = fs::read_to_string(&pass)?;
+                if !fs::exists(&keychain)? {
+                    need("security", &["create-keychain", "-p", &secret, &kc])?;
+                    // no lock timeout and none at sleep: only a reboot locks it
+                    need("security", &["set-keychain-settings", &kc])?;
+                    println!("made {}", keychain.display());
+                }
+                need("security", &["unlock-keychain", "-p", &secret, &kc])?;
+                // the identity's SHA-1, the first such word `find-identity` prints, else empty
+                let found = || -> io::Result<String> {
+                    let listed = ask("security", &["find-identity", "-p", "codesigning", &kc])?;
+                    Ok(String::from_utf8_lossy(&listed.stdout)
+                        .split_whitespace()
+                        .find(|word| {
+                            word.len() == 40 && word.bytes().all(|byte| byte.is_ascii_hexdigit())
+                        })
+                        .unwrap_or_default()
+                        .to_owned())
+                };
+                let mut hash = found()?;
+                if hash.is_empty() {
+                    // the key and certificate in a 0700 directory, gone once imported; the bundle
+                    // 3DES with a SHA-1 MAC, which `security import` reads from LibreSSL and
+                    // OpenSSL 3 alike; the partition list, else codesign's first use of the key
+                    // asks at the screen
+                    need(
+                        "sh",
+                        &[
+                            "-c",
+                            r#"set -e; rm -rf "$1"; mkdir -m 700 "$1"; trap 'rm -rf "$1"' EXIT
+openssl req -x509 -newkey rsa:2048 -nodes -days 36500 -subj /CN=rift -addext keyUsage=critical,digitalSignature -addext extendedKeyUsage=critical,codeSigning -keyout "$1/key.pem" -out "$1/cert.pem"
+openssl pkcs12 -export -inkey "$1/key.pem" -in "$1/cert.pem" -out "$1/identity.p12" -passout "pass:$2" -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES -macalg sha1
+security import "$1/identity.p12" -k "$3" -P "$2" -T /usr/bin/codesign
+security set-key-partition-list -S apple-tool:,apple: -s -k "$2" "$3" >/dev/null"#,
+                            "sh",
+                            &root.join("identity.new").to_string_lossy(),
+                            &secret,
+                            &kc,
+                        ],
+                    )?;
+                    hash = found()?;
+                    println!(
+                        "made the code-signing identity {hash} in {}",
+                        keychain.display()
+                    );
+                }
+                // the release itself, not the link: signed unless it already is, by this identity
+                let target = fs::canonicalize(&linked)?;
+                let program = target.to_string_lossy();
+                let wanted =
+                    format!("-R=identifier \"{label}\" and certificate leaf = H\"{hash}\"");
+                if !ask("codesign", &["-v", &wanted, &program])?
+                    .status
+                    .success()
+                {
+                    // a copy signed and renamed over it: a running rift keeps the file it mapped
+                    let copy = target.with_added_extension("new");
+                    let _: u64 = fs::copy(&target, &copy)?;
+                    need(
+                        "codesign",
+                        &[
+                            "-f",
+                            "-s",
+                            &hash,
+                            "--keychain",
+                            &kc,
+                            "-i",
+                            label,
+                            &copy.to_string_lossy(),
+                        ],
+                    )
+                    .and_then(|()| fs::rename(&copy, &target))
+                    .inspect_err(|_| drop(fs::remove_file(&copy)))?;
+                    println!("signed {} as {label} by {hash}", target.display());
+                }
                 let staged = path.with_extension("plist.new");
                 path.parent().map_or(Ok(()), fs::create_dir_all)?;
                 fs::write(&staged, &plist)?;
@@ -1558,7 +1736,7 @@ fn main() -> ExitCode {
         }
         _ => {
             eprintln!(
-                "usage: rift serve | status | quiet on|off | ears on|off | keep <window s> [<archive>] | feed [--after <boot>:<seq>] | listen <track> | read <track> <from us> <to us> | device ear|mouth <name> <file.pcm> [--fast] | setup [--print | --remove] | upgrade [--check | --back | --retry] | version"
+                "usage: rift serve | status | quiet on|off | ears on|off | keep <window s> [<archive>] | feed [--after <boot>:<seq>] | listen <track> | read <track> <from us> <to us> | device ear|mouth <name> <file.pcm> [--fast] | device ear <name> --mic [<microphone>] | setup [--print | --remove] | upgrade [--check | --back | --retry] | version"
             );
             ExitCode::from(2)
         }

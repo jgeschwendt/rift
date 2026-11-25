@@ -15,7 +15,8 @@ run = [
 
 [tasks.cover]
 description = "the end-to-end suite under llvm-cov; anything under 100 % of lines fails, naming the lines"
-run = "cargo llvm-cov --fail-under-lines 100 --show-missing-lines"
+# src/mic.rs alone is exempt: its lines open a real microphone, which no test may
+run = "cargo llvm-cov --fail-under-lines 100 --ignore-filename-regex 'src/mic\\.rs$' --show-missing-lines"
 
 [tasks.dist]
 description = "this host's release archive as release.yaml builds it, its next YYYY.M.N stamped, to dist/; signing and publishing stay the workflow's"

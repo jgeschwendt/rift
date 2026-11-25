@@ -68,11 +68,14 @@
   <p class="lead docs-lead"><code class="code">rift</code> is one process, kept running by launchd,
     that will turn the sound its devices hear into an append-only log of which words were said when,
     and play speech back. Today: one instance, its socket, the event log, and the stream, every
-    connected device's sound on one clock, kept on disk for a window, then archived. The one device
-    yet is a file player; microphones come next.</p>
+    connected device's sound on one clock, kept on disk for a window, then archived. A device plays
+    a file or, on macOS, hears a microphone, under an identity of rift's own that keeps the
+    microphone's grant across upgrades.</p>
   <nav class="row docs-toc" aria-label="sections">
     <a class="pill" href="#today">today</a>
     <a class="pill" href="#stream">the stream</a>
+    <a class="pill" href="#microphone">the microphone</a>
+    <a class="pill" href="#identity">identity</a>
     <a class="pill" href="#designed">designed</a>
     <a class="pill" href="#paths">paths</a>
     <a class="pill" href="#environment">environment</a>
@@ -203,6 +206,72 @@
   </ul>
 </section>
 
+<section class="docs-section" id="microphone" data-component="microphone">
+  <header>
+    <h2 class="h2">The microphone</h2>
+    <p class="docs-note"><code class="code">rift device ear &lt;name&gt; --mic [&lt;microphone&gt;]</code>, macOS only
+      (CoreAudio through cpal, capture alone: no echo cancelling, no voice processing). On Linux it
+      exits 2 saying so.</p>
+  </header>
+  <ul class="stack">
+    <li><strong>Which input.</strong> Alone, <code class="code">--mic</code> follows the system's
+      default input, asked every <code class="code">$RIFT_POLL_MS</code>; a change closes the
+      microphone and opens the new default. With a name it holds that input, matched exactly, and
+      never follows the default. An input not present (the named one, or no default at all) is one
+      stderr line listing the inputs present, then a wait: it opens when the input appears, and
+      closes when it goes or falls silent a poll long. Two devices, each pinned, record two
+      microphones on two tracks at once.</li>
+    <li><strong>Open only while the ears are.</strong> The microphone opens when the ears open and
+      closes when they close, so the system's recording indicator shows exactly when rift
+      hears.</li>
+    <li><strong>One microphone a segment.</strong> Every frame names its microphone; a change closes
+      the open segment, and the next opens with a hole and carries the new name, as do its
+      <code class="code">segment</code> event and the archive's index line. The recorded audio
+      separates by microphone with no guessing (<a href="protocol.html#devices">the protocol</a>).</li>
+    <li><strong>Conversion.</strong> Channel 0 of whatever the input delivers (a sum of channels
+      would cancel or clip), through a Hann-windowed sinc low-pass under 7 kHz, a millisecond each
+      side, then read at 16 kHz between the filtered samples; 16-bit, 20 ms frames, stamped as a
+      file-fed device stamps them.</li>
+    <li><strong>A withheld grant is said, never silent.</strong> Under launchd an ungranted
+      microphone either blocks the open or delivers exact zeros with no error. An open past
+      <code class="code">$RIFT_OPEN_MS</code> (10 s) and exact zeros for
+      <code class="code">$RIFT_ZERO_MS</code> (2 s) after an open each exit 1 with one line naming
+      System Settings › Privacy &amp; Security › Microphone. An input that fails to open is
+      <code class="code">rift device: "&lt;microphone&gt;": &lt;cause&gt;</code>, exit 1.</li>
+  </ul>
+</section>
+
+<section class="docs-section" id="identity" data-component="identity">
+  <header>
+    <h2 class="h2">Identity</h2>
+    <p class="docs-note">macOS grants the microphone to a program by its code signature: an ad-hoc
+      signature changes with every build, so every upgrade would ask again. rift signs itself with a
+      certificate of its own, and the grant, which names the identifier and the certificate,
+      survives.</p>
+  </header>
+  <ul class="stack">
+    <li><strong>The Info.plist.</strong> Linked into the binary on macOS
+      (<code class="code">__TEXT,__info_plist</code>): <code class="code">CFBundleIdentifier</code>
+      <code class="code">dev.gigantic.rift</code>, <code class="code">CFBundleName</code>
+      <code class="code">rift</code> and the sentence the microphone's prompt shows.</li>
+    <li><strong>What setup makes, once.</strong> After hotswap links the release and before the
+      daemon is loaded or swapped: a password in <code class="code">&lt;root&gt;/rift.keychain-pass</code>
+      (0600), a keychain <code class="code">&lt;root&gt;/rift.keychain-db</code> with no lock timeout
+      and none at sleep, kept off the search list, and in it a self-signed code-signing certificate,
+      <code class="code">CN=rift</code>, RSA 2048, 100 years, its key usable by
+      <code class="code">codesign</code> with no prompt. Each run unlocks the keychain (a reboot locks
+      it) and signs the release itself, the file behind <code class="code">current</code>, with
+      identifier <code class="code">dev.gigantic.rift</code>, unless that identity already signed it:
+      a copy beside it is signed, then renamed over it, so a running rift keeps the file it
+      mapped. Each tool call has <code class="code">$RIFT_SIGN_MS</code>; one that would ask at the
+      screen is killed and named, and a failure is <code class="code">rift setup: &lt;line&gt;</code>,
+      exit 1, before the daemon is touched.</li>
+    <li><strong>What <code class="code">--remove</code> deletes.</strong> The keychain and its
+      password file, as files; the root is left. The next <code class="code">setup</code> makes a new
+      certificate, so the microphone is asked for again.</li>
+  </ul>
+</section>
+
 <section class="docs-section" id="designed" data-component="designed">
   <header>
     <h2 class="h2">The path</h2>
@@ -263,7 +332,7 @@
     <table data-table>
       <thead><tr><th>stage</th><th>what it does</th></tr></thead>
       <tbody>
-        <tr><td>① devices</td><td>clients of the socket, each an ear or a mouth; built with a file player (<code class="code">rift device</code>), microphones next; one on another machine is a later protocol</td></tr>
+        <tr><td>① devices</td><td>clients of the socket, each an ear or a mouth; built: a file player and, on macOS, <a href="#microphone">the microphone</a> (<code class="code">rift device</code>); next, a standing launchd job for the ear, then the mouth, playing what it is given; one on another machine is a later protocol</td></tr>
         <tr><td>② one stream</td><td>built: every track on the daemon's clock, so a moment means the same instant on every track (<a href="#stream">the stream</a>)</td></tr>
         <tr><td>③ voices</td><td>overlapping speakers split into separate voices, each given an id that holds across the stream</td></tr>
         <tr><td>④ words</td><td>each voice transcribed to words, each word with its start and end on that clock</td></tr>
@@ -284,6 +353,7 @@
         <tr><td class="table-mono">~/.local/state/rift</td><td>the state root, mode 0700; <code class="code">$RIFT_ROOT</code> overrides</td></tr>
         <tr><td class="table-mono">&lt;root&gt;/audio/&lt;boot&gt;/&lt;track&gt;/&lt;n&gt;.pcm</td><td>a segment's raw frames: the closed ones still in the window and each track's open one</td></tr>
         <tr><td class="table-mono">&lt;root&gt;/events.ndjson</td><td>the event log, the durable state beside the audio</td></tr>
+        <tr><td class="table-mono">&lt;root&gt;/rift.keychain-db, &lt;root&gt;/rift.keychain-pass</td><td>rift's own keychain, holding its code-signing identity, and its password (0600); <code class="code">setup</code> makes both, <code class="code">setup --remove</code> deletes both (<a href="#identity">identity</a>); <code class="code">identity.new/</code> beside them lives only while a certificate is made</td></tr>
         <tr><td class="table-mono">&lt;root&gt;/run/rift.sock</td><td>the socket, in <code class="code">run/</code> (0700) beside <code class="code">serve.lock</code> (the <code class="code">flock</code> that admits one instance), <code class="code">serve.pid</code> (a hint) and <code class="code">serve.log</code> (start, refused, accept, degraded, exit and panic lines)</td></tr>
         <tr><td class="table-mono">&lt;root&gt;/serve.err</td><td>launchd's stderr, for a failure before the daemon's log</td></tr>
         <tr><td class="table-mono">&lt;archive&gt;/audio/…, &lt;archive&gt;/index.ndjson</td><td>the archive, when one is set: every segment that left the window at its path, and its <code class="code">segment</code> event, one line each (<a href="protocol.html#audio">a repeated line</a> after a kill); nothing deletes there</td></tr>
@@ -306,10 +376,15 @@
         <tr><td class="table-mono">RIFT_BOOTOUT_MS</td><td><code class="code">setup</code>'s wait for launchd to let go of a job after a bootout, default 30000</td></tr>
         <tr><td class="table-mono">RIFT_DRAIN_MS</td><td>the drain's budget for open connections before they are cut, default 1000 (launchd's <code class="code">ExitTimeOut</code> is 3 s)</td></tr>
         <tr><td class="table-mono">RIFT_LOG_CAP</td><td>the size at which <code class="code">serve.log</code> and <code class="code">serve.err</code> each rotate to <code class="code">.1</code>, default 1 MiB</td></tr>
+        <tr><td class="table-mono">RIFT_MIC</td><td>the suite's fake microphones in place of the system's: a directory, its format in <code class="code">src/ear.rs</code></td></tr>
+        <tr><td class="table-mono">RIFT_OPEN_MS</td><td>how long a microphone's open may take before <code class="code">--mic</code> exits naming the grant, default 10000</td></tr>
         <tr><td class="table-mono">RIFT_PING_MS</td><td>how long after a device's last ping a frame's reply carries the next, default 10000</td></tr>
+        <tr><td class="table-mono">RIFT_POLL_MS</td><td>how often <code class="code">--mic</code> asks for the inputs, and how long one may fall silent before it closes, default 1000</td></tr>
         <tr><td class="table-mono">RIFT_READY_MS</td><td><code class="code">setup</code>'s wait for the loaded daemon to answer health ready, default 30000</td></tr>
         <tr><td class="table-mono">RIFT_ROOT</td><td>the state root, default <code class="code">~/.local/state/rift</code>; the socket path under it must fit 103 bytes</td></tr>
         <tr><td class="table-mono">RIFT_SEGMENT_MS</td><td>a segment's length, in whole 20 ms frames, at least one, default 10000</td></tr>
+        <tr><td class="table-mono">RIFT_SIGN_MS</td><td>how long <code class="code">setup</code> lets each <code class="code">security</code>, <code class="code">openssl</code> and <code class="code">codesign</code> call run before killing it, default 30000</td></tr>
+        <tr><td class="table-mono">RIFT_ZERO_MS</td><td>how long a microphone may give only exact zeros after its open before <code class="code">--mic</code> exits naming the grant, default 2000</td></tr>
       </tbody>
     </table>
   </div>
@@ -339,7 +414,8 @@ mise run dist                           # a checkout: this host's release archiv
         <tr><td class="table-mono">rift listen &lt;track&gt;</td><td>prints each frame placed on the track, live</td></tr>
         <tr><td class="table-mono">rift read &lt;track&gt; &lt;from us&gt; &lt;to us&gt;</td><td>prints the range's frames, silence where nothing is held</td></tr>
         <tr><td class="table-mono">rift device ear|mouth &lt;name&gt; &lt;file.pcm&gt; [--fast]</td><td>a device, its own process: plays a raw PCM file (16 kHz, mono, 16-bit little-endian) as the track's frames, a short tail dropped, answering every ping, paced in real time and stamped from now, a pause or clock step of over 100 ms playing on from the clock as a hole, or with <code class="code">--fast</code> sent as fast as each is answered and stamped as if captured ending now; prints its reply, then each notice and refusal; exit 0 once every frame is answered, <code class="code">{"code":"unknown","ok":false}</code> and exit 1 if the connection ends first; an unreadable file is <code class="code">rift device: &lt;cause&gt;</code>, exit 1</td></tr>
-        <tr><td class="table-mono">rift setup [--print | --remove]</td><td>brings the release into hotswap's layout and links <code class="code">~/.local/bin/rift</code> (with none installed, the latest, through packslip), then writes and loads the agent on that link, or swaps it with one <code class="code">kickstart -k</code>, then waits for the new daemon to answer health ready; <code class="code">--print</code> prints the plist, <code class="code">--remove</code> has hotswap forget the layout and the upgrade agent, unloads the agent and removes the plist and the link</td></tr>
+        <tr><td class="table-mono">rift device ear &lt;name&gt; --mic [&lt;microphone&gt;]</td><td>a device, its own process, macOS only: hears the default input, or the one named, while the ears are open (<a href="#microphone">the microphone</a>); prints its reply, then each notice and refusal; <code class="code">{"code":"unknown","ok":false}</code> and exit 1 when the connection ends, one stderr line and exit 1 for a withheld grant or a failed open; on Linux exit 2</td></tr>
+        <tr><td class="table-mono">rift setup [--print | --remove]</td><td>brings the release into hotswap's layout and links <code class="code">~/.local/bin/rift</code> (with none installed, the latest, through packslip), signs the release with <a href="#identity">rift's identity</a>, then writes and loads the agent on that link, or swaps it with one <code class="code">kickstart -k</code>, then waits for the new daemon to answer health ready; <code class="code">--print</code> prints the plist, <code class="code">--remove</code> has hotswap forget the layout and the upgrade agent, unloads the agent and removes the plist, the link, the keychain and its password</td></tr>
         <tr><td class="table-mono">rift upgrade [--check | --back | --retry]</td><td>hotswap's swap onto a newer release: installed beside the running one, <code class="code">current</code> moved, <code class="code">rift setup</code>, then the smoke (<code class="code">rift version</code>, <code class="code">rift status</code> until the daemon answers with it); a failure rolls back. Exit 0 green or settled, 1 red, 2 unable to try</td></tr>
         <tr><td class="table-mono">rift version</td><td>the build, as the hello reports it</td></tr>
       </tbody>
