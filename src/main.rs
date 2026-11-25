@@ -22,7 +22,7 @@ use std::panic;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, id};
 use std::str::FromStr;
-use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -79,13 +79,14 @@ struct Live {
     /// Each feed's queue, its connection's key and its topic: `""` the events, `"ears"` a
     /// device's replies and notices, else the track a listener follows.
     feeds: Vec<(SyncSender<String>, u64, String)>,
-    /// The closed segments still under `audio/`, as their events, in log order.
+    /// The closed segments still under `audio/` and not handed to the sweep, as their events, in
+    /// log order.
     held: Vec<Value>,
     /// The last connection key handed out.
     keys: u64,
     /// The quiet setting.
     quiet: bool,
-    /// The state root; `events.ndjson` under it is the only durable state.
+    /// The state root; `events.ndjson` and the segments under `audio/` are its durable state.
     root: PathBuf,
     /// A segment's length in samples, whole frames.
     segment: u64,
@@ -97,6 +98,9 @@ struct Live {
     sock: PathBuf,
     /// `ready`, `degraded` (the last write to the log or a segment failed) or `stopping`.
     state: &'static str,
+    /// The sweep's queue: each batch of segments leaving the window and the archive they move
+    /// into, moved by a thread of its own, so no request waits on the archive's disk.
+    sweeps: Sender<(Value, Vec<Value>)>,
     /// Every track of this boot, by name.
     tracks: BTreeMap<String, Track>,
     /// The window in seconds: a closed segment that ended longer ago leaves `audio/`.
@@ -118,20 +122,22 @@ struct Track {
 
 impl Live {
     /// Closes the open segment of `only`, else of every track, each with its event, then sweeps.
+    /// A segment whose event fails to log stays open, as does every one after it.
     fn close(&mut self, only: Option<&str>) -> io::Result<()> {
         let boot = self.boot;
-        let closing: Vec<Value> = self
+        let closing: Vec<(String, Value)> = self
             .tracks
-            .iter_mut()
+            .iter()
             .filter(|entry| only.is_none_or(|one| one == entry.0.as_str()))
             .filter_map(|(name, track)| {
-                let (num, start, samples) = track.open.take()?;
-                Some(json!({"kind": "segment", "n": num, "path": format!("audio/{boot}/{name}/{num}.pcm"), "samples": samples, "start": start, "track": name}))
+                let (num, start, samples) = track.open?;
+                Some((name.clone(), json!({"kind": "segment", "n": num, "path": format!("audio/{boot}/{name}/{num}.pcm"), "samples": samples, "start": start, "track": name})))
             })
             .collect();
-        for event in closing {
+        for (name, event) in closing {
             let logged = self.emit(&event)?;
             self.held.push(logged);
+            self.tracks.entry(name).or_default().open = None;
         }
         self.sweep();
         Ok(())
@@ -204,28 +210,15 @@ impl Live {
         wrote
     }
 
-    /// Moves every closed segment that ended more than the window ago out of `audio/`: into the
-    /// archive, its event appended to the archive's `index.ndjson`, else deleted. One that fails
-    /// stays for the next sweep.
+    /// Hands every closed segment that ended more than the window ago to the sweep's thread,
+    /// which moves it out of `audio/`.
     fn sweep(&mut self) {
         let cutoff = now().saturating_sub(self.window.saturating_mul(1_000_000));
-        let (root, archive) = (&self.root, &self.archive);
-        self.held.retain(|event| {
-            let path = event["e"]["path"].as_str().unwrap_or_default();
-            let from = root.join(path);
-            end(&event["e"]) >= cutoff
-                || archive
-                    .as_str()
-                    .map(Path::new)
-                    .map_or(Ok(()), |dir| {
-                        let into = dir.join(path);
-                        into.parent().map_or(Ok(()), fs::create_dir_all)?;
-                        let _: u64 = fs::copy(&from, &into)?;
-                        append(&dir.join("index.ndjson"), format!("{event}\n").as_bytes())
-                    })
-                    .and_then(|()| fs::remove_file(&from))
-                    .is_err()
-        });
+        let due = self
+            .held
+            .extract_if(.., |event| end(&event["e"]) < cutoff)
+            .collect();
+        drop(self.sweeps.send((self.archive.clone(), due)));
     }
 }
 
@@ -465,21 +458,24 @@ fn main() -> ExitCode {
                         };
                         let frames = pcm.chunks_exact(FRAME);
                         // stamped from now in real time, or, sent as fast as accepted, ending now
-                        let (base, begun) = (
-                            now().saturating_sub(
-                                u64::try_from(frames.len())
-                                    .unwrap_or_default()
-                                    .saturating_mul(20_000)
-                                    .saturating_mul(u64::from(fast)),
-                            ),
-                            Instant::now(),
+                        let mut base = now().saturating_sub(
+                            u64::try_from(frames.len())
+                                .unwrap_or_default()
+                                .saturating_mul(20_000)
+                                .saturating_mul(u64::from(fast)),
                         );
                         let played = pong(&mut reader, &reply["ping"]).and_then(|()| {
                             (0u64..).step_by(20_000).zip(frames).try_for_each(|(at, frame)| {
+                                // paced on the clock its pongs read; over 100 ms off it (a pause,
+                                // a sleep, a clock step) plays on from now, the gap a hole
                                 if !fast {
-                                    thread::sleep(
-                                        Duration::from_micros(at).saturating_sub(begun.elapsed()),
-                                    );
+                                    let clock = now();
+                                    if clock.abs_diff(base.saturating_add(at)) > 100_000 {
+                                        base = clock.saturating_sub(at);
+                                    }
+                                    thread::sleep(Duration::from_micros(
+                                        base.saturating_add(at).saturating_sub(clock),
+                                    ));
                                 }
                                 writeln!(
                                     reader.get_mut(),
@@ -628,6 +624,7 @@ fn main() -> ExitCode {
                     .iter()
                     .filter(|event| event["e"]["kind"] == "segment")
                     .collect();
+                let (sweeps, swept) = mpsc::channel::<(Value, Vec<Value>)>();
                 let live: &'static Mutex<Live> = Box::leak(Box::new(Mutex::new(Live {
                     archive: kept.map_or(Value::Null, |keep| keep["archive"].clone()),
                     boot: held_events
@@ -658,10 +655,47 @@ fn main() -> ExitCode {
                     since: utc(SystemTime::now()),
                     sock: sock.clone(),
                     state: "ready",
+                    sweeps,
                     tracks: BTreeMap::new(),
                     window: kept.map_or(600, |keep| keep["window"].as_u64().unwrap_or_default()),
                 })));
-                // the pid file first: a failure past the boot event or the rename leaves no trace
+                // the sweep's thread, off the lock: into the archive, its event appended to the
+                // archive's index, else deleted; one that fails goes back for the next sweep
+                let moving = root.clone();
+                drop(thread::spawn(move || {
+                    for (archive, due) in swept {
+                        let failed: Vec<Value> = due
+                            .into_iter()
+                            .filter(|event| {
+                                let path = event["e"]["path"].as_str().unwrap_or_default();
+                                let from = moving.join(path);
+                                archive
+                                    .as_str()
+                                    .map(Path::new)
+                                    .map_or(Ok(()), |under| {
+                                        let into = under.join(path);
+                                        into.parent().map_or(Ok(()), fs::create_dir_all)?;
+                                        let _: u64 = fs::copy(&from, &into)?;
+                                        append(
+                                            &under.join("index.ndjson"),
+                                            format!("{event}\n").as_bytes(),
+                                        )
+                                    })
+                                    .and_then(|()| fs::remove_file(&from))
+                                    .is_err()
+                            })
+                            .collect();
+                        drop(lock(live).held.splice(0..0, failed));
+                    }
+                }));
+                // the window holds while nothing closes a segment: ears off, no device, idle
+                drop(thread::spawn(move || -> ! {
+                    loop {
+                        thread::sleep(Duration::from_secs(1));
+                        lock(live).sweep();
+                    }
+                }));
+                // the pid file first: past the boot event only a failed append or rename refuses
                 fs::write(&pid, id().to_string())?;
                 let mut guard = lock(live);
                 drop(guard.emit(&json!({"kind": "boot", "pid": id(), "version": VERSION}))?);
@@ -688,13 +722,23 @@ fn main() -> ExitCode {
                     let (folder, name) = path.rsplit_once('/').unwrap_or_default();
                     let (top, track) = folder.rsplit_once('/').unwrap_or_default();
                     let boot: u64 = top.trim_start_matches("audio/").parse().unwrap_or_default();
-                    let handle = OpenOptions::new().write(true).open(root.join(&path))?;
-                    let frames = handle
-                        .metadata()?
-                        .len()
-                        .checked_div(640)
-                        .unwrap_or_default();
-                    handle.set_len(frames.saturating_mul(640))?;
+                    // one that will not open or cut (a directory, a read-only file) stays as it
+                    // is: refusing would put the daemon in a boot loop under KeepAlive
+                    let Ok(frames) = OpenOptions::new()
+                        .write(true)
+                        .open(root.join(&path))
+                        .and_then(|handle| {
+                            let frames = handle
+                                .metadata()?
+                                .len()
+                                .checked_div(640)
+                                .unwrap_or_default();
+                            handle.set_len(frames.saturating_mul(640))?;
+                            Ok(frames)
+                        })
+                    else {
+                        continue;
+                    };
                     let start = held_events
                         .iter()
                         .rev()
@@ -809,7 +853,13 @@ fn main() -> ExitCode {
                             .map(|(kind, name)| format!("{kind}-{name}"));
                         let pcm = request["pcm"]
                             .as_str()
-                            .filter(|text| text.len() == FRAME * 2)
+                            // lowercase digits only: from_str_radix alone takes uppercase and a `+`
+                            .filter(|text| {
+                                text.len() == FRAME * 2
+                                    && text
+                                        .bytes()
+                                        .all(|digit| matches!(digit, b'0'..=b'9' | b'a'..=b'f'))
+                            })
                             .and_then(|text| {
                                 text.as_bytes()
                                     .chunks(2)
@@ -879,14 +929,16 @@ fn main() -> ExitCode {
                                         guard.quiet
                                     };
                                 let toggled = (|| {
-                                    if changed && op == "ears" {
-                                        if !on {
+                                    if changed {
+                                        if op == "ears" && !on {
                                             guard.close(None)?;
                                         }
-                                        guard.fan("ears", &format!("{}\n", json!({"ears": on})));
-                                    }
-                                    if changed {
                                         drop(guard.emit(&json!({"kind": op, "on": on}))?);
+                                        // devices hear of it only once it is logged
+                                        if op == "ears" {
+                                            guard
+                                                .fan("ears", &format!("{}\n", json!({"ears": on})));
+                                        }
                                         *(if op == "ears" {
                                             &mut guard.ears
                                         } else {
@@ -905,43 +957,64 @@ fn main() -> ExitCode {
                                     (Some(bytes), Some((theirs, ours))) => {
                                         let (name, state) =
                                             (device.clone().unwrap_or_default(), &mut *guard);
+                                        // never after it arrived: a clock stepped ahead between
+                                        // pongs leaves no hole into the future to stay ahead by
                                         let at = request["t"]
                                             .as_u64()
                                             .unwrap_or_default()
                                             .saturating_add(ours)
-                                            .saturating_sub(theirs);
+                                            .saturating_sub(theirs)
+                                            .min(now());
                                         let placed = (|| {
-                                            let start = match state
+                                            // logged only once the frame is written, so a refused one changes nothing
+                                            let (start, event) = match state
                                                 .tracks
                                                 .get(&name)
                                                 .and_then(|held| held.end)
                                             {
-                                                None => {
-                                                    drop(state.emit(&json!({"kind": "track", "start": at, "track": name}))?);
-                                                    at
-                                                }
+                                                None => (
+                                                    at,
+                                                    Some(
+                                                        json!({"kind": "track", "start": at, "track": name}),
+                                                    ),
+                                                ),
                                                 // half a frame or more past the track's end is a hole
                                                 Some(last) if at >= last.saturating_add(10_000) => {
-                                                    state.close(Some(&name))?;
-                                                    end(&state.emit(&json!({"kind": "hole", "samples": samples(at.saturating_sub(last)), "start": last, "track": name}))?["e"])
+                                                    let gap = json!({"kind": "hole", "samples": samples(at.saturating_sub(last)), "start": last, "track": name});
+                                                    (end(&gap), Some(gap))
                                                 }
-                                                Some(last) => last,
+                                                // as far before it is a clock running fast, dropped
+                                                // so the track never runs ahead of the device
+                                                Some(last) if at.saturating_add(10_000) <= last => {
+                                                    return Ok(error("ahead"));
+                                                }
+                                                Some(last) => (last, None),
                                             };
-                                            // the open segment, else the next, which counts only once written
+                                            // the open segment, unless a hole closes it, else the next, which counts only once written
                                             let known = state.tracks.get(&name);
                                             let (num, first, written) = known
                                                 .and_then(|held| held.open)
+                                                .filter(|_| event.is_none())
                                                 .unwrap_or_else(|| {
                                                     (known.map_or(0, |held| held.next), start, 0)
                                                 });
                                             let dir = state
                                                 .root
                                                 .join(format!("audio/{}/{name}", state.boot));
-                                            state.mark(fs::create_dir_all(&dir).and_then(
-                                                |()| {
-                                                    append(&dir.join(format!("{num}.pcm")), &bytes)
-                                                },
-                                            ))?;
+                                            let file = dir.join(format!("{num}.pcm"));
+                                            state.mark(
+                                                fs::create_dir_all(&dir)
+                                                    .and_then(|()| append(&file, &bytes)),
+                                            )?;
+                                            if let Some(opening) = event {
+                                                // a segment its event never logged is unwritten
+                                                let logged = state
+                                                    .close(Some(&name))
+                                                    .and_then(|()| state.emit(&opening));
+                                                drop(logged.inspect_err(|_| {
+                                                    drop(fs::remove_file(&file));
+                                                })?);
+                                            }
                                             let (held, full) = (
                                                 state.tracks.entry(name.clone()).or_default(),
                                                 written.saturating_add(320),
@@ -951,14 +1024,16 @@ fn main() -> ExitCode {
                                                 Some((num, first, full)),
                                                 Some(start.saturating_add(20_000)),
                                             );
+                                            // the frame is placed: a close that fails to log
+                                            // leaves the segment open for the next frame's close
                                             if full >= state.segment {
-                                                state.close(Some(&name))?;
+                                                drop(state.close(Some(&name)));
                                             }
                                             state.fan(
                                                 &name,
                                                 &format!(
                                                     "{}\n",
-                                                    json!({"pcm": request["pcm"], "t": start})
+                                                    json!({"pcm": hex(&bytes), "t": start})
                                                 ),
                                             );
                                             let mut reply = json!({"ok": true, "t": start});
@@ -1122,31 +1197,41 @@ fn main() -> ExitCode {
                                         || after["boot"].is_u64() && after["seq"].is_u64()
                                 }) =>
                             {
-                                let after = &request["after"];
-                                let held_events = events(
-                                    &fs::read(guard.root.join("events.ndjson")).unwrap_or_default(),
-                                );
-                                let found = held_events.iter().position(|event| {
-                                    event["boot"] == after["boot"] && event["seq"] == after["seq"]
+                                let (after, boot, id) =
+                                    (request["after"].clone(), guard.boot, request["id"].clone());
+                                let path = guard.root.join("events.ndjson");
+                                // the log as of the subscription, read and replied to off the lock:
+                                // appends hold it, so every event past this length reaches the queue
+                                let len = fs::metadata(&path).map_or(0, |meta| meta.len());
+                                let backlog = iter::once(()).flat_map(move |()| {
+                                    let mut bytes = Vec::new();
+                                    drop(fs::File::open(&path).and_then(|file| {
+                                        file.take(len).read_to_end(&mut bytes)
+                                    }));
+                                    let held_events = events(&bytes);
+                                    let found = held_events.iter().position(|event| {
+                                        event["boot"] == after["boot"]
+                                            && event["seq"] == after["seq"]
+                                    });
+                                    let mut reply = json!({"ok": true, "reset": found.is_none() && !after.is_null()});
+                                    if !id.is_null() {
+                                        reply["id"] = id.clone();
+                                    }
+                                    iter::once(format!("{reply}\n")).chain(
+                                        held_events
+                                            .into_iter()
+                                            .enumerate()
+                                            .filter(move |entry| {
+                                                found.map_or(entry.1["boot"] == boot, |start| {
+                                                    entry.0 > start
+                                                })
+                                            })
+                                            .map(|(_, event)| format!("{event}\n")),
+                                    )
                                 });
-                                let boot = guard.boot;
-                                let backlog = held_events
-                                    .into_iter()
-                                    .enumerate()
-                                    .filter(move |entry| {
-                                        found.map_or(entry.1["boot"] == boot, |start| {
-                                            entry.0 > start
-                                        })
-                                    })
-                                    .map(|(_, event)| format!("{event}\n"));
                                 let (sender, incoming) = mpsc::sync_channel(BEHIND);
                                 guard.feeds.push((sender, key, String::new()));
-                                (
-                                    Ok(
-                                        json!({"ok": true, "reset": found.is_none() && !after.is_null()}),
-                                    ),
-                                    Next::Feed(Box::new(backlog), incoming),
-                                )
+                                (Ok(Value::Null), Next::Feed(Box::new(backlog), incoming))
                             }
                             (true, Some("shutdown")) => (Ok(json!({"ok": true})), Next::Stop),
                             (

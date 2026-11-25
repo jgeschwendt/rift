@@ -181,6 +181,19 @@ mod tests {
         Ok(())
     }
 
+    /// `done` asked every 10 ms until it holds, 10 s at most: the sweep moves segments off the
+    /// request path.
+    fn until<F: Fn() -> io::Result<bool>>(done: F) -> Outcome {
+        let started = Instant::now();
+        while !done()? {
+            if started.elapsed() > Duration::from_secs(10) {
+                return Err("timed out".into());
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        Ok(())
+    }
+
     /// The error reply with `name`, as the daemon writes it.
     fn code(name: &str) -> String {
         format!(r#"{{"code":"{name}","ok":false}}"#)
@@ -817,6 +830,37 @@ mod tests {
         )
     }
 
+    /// A feed reads the log off the lock: with the log a fifo whose read never ends, a feed stuck
+    /// replaying it leaves `status` answering; once the fifo ends, its reply carries its `id`.
+    #[test]
+    fn unlocked() -> Outcome {
+        let root = temp("unlocked")?;
+        let (mut daemon, _) = serve(&root, &[])?;
+        let log = format!("{root}/events.ndjson");
+        fs::rename(&log, format!("{log}.held"))?;
+        let mut status = greet(&root)?;
+        status
+            .get_ref()
+            .set_read_timeout(Some(Duration::from_secs(2)))?;
+        same(
+            &format!("{}", Command::new("mkfifo").arg(&log).status()?),
+            "exit status: 0",
+        )?;
+        let mut feed = greet(&root)?;
+        feed.get_mut()
+            .write_all(b"{\"after\":null,\"id\":7,\"op\":\"feed\"}\n")?;
+        // opening the fifo to write returns once the feed has opened it to read
+        let writer = OpenOptions::new().write(true).open(&log)?;
+        let health: Value = serde_json::from_str(&say(&mut status, r#"{"op":"health"}"#)?)?;
+        same(&health["ok"].to_string(), "true")?;
+        drop(writer);
+        same(&next(&mut feed)?, r#"{"id":7,"ok":true,"reset":false}"#)?;
+        fs::remove_file(&log)?;
+        fs::rename(format!("{log}.held"), &log)?;
+        same(&signal(&daemon, "TERM")?, "")?;
+        same(&format!("{:?}", daemon.0.wait()?.code()), "Some(0)")
+    }
+
     /// A feed client that stops reading is dropped once it is more than 1024 events behind; the
     /// daemon serves on, and the client resumes from its last position.
     #[test]
@@ -967,6 +1011,9 @@ mod tests {
         for line in [
             r#"{"op":"frame","pcm":"00","t":1}"#.to_owned(),
             json!({"op": "frame", "pcm": "zz".repeat(640), "t": 1u8}).to_string(),
+            // from_str_radix takes these; the wire is lowercase digits only
+            json!({"op": "frame", "pcm": "AB".repeat(640), "t": 1u8}).to_string(),
+            json!({"op": "frame", "pcm": "+0".repeat(640), "t": 1u8}).to_string(),
         ] {
             same(&say(&mut ear, &line)?, &code("bad_frame"))?;
         }
@@ -1099,18 +1146,65 @@ mod tests {
                 .collect::<Vec<_>>()
                 .concat(),
         )?;
-        // a segment that cannot be written: the track begins, the frame is refused
+        // a segment that cannot be written: every frame is refused and nothing is logged
         fs::write(format!("{root}/audio/1/ear-z"), "")?;
         let (mut broken, broken_hi) =
             device(&root, r#"{"kind":"ear","name":"z","op":"device"}"#, 0)?;
+        for index in 0..2 {
+            same(
+                &frame(
+                    &mut broken,
+                    broken_hi["ping"].as_u64().unwrap_or_default() + index * 20_000,
+                    1,
+                )?
+                .to_string(),
+                &code("io"),
+            )?;
+        }
+        same(
+            &events(&root)?
+                .iter()
+                .filter(|event| event["e"]["track"] == "ear-z")
+                .count()
+                .to_string(),
+            "0",
+        )?;
+        // a segment written whose track event cannot be logged is taken back
+        let (log, aside) = (
+            format!("{root}/events.ndjson"),
+            format!("{root}/held.ndjson"),
+        );
+        fs::rename(&log, &aside)?;
+        symlink("/dev/urandom", &log)?;
+        let (mut unlogged, unlogged_hi) =
+            device(&root, r#"{"kind":"ear","name":"y","op":"device"}"#, 0)?;
         same(
             &frame(
-                &mut broken,
-                broken_hi["ping"].as_u64().unwrap_or_default(),
+                &mut unlogged,
+                unlogged_hi["ping"].as_u64().unwrap_or_default(),
                 1,
             )?
             .to_string(),
             &code("io"),
+        )?;
+        // closing the ears unlogged changes nothing, and no device is told
+        same(
+            &rift(&root, &[], &["ears", "off"])?,
+            &format!("1\n{}\n", code("io")),
+        )?;
+        same(
+            &frame(
+                &mut broken,
+                broken_hi["ping"].as_u64().unwrap_or_default() + 40_000,
+                1,
+            )?
+            .to_string(),
+            &code("io"),
+        )?;
+        fs::rename(&aside, &log)?;
+        same(
+            &fs::exists(format!("{root}/audio/1/ear-y/0.pcm"))?.to_string(),
+            "false",
         )?;
         let state = || -> Result<String, Box<dyn Error>> {
             let health: Value =
@@ -1118,7 +1212,6 @@ mod tests {
             Ok(health["state"].to_string())
         };
         same(&state()?, r#""degraded""#)?;
-        drop(take(&mut feed, 1)?);
         // closing the ears closes the open segment, and its device is told
         let (mut open, open_hi) = device(&root, r#"{"kind":"ear","name":"c","op":"device"}"#, 0)?;
         let open_at = open_hi["ping"].as_u64().unwrap_or_default() - 1_000_000;
@@ -1127,7 +1220,9 @@ mod tests {
         }
         same(&state()?, r#""ready""#)?;
         // an open segment reads back too
-        let open_first = take(&mut feed, 1)?[0]["start"].as_u64().unwrap_or_default();
+        let opened = take(&mut feed, 1)?;
+        same(&opened[0]["track"].to_string(), r#""ear-c""#)?;
+        let open_first = opened[0]["start"].as_u64().unwrap_or_default();
         same(
             &rift(
                 &root,
@@ -1145,9 +1240,36 @@ mod tests {
                 json!({"pcm": "03".repeat(640), "t": open_first + 20_000})
             ),
         )?;
+        // a read into the future ends at now: no silence for time not yet heard
+        let mut ahead = greet(&root)?;
+        same(
+            &say(
+                &mut ahead,
+                &json!({"from": open_first, "op": "read", "to": open_first + 10_000_000, "track": "ear-c"})
+                    .to_string(),
+            )?,
+            r#"{"ok":true}"#,
+        )?;
+        let last = drain(&mut ahead)?
+            .last()
+            .and_then(|line| line["t"].as_u64())
+            .ok_or("unread")?;
+        same(
+            &(last < u64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_micros())?)
+                .to_string(),
+            "true",
+        )?;
+        // a segment whose event cannot be logged stays open, for the next close to log
+        fs::rename(&log, &aside)?;
+        symlink("/dev/urandom", &log)?;
         same(
             &rift(&root, &[], &["ears", "off"])?,
-            "0\n{\"changed\":true,\"ok\":true,\"seq\":13}\n",
+            &format!("1\n{}\n", code("io")),
+        )?;
+        fs::rename(&aside, &log)?;
+        same(
+            &rift(&root, &[], &["ears", "off"])?,
+            "0\n{\"changed\":true,\"ok\":true,\"seq\":12}\n",
         )?;
         same(&next(&mut open)?, r#"{"ears":false}"#)?;
         same(
@@ -1165,8 +1287,9 @@ mod tests {
         // a window of nothing: every closed segment moves to the archive, in log order
         same(
             &rift(&root, &[], &["keep", "0", &archive])?,
-            "0\n{\"ok\":true,\"seq\":14}\n",
+            "0\n{\"ok\":true,\"seq\":13}\n",
         )?;
+        until(|| Ok(!fs::exists(format!("{root}/audio/1/ear-c/0.pcm"))?))?;
         let indexed: Vec<Value> = fs::read_to_string(format!("{archive}/index.ndjson"))?
             .lines()
             .map(serde_json::from_str)
@@ -1203,13 +1326,14 @@ mod tests {
         // no archive: a segment leaving the window is deleted
         same(
             &rift(&root, &[], &["keep", "0"])?,
-            "0\n{\"ok\":true,\"seq\":15}\n",
+            "0\n{\"ok\":true,\"seq\":14}\n",
         )?;
         drop(rift(&root, &[], &["ears", "on"])?);
         same(&next(&mut open)?, r#"{"ears":true}"#)?;
         for index in 0..5 {
             drop(frame(&mut open, open_at + 200_000 + index * 20_000, 4)?);
         }
+        until(|| Ok(!fs::exists(format!("{root}/audio/1/ear-c/1.pcm"))?))?;
         same(
             &format!(
                 "{} {} {}",
@@ -1223,7 +1347,7 @@ mod tests {
         )?;
         same(
             &rift(&root, &[], &["keep", "5", &archive])?,
-            "0\n{\"ok\":true,\"seq\":19}\n",
+            "0\n{\"ok\":true,\"seq\":18}\n",
         )?;
         same(
             &say(&mut greet(&root)?, r#"{"op":"shutdown"}"#)?,
@@ -1246,6 +1370,69 @@ mod tests {
             ),
             &format!("\"{archive}\" true 5 Some(0)"),
         )
+    }
+
+    /// An idle daemon still keeps the window: with the ears closed and no device, a closed
+    /// segment leaves `audio/` once it ages out.
+    #[test]
+    fn idle() -> Outcome {
+        let root = temp("idle")?;
+        let (mut daemon, _) = serve(&root, &[])?;
+        drop(rift(&root, &[], &["keep", "1"])?);
+        drop(rift(&root, &[], &["ears", "on"])?);
+        let (mut ear, hi) = device(&root, r#"{"kind":"ear","name":"i","op":"device"}"#, 0)?;
+        drop(frame(&mut ear, hi["ping"].as_u64().unwrap_or_default(), 1)?);
+        drop(rift(&root, &[], &["ears", "off"])?);
+        drop(ear);
+        let segment = format!("{root}/audio/1/ear-i/0.pcm");
+        until(|| fs::exists(&segment))?;
+        until(|| Ok(!fs::exists(&segment)?))?;
+        same(
+            &say(&mut greet(&root)?, r#"{"op":"shutdown"}"#)?,
+            r#"{"ok":true}"#,
+        )?;
+        same(&format!("{:?}", daemon.0.wait()?.code()), "Some(0)")
+    }
+
+    /// A fast clock never runs a track ahead: a frame within half a frame of the track's end goes
+    /// at the end, one half a frame or more before it is refused `ahead` and writes nothing.
+    #[test]
+    fn ahead() -> Outcome {
+        let root = temp("ahead")?;
+        let (mut daemon, _) = serve(&root, &[])?;
+        drop(rift(&root, &[], &["ears", "on"])?);
+        let (mut ear, hi) = device(&root, r#"{"kind":"ear","name":"f","op":"device"}"#, 0)?;
+        let at = hi["ping"].as_u64().unwrap_or_default() - 1_000_000;
+        let placed = [0, 25_000, 28_000, 35_000]
+            .into_iter()
+            .zip(0u8..)
+            .map(|(step, fill)| frame(&mut ear, at + step, fill))
+            .collect::<Result<Vec<_>, _>>()?;
+        let first = placed[0]["t"].as_u64().ok_or("unplaced")?;
+        same(
+            &json!(placed).to_string(),
+            &json!([
+                {"ok": true, "t": first},
+                {"ok": true, "t": first + 20_000},
+                {"code": "ahead", "ok": false},
+                {"ok": true, "t": first + 40_000},
+            ])
+            .to_string(),
+        )?;
+        same(
+            &(fs::read(format!("{root}/audio/1/ear-f/0.pcm"))?
+                == [0u8, 1, 3]
+                    .iter()
+                    .flat_map(|&fill| [fill; 640])
+                    .collect::<Vec<_>>())
+            .to_string(),
+            "true",
+        )?;
+        same(
+            &say(&mut greet(&root)?, r#"{"op":"shutdown"}"#)?,
+            r#"{"ok":true}"#,
+        )?;
+        same(&format!("{:?}", daemon.0.wait()?.code()), "Some(0)")
     }
 
     /// A kill mid-segment: the next boot cuts its torn tail to whole frames and closes it with its
@@ -1320,6 +1507,169 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join(" "),
             r#""stop" "boot""#,
+        )
+    }
+
+    /// A kill in a later segment: a torn segment after a closed one, or after a hole, starts where
+    /// that one ended, at its own first frame, never at the track's start.
+    #[test]
+    fn seam() -> Outcome {
+        let root = temp("seam")?;
+        let (mut daemon, _) = serve(&root, &[("RIFT_SEGMENT_MS", "100")])?;
+        drop(rift(&root, &[], &["ears", "on"])?);
+        // each device held to the kill: a drop would close its segment
+        let (mut ears, mut torn) = (Vec::new(), Vec::new());
+        for (name, steps) in [("h", &[0, 58, 59][..]), ("k", &[0, 1, 2, 3, 4, 5, 6])] {
+            let (mut ear, hi) = device(
+                &root,
+                &json!({"kind": "ear", "name": name, "op": "device"}).to_string(),
+                0,
+            )?;
+            let at = hi["ping"].as_u64().unwrap_or_default() - 2_000_000;
+            let placed = steps
+                .iter()
+                .map(|&step| frame(&mut ear, at + step * 20_000, 1))
+                .collect::<Result<Vec<_>, _>>()?;
+            torn.push(json!({"kind": "segment", "n": 1u8, "path": format!("audio/1/ear-{name}/1.pcm"), "samples": 640u16, "start": placed[steps.len() - 2]["t"], "track": format!("ear-{name}")}));
+            ears.push(ear);
+        }
+        daemon.0.kill()?;
+        let _: ExitStatus = daemon.0.wait()?;
+        let (mut again, _) = serve(&root, &[])?;
+        let mut logged = events(&root)?;
+        same(
+            &json!(
+                logged
+                    .split_off(logged.len() - 2)
+                    .iter()
+                    .map(|event| &event["e"])
+                    .collect::<Vec<_>>()
+            )
+            .to_string(),
+            &json!(torn).to_string(),
+        )?;
+        same(
+            &say(&mut greet(&root)?, r#"{"op":"shutdown"}"#)?,
+            r#"{"ok":true}"#,
+        )?;
+        same(&format!("{:?}", again.0.wait()?.code()), "Some(0)")
+    }
+
+    /// A `*.pcm` under `audio/` that will not open for writing is left as it is: the daemon comes
+    /// up, its boot the only event, rather than refusing each relaunch.
+    #[test]
+    fn unopenable() -> Outcome {
+        let root = temp("unopenable")?;
+        fs::create_dir_all(format!("{root}/audio/1/mic/0.pcm"))?;
+        let (mut daemon, ready) = serve(&root, &[])?;
+        same(&ready["boot"].to_string(), "1")?;
+        same(
+            &events(&root)?
+                .iter()
+                .map(|event| event["e"]["kind"].to_string())
+                .collect::<Vec<_>>()
+                .join(" "),
+            r#""boot""#,
+        )?;
+        same(
+            &say(&mut greet(&root)?, r#"{"op":"shutdown"}"#)?,
+            r#"{"ok":true}"#,
+        )?;
+        same(&format!("{:?}", daemon.0.wait()?.code()), "Some(0)")
+    }
+
+    /// An archive whose disk stalls, a FIFO with no reader where a segment's copy goes: frames
+    /// and `status` answer meanwhile, and the copy lands once the disk wakes.
+    #[test]
+    fn stall() -> Outcome {
+        let root = temp("stall")?;
+        let archive = format!("{root}/archive");
+        let (mut daemon, _) = serve(&root, &[("RIFT_SEGMENT_MS", "20")])?;
+        drop(rift(&root, &[], &["ears", "on"])?);
+        drop(rift(&root, &[], &["keep", "0", &archive])?);
+        let stuck = format!("{archive}/audio/1/ear-s/0.pcm");
+        fs::create_dir_all(format!("{archive}/audio/1/ear-s"))?;
+        same(
+            &Command::new("mkfifo")
+                .arg(&stuck)
+                .status()?
+                .success()
+                .to_string(),
+            "true",
+        )?;
+        let (mut ear, hi) = device(&root, r#"{"kind":"ear","name":"s","op":"device"}"#, 0)?;
+        let at = hi["ping"].as_u64().unwrap_or_default() - 1_000_000;
+        for index in 0..2 {
+            same(
+                &frame(&mut ear, at + index * 20_000, 1)?["ok"].to_string(),
+                "true",
+            )?;
+        }
+        same(
+            &serde_json::from_str::<Value>(
+                rift(&root, &[], &["status"])?.trim_start_matches("0\n"),
+            )?["state"]
+                .to_string(),
+            r#""ready""#,
+        )?;
+        let woken = fs::read(&stuck)?;
+        same(&woken.len().to_string(), "640")?;
+        until(|| {
+            Ok(fs::read_to_string(format!("{archive}/index.ndjson"))
+                .is_ok_and(|index| index.lines().count() == 2))
+        })?;
+        same(
+            &say(&mut greet(&root)?, r#"{"op":"shutdown"}"#)?,
+            r#"{"ok":true}"#,
+        )?;
+        same(&format!("{:?}", daemon.0.wait()?.code()), "Some(0)")
+    }
+
+    /// A frame that fills its segment while the log fails is still placed and answered; its
+    /// segment stays open and is logged by the next frame's close, at its own start.
+    #[test]
+    fn unlogged() -> Outcome {
+        let root = temp("unlogged")?;
+        let (log, aside) = (format!("{root}/events.ndjson"), format!("{root}/aside"));
+        let (mut daemon, _) = serve(&root, &[("RIFT_SEGMENT_MS", "20")])?;
+        drop(rift(&root, &[], &["ears", "on"])?);
+        let (mut ear, hi) = device(&root, r#"{"kind":"ear","name":"u","op":"device"}"#, 0)?;
+        let at = hi["ping"].as_u64().unwrap_or_default() - 1_000_000;
+        let mut placed = Vec::new();
+        for index in 0u8..4 {
+            if index == 1 {
+                fs::rename(&log, &aside)?;
+                symlink("/dev/urandom", &log)?;
+            }
+            let reply = frame(&mut ear, at + u64::from(index) * 20_000, index)?;
+            if index == 1 {
+                fs::remove_file(&log)?;
+                fs::rename(&aside, &log)?;
+            }
+            same(&reply["ok"].to_string(), "true")?;
+            placed.push(reply["t"].as_u64().ok_or("unplaced")?);
+        }
+        same(
+            &say(&mut greet(&root)?, r#"{"op":"shutdown"}"#)?,
+            r#"{"ok":true}"#,
+        )?;
+        same(&format!("{:?}", daemon.0.wait()?.code()), "Some(0)")?;
+        same(
+            &events(&root)?
+                .iter()
+                .filter(|event| event["e"]["kind"] == "segment")
+                .map(|event| {
+                    format!(
+                        "{} {} {}",
+                        event["e"]["n"], event["e"]["samples"], event["e"]["start"]
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", "),
+            &format!(
+                "0 320 {}, 1 640 {}, 2 320 {}",
+                placed[0], placed[1], placed[3]
+            ),
         )
     }
 
@@ -1462,6 +1812,61 @@ mod tests {
                 code("unknown")
             ),
         )
+    }
+
+    /// A frame is never placed after it arrived, however far ahead its device's clock; `rift device`
+    /// stopped mid-file plays on from the clock, the pause a hole, never a burst behind it.
+    #[test]
+    fn pause() -> Outcome {
+        let root = temp("pause")?;
+        let (mut daemon, _) = serve(&root, &[("RIFT_DRAIN_MS", "200")])?;
+        drop(rift(&root, &[], &["ears", "on"])?);
+        let (mut ahead, hi) = device(&root, r#"{"kind":"ear","name":"ahead","op":"device"}"#, 0)?;
+        let placed = frame(
+            &mut ahead,
+            hi["ping"].as_u64().unwrap_or_default() + 3_600_000_000,
+            1,
+        )?;
+        same(
+            &(placed["t"].as_u64().unwrap_or(u64::MAX)
+                <= u64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_micros())?)
+            .to_string(),
+            "true",
+        )?;
+        drop(ahead);
+        let long = format!("{root}/long.pcm");
+        fs::write(&long, vec![1; 64_000])?;
+        let mut player = Daemon(
+            Command::new(env!("CARGO_BIN_EXE_rift"))
+                .env("RIFT_ROOT", &root)
+                .args(["device", "ear", "paused", &long])
+                .stdout(Stdio::null())
+                .spawn()?,
+        );
+        let paused = || -> Result<Vec<Value>, Box<dyn Error>> {
+            Ok(events(&root)?
+                .into_iter()
+                .map(|event| event["e"].clone())
+                .filter(|event| event["track"] == "ear-paused")
+                .collect())
+        };
+        until(|| Ok(paused().is_ok_and(|held| !held.is_empty())))?;
+        same(&signal(&player, "STOP")?, "")?;
+        thread::sleep(Duration::from_millis(400));
+        same(&signal(&player, "CONT")?, "")?;
+        same(&format!("{:?}", player.0.wait()?.code()), "Some(0)")?;
+        same(
+            &paused()?
+                .iter()
+                .any(|event| event["kind"] == "hole" && event["samples"].as_u64() >= Some(4_800))
+                .to_string(),
+            "true",
+        )?;
+        same(
+            &say(&mut greet(&root)?, r#"{"op":"shutdown"}"#)?,
+            r#"{"ok":true}"#,
+        )?;
+        same(&format!("{:?}", daemon.0.wait()?.code()), "Some(0)")
     }
 
     /// `serve` refuses a socket path over 103 bytes and a `run/` others can reach; a panic (the
