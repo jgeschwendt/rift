@@ -14,6 +14,7 @@ use std::env;
 use std::fmt::Write as _;
 use std::fs::{self, DirBuilder, OpenOptions, Permissions, TryLockError};
 use std::io::{self, BufRead as _, BufReader, Read as _, Write as _};
+use std::iter;
 use std::net::Shutdown;
 use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -54,8 +55,8 @@ enum Next {
     Close,
     /// Become a device: its replies and notices leave through this queue, by a writer of its own.
     Device(Receiver<String>),
-    /// Become a feed: the replay, then every live event until the daemon drops it.
-    Feed(Vec<String>, Receiver<String>),
+    /// Become a feed: the lines it starts with, then every live one until the daemon drops it.
+    Feed(Box<dyn Iterator<Item = String> + Send>, Receiver<String>),
     /// Read the next request.
     Go,
     /// The hello was accepted: read requests.
@@ -94,7 +95,7 @@ struct Live {
     since: String,
     /// The socket, which the shutdown request connects to so `accept` wakes.
     sock: PathBuf,
-    /// `ready`, `degraded` (the last append failed) or `stopping`.
+    /// `ready`, `degraded` (the last write to the log or a segment failed) or `stopping`.
     state: &'static str,
     /// Every track of this boot, by name.
     tracks: BTreeMap<String, Track>,
@@ -146,12 +147,7 @@ impl Live {
             json!({"boot": self.boot, "e": event, "seq": seq, "t": utc(SystemTime::now())});
         let line = format!("{logged}\n");
         let appended = append(&self.root.join("events.ndjson"), line.as_bytes());
-        self.state = if appended.is_ok() {
-            "ready"
-        } else {
-            "degraded"
-        };
-        appended?;
+        self.mark(appended)?;
         self.seq = seq;
         self.fan("", &line);
         Ok(logged)
@@ -199,6 +195,13 @@ impl Live {
     /// The hello reply.
     fn hello(&self) -> Value {
         json!({"boot": self.boot, "ok": true, "pid": id(), "proto": PROTO, "since": self.since, "state": self.state, "version": VERSION})
+    }
+
+    /// `wrote`, a write to the log or a segment, as it came; the state `ready` once one
+    /// succeeds, `degraded` while the last failed.
+    const fn mark<T>(&mut self, wrote: io::Result<T>) -> io::Result<T> {
+        self.state = if wrote.is_ok() { "ready" } else { "degraded" };
+        wrote
     }
 
     /// Moves every closed segment that ended more than the window ago out of `audio/`: into the
@@ -765,10 +768,11 @@ fn main() -> ExitCode {
                     let (mut reader, mut writer, mut greeted) =
                         (BufReader::new(read), stream, false);
                     // a device's track, its clock and the daemon's at one instant (by its last
-                    // pong; until one, the same), its last ping, and the queue its writer drains
+                    // pong; until one, no frame is placed), its last ping, and the queue its
+                    // writer drains
                     let (mut device, mut clock, mut pinged, mut queue) = (
                         None::<String>,
-                        (0, 0),
+                        None::<(u64, u64)>,
                         Instant::now(),
                         None::<SyncSender<String>>,
                     );
@@ -786,19 +790,23 @@ fn main() -> ExitCode {
                         let id_ok = request["id"].is_null()
                             || request["id"].is_string()
                             || request["id"].is_number();
-                        let (track, named) = (
-                            request["track"].as_str().unwrap_or_default(),
-                            request["kind"]
-                                .as_str()
-                                .filter(|&kind| matches!(kind, "ear" | "mouth"))
-                                .zip(request["name"].as_str().filter(|name| {
-                                    (1..=64).contains(&name.len())
-                                        && name.bytes().all(|byte| {
-                                            byte.is_ascii_alphanumeric() || b"-_".contains(&byte)
-                                        })
-                                }))
-                                .map(|(kind, name)| format!("{kind}-{name}")),
-                        );
+                        // a track is `<kind>-<name>`
+                        let well = |kind: &str, name: &str| {
+                            matches!(kind, "ear" | "mouth")
+                                && (1..=64).contains(&name.len())
+                                && name.bytes().all(|byte| {
+                                    byte.is_ascii_alphanumeric() || b"-_".contains(&byte)
+                                })
+                        };
+                        let track = request["track"].as_str().unwrap_or_default();
+                        let tracked = track
+                            .split_once('-')
+                            .is_some_and(|(kind, name)| well(kind, name));
+                        let named = request["kind"]
+                            .as_str()
+                            .zip(request["name"].as_str())
+                            .filter(|&(kind, name)| well(kind, name))
+                            .map(|(kind, name)| format!("{kind}-{name}"));
                         let pcm = request["pcm"]
                             .as_str()
                             .filter(|text| text.len() == FRAME * 2)
@@ -890,17 +898,18 @@ fn main() -> ExitCode {
                                 (toggled, Next::Go)
                             }
                             (true, Some("frame")) if device.is_some() && request["t"].is_u64() => {
-                                match pcm {
-                                    None => (Ok(error("bad_frame")), Next::Go),
-                                    Some(_) if !guard.ears => (Ok(error("closed")), Next::Go),
-                                    Some(bytes) => {
+                                match (pcm, clock) {
+                                    (None, _) => (Ok(error("bad_frame")), Next::Go),
+                                    (_, None) => (Ok(error("unsynced")), Next::Go),
+                                    _ if !guard.ears => (Ok(error("closed")), Next::Go),
+                                    (Some(bytes), Some((theirs, ours))) => {
                                         let (name, state) =
                                             (device.clone().unwrap_or_default(), &mut *guard);
                                         let at = request["t"]
                                             .as_u64()
                                             .unwrap_or_default()
-                                            .saturating_add(clock.1)
-                                            .saturating_sub(clock.0);
+                                            .saturating_add(ours)
+                                            .saturating_sub(theirs);
                                         let placed = (|| {
                                             let start = match state
                                                 .tracks
@@ -918,20 +927,27 @@ fn main() -> ExitCode {
                                                 }
                                                 Some(last) => last,
                                             };
-                                            let held =
-                                                state.tracks.entry(name.clone()).or_default();
-                                            let (num, first, written) =
-                                                held.open.unwrap_or_else(|| {
-                                                    held.next = held.next.saturating_add(1);
-                                                    (held.next.saturating_sub(1), start, 0)
+                                            // the open segment, else the next, which counts only once written
+                                            let known = state.tracks.get(&name);
+                                            let (num, first, written) = known
+                                                .and_then(|held| held.open)
+                                                .unwrap_or_else(|| {
+                                                    (known.map_or(0, |held| held.next), start, 0)
                                                 });
                                             let dir = state
                                                 .root
                                                 .join(format!("audio/{}/{name}", state.boot));
-                                            fs::create_dir_all(&dir)?;
-                                            append(&dir.join(format!("{num}.pcm")), &bytes)?;
-                                            let full = written.saturating_add(320);
-                                            (held.open, held.end) = (
+                                            state.mark(fs::create_dir_all(&dir).and_then(
+                                                |()| {
+                                                    append(&dir.join(format!("{num}.pcm")), &bytes)
+                                                },
+                                            ))?;
+                                            let (held, full) = (
+                                                state.tracks.entry(name.clone()).or_default(),
+                                                written.saturating_add(320),
+                                            );
+                                            (held.next, held.open, held.end) = (
+                                                num.saturating_add(1),
                                                 Some((num, first, full)),
                                                 Some(start.saturating_add(20_000)),
                                             );
@@ -976,10 +992,13 @@ fn main() -> ExitCode {
                                     });
                                 (kept, Next::Go)
                             }
-                            (true, Some("listen")) if request["track"].is_string() => {
+                            (true, Some("listen")) if tracked => {
                                 let (sender, incoming) = mpsc::sync_channel(BEHIND);
                                 guard.feeds.push((sender, key, track.to_owned()));
-                                (Ok(json!({"ok": true})), Next::Feed(Vec::new(), incoming))
+                                (
+                                    Ok(json!({"ok": true})),
+                                    Next::Feed(Box::new(iter::empty()), incoming),
+                                )
                             }
                             // a pong is answered by nothing
                             (true, Some("pong"))
@@ -987,14 +1006,14 @@ fn main() -> ExitCode {
                                     && request["ping"].is_u64()
                                     && request["t"].is_u64() =>
                             {
-                                clock = (
+                                clock = Some((
                                     request["t"].as_u64().unwrap_or_default(),
                                     request["ping"].as_u64().unwrap_or_default().midpoint(now()),
-                                );
+                                ));
                                 (Ok(Value::Null), Next::Go)
                             }
                             (true, Some("read"))
-                                if request["track"].is_string()
+                                if tracked
                                     && matches!(
                                         (request["from"].as_u64(), request["to"].as_u64()),
                                         (Some(from), Some(to)) if from < to
@@ -1008,7 +1027,8 @@ fn main() -> ExitCode {
                                 {
                                     (Ok(error("gone")), Next::Go)
                                 } else {
-                                    // silence wherever nothing is held, the segments laid on the sample grid
+                                    // on the sample grid: the range, and each segment of the track
+                                    // inside it by its start, samples and file, last first
                                     let (first, last) = (
                                         samples(from),
                                         samples(
@@ -1018,56 +1038,82 @@ fn main() -> ExitCode {
                                                 .min(clock_now),
                                         ),
                                     );
-                                    let mut sound = vec![
-                                        0u8;
-                                        usize::try_from(
-                                            last.saturating_sub(first).saturating_mul(2)
-                                        )
-                                        .unwrap_or_default()
-                                    ];
-                                    let open = guard.tracks.get(track).and_then(|held| held.open).map(|(num, start, _)| {
-                                        json!({"path": format!("audio/{}/{track}/{num}.pcm", guard.boot), "start": start, "track": track})
+                                    let open = guard.tracks.get(track).and_then(|held| held.open).map(|(num, start, written)| {
+                                        json!({"path": format!("audio/{}/{track}/{num}.pcm", guard.boot), "samples": written, "start": start, "track": track})
                                     });
-                                    for held in guard
+                                    let mut spans: Vec<(u64, PathBuf)> = guard
                                         .held
                                         .iter()
                                         .map(|event| &event["e"])
                                         .chain(open.as_ref())
                                         .filter(|held| held["track"] == track)
-                                    {
-                                        let bytes = fs::read(
-                                            guard
-                                                .root
-                                                .join(held["path"].as_str().unwrap_or_default()),
-                                        )
-                                        .unwrap_or_default();
-                                        for (sample, pair) in
-                                            (samples(held["start"].as_u64().unwrap_or_default())..)
-                                                .zip(bytes.chunks_exact(2))
-                                        {
-                                            if let Some(slot) = sample
-                                                .checked_sub(first)
-                                                .and_then(|index| {
-                                                    usize::try_from(index.saturating_mul(2)).ok()
-                                                })
-                                                .and_then(|index| {
-                                                    sound.get_mut(index..index.saturating_add(2))
-                                                })
-                                            {
-                                                slot.copy_from_slice(pair);
-                                            }
-                                        }
-                                    }
-                                    let lines = sound
-                                        .chunks(FRAME)
-                                        .zip((from..).step_by(20_000))
-                                        .map(|(frame, at)| {
-                                            format!("{}\n", json!({"pcm": hex(frame), "t": at}))
+                                        .map(|held| {
+                                            (
+                                                samples(held["start"].as_u64().unwrap_or_default()),
+                                                samples(end(held)),
+                                                guard.root.join(
+                                                    held["path"].as_str().unwrap_or_default(),
+                                                ),
+                                            )
                                         })
+                                        .filter(|span| span.0 < last && span.1 > first)
+                                        .map(|(start, _, path)| (start, path))
                                         .collect();
+                                    spans.sort();
+                                    spans.reverse();
+                                    // a frame at a time, silence wherever nothing is held, each
+                                    // segment read once as the range reaches it and let go as it
+                                    // passes: memory is a segment or two, whatever the range
+                                    let mut loaded: Vec<(u64, u64, Vec<u8>)> = Vec::new();
+                                    let bytes = |count: u64| {
+                                        usize::try_from(count.saturating_mul(2)).unwrap_or_default()
+                                    };
+                                    let frames = (first..last)
+                                        .step_by(320)
+                                        .zip((from..).step_by(20_000))
+                                        .map(move |(at, micros)| {
+                                            let stop = at.saturating_add(320).min(last);
+                                            while let Some((start, path)) =
+                                                spans.pop_if(|span| span.0 < stop)
+                                            {
+                                                let sound = fs::read(path).unwrap_or_default();
+                                                let count =
+                                                    u64::try_from(sound.chunks_exact(2).len())
+                                                        .unwrap_or_default();
+                                                loaded.push((
+                                                    start,
+                                                    start.saturating_add(count),
+                                                    sound,
+                                                ));
+                                            }
+                                            loaded.retain(|held| held.1 > at);
+                                            let mut frame =
+                                                vec![0u8; bytes(stop.saturating_sub(at))];
+                                            for held_span in &loaded {
+                                                let (start, finish, sound) =
+                                                    (held_span.0, held_span.1, &held_span.2);
+                                                let (low, high) = (at.max(start), stop.min(finish));
+                                                if let (Some(into), Some(held)) = (
+                                                    frame.get_mut(
+                                                        bytes(low.saturating_sub(at))
+                                                            ..bytes(high.saturating_sub(at)),
+                                                    ),
+                                                    sound.get(
+                                                        bytes(low.saturating_sub(start))
+                                                            ..bytes(high.saturating_sub(start)),
+                                                    ),
+                                                ) {
+                                                    into.copy_from_slice(held);
+                                                }
+                                            }
+                                            format!(
+                                                "{}\n",
+                                                json!({"pcm": hex(&frame), "t": micros})
+                                            )
+                                        });
                                     // the range, then the end of stream
                                     let (_, ended) = mpsc::sync_channel(0);
-                                    (Ok(json!({"ok": true})), Next::Feed(lines, ended))
+                                    (Ok(json!({"ok": true})), Next::Feed(Box::new(frames), ended))
                                 }
                             }
                             (true, Some("feed"))
@@ -1085,20 +1131,21 @@ fn main() -> ExitCode {
                                 });
                                 let boot = guard.boot;
                                 let backlog = held_events
-                                    .iter()
+                                    .into_iter()
                                     .enumerate()
-                                    .filter(|&(at, event)| {
-                                        found.map_or(event["boot"] == boot, |start| at > start)
+                                    .filter(move |entry| {
+                                        found.map_or(entry.1["boot"] == boot, |start| {
+                                            entry.0 > start
+                                        })
                                     })
-                                    .map(|(_, event)| format!("{event}\n"))
-                                    .collect();
+                                    .map(|(_, event)| format!("{event}\n"));
                                 let (sender, incoming) = mpsc::sync_channel(BEHIND);
                                 guard.feeds.push((sender, key, String::new()));
                                 (
                                     Ok(
                                         json!({"ok": true, "reset": found.is_none() && !after.is_null()}),
                                     ),
-                                    Next::Feed(backlog, incoming),
+                                    Next::Feed(Box::new(backlog), incoming),
                                 )
                             }
                             (true, Some("shutdown")) => (Ok(json!({"ok": true})), Next::Stop),

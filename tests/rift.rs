@@ -896,6 +896,7 @@ mod tests {
             (r#"{"op":"frame","pcm":"00","t":1}"#, "bad_request"),
             (r#"{"op":"pong","ping":1,"t":1}"#, "bad_request"),
             (r#"{"op":"listen"}"#, "bad_request"),
+            (r#"{"op":"listen","track":"ears"}"#, "bad_request"),
             (
                 r#"{"from":2,"op":"read","to":1,"track":"ear-a"}"#,
                 "bad_request",
@@ -943,6 +944,14 @@ mod tests {
             hi["ping"].as_u64().unwrap_or_default() + 3_600_000_000 - 2_000_000 + index * 20_000
         };
         same(&frame(&mut ear, ear_at(0), 0)?.to_string(), &code("closed"))?;
+        // a frame before its device's first pong has no place on the timeline
+        let mut early = greet(&root)?;
+        drop(say(
+            &mut early,
+            r#"{"kind":"ear","name":"early","op":"device"}"#,
+        )?);
+        same(&frame(&mut early, 1, 0)?.to_string(), &code("unsynced"))?;
+        drop(early);
         same(
             &rift(&root, &[], &["ears", "on"])?,
             "0\n{\"changed\":true,\"ok\":true,\"seq\":2}\n",
@@ -1067,6 +1076,29 @@ mod tests {
                 })
             ),
         )?;
+        // half a frame in: every frame straddles two of the device's, one across two segments
+        let mut halfway = greet(&root)?;
+        same(
+            &say(
+                &mut halfway,
+                &json!({"from": first + 10_000, "op": "read", "to": first + 110_000, "track": "ear-a"})
+                    .to_string(),
+            )?,
+            r#"{"ok":true}"#,
+        )?;
+        same(
+            &drain(&mut halfway)?
+                .iter()
+                .map(|line| line["pcm"].as_str().unwrap_or_default())
+                .collect::<String>(),
+            &fills(&[0, 1, 2, 3, 4, 5, 6, 7])
+                .get(320..3520)
+                .ok_or("short")?
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<Vec<_>>()
+                .concat(),
+        )?;
         // a segment that cannot be written: the track begins, the frame is refused
         fs::write(format!("{root}/audio/1/ear-z"), "")?;
         let (mut broken, broken_hi) =
@@ -1080,6 +1112,12 @@ mod tests {
             .to_string(),
             &code("io"),
         )?;
+        let state = || -> Result<String, Box<dyn Error>> {
+            let health: Value =
+                serde_json::from_str(rift(&root, &[], &["status"])?.trim_start_matches("0\n"))?;
+            Ok(health["state"].to_string())
+        };
+        same(&state()?, r#""degraded""#)?;
         drop(take(&mut feed, 1)?);
         // closing the ears closes the open segment, and its device is told
         let (mut open, open_hi) = device(&root, r#"{"kind":"ear","name":"c","op":"device"}"#, 0)?;
@@ -1087,6 +1125,7 @@ mod tests {
         for index in 0..2 {
             drop(frame(&mut open, open_at + index * 20_000, 3)?);
         }
+        same(&state()?, r#""ready""#)?;
         // an open segment reads back too
         let open_first = take(&mut feed, 1)?[0]["start"].as_u64().unwrap_or_default();
         same(
