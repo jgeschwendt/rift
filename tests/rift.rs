@@ -2498,8 +2498,10 @@ esac
     /// event naming its microphone; the default changed, the segment closes and a hole opens the
     /// next microphone's; ears off closes the microphone. A second device pinned to an absent
     /// input says so and waits, records it once it appears and stops when it goes. A torn segment
-    /// keeps its microphone; a frame whose `mic` is not a string is refused; an open that never
-    /// returns, a refused open and exact zeros each exit 1 naming the grant.
+    /// keeps its microphone; a frame whose `mic` is not a string is refused. Pongs leave on the
+    /// reader's thread, so listings slower than a ping leave no hole. An open waited on, a refused
+    /// open and exact zeros are each said once and the device kept: the waited open returns when
+    /// granted, the others are retried, a poll doubled per failure, until heard.
     #[cfg(target_os = "macos")]
     #[test]
     fn mic() -> Outcome {
@@ -2509,8 +2511,17 @@ esac
         fs::write(format!("{fake}/inputs/Desk Mic"), "48000 2 0.25 0.5")?;
         fs::write(format!("{fake}/inputs/Hall Mic"), "44100 1 -0.5 0")?;
         fs::write(format!("{fake}/default"), "Desk Mic\n")?;
-        let envs = [("RIFT_MIC", fake.as_str()), ("RIFT_POLL_MS", "100")];
-        let (daemon, _) = serve(&root, &[("RIFT_SEGMENT_MS", "200")])?;
+        fs::write(format!("{fake}/slow"), "50")?;
+        let envs = [
+            ("RIFT_MIC", fake.as_str()),
+            ("RIFT_OPEN_MS", "100"),
+            ("RIFT_POLL_MS", "100"),
+            ("RIFT_ZERO_MS", "200"),
+        ];
+        let (daemon, _) = serve(
+            &root,
+            &[("RIFT_PING_MS", "300"), ("RIFT_SEGMENT_MS", "200")],
+        )?;
         let spawn = |args: &[&str]| -> io::Result<Daemon> {
             Ok(Daemon(
                 Command::new(env!("CARGO_BIN_EXE_rift"))
@@ -2560,6 +2571,24 @@ esac
             "true",
         )?;
         drop(heard);
+        // a second of it, three pings past the reply's: no hole
+        until(|| {
+            Ok(stream("ear-desk").is_ok_and(|held| {
+                held.iter()
+                    .filter(|event| event["kind"] == "segment")
+                    .count()
+                    >= 5
+            }))
+        })?;
+        let opening = stream("ear-desk")?;
+        same(
+            &format!(
+                "{} {}",
+                opening.iter().any(|event| event["kind"] == "hole"),
+                opening[1]["samples"]
+            ),
+            "false 3200",
+        )?;
         // a second device pinned to an input not yet there
         let mut spare = spawn(&["device", "ear", "spare", "--mic", "Spare Mic"])?;
         let mut said = String::new();
@@ -2607,7 +2636,7 @@ esac
         opened.sort_unstable();
         same(
             &opened.join("\n"),
-            "close Desk Mic\nclose Hall Mic\nclose Spare Mic\nopen Desk Mic\nopen Hall Mic\nopen Spare Mic",
+            "ask Desk Mic\nask Hall Mic\nask Spare Mic\nclose Desk Mic\nclose Hall Mic\nclose Spare Mic\nopen Desk Mic\nopen Hall Mic\nopen Spare Mic",
         )?;
         // the ears on again, a segment torn by a kill keeps its microphone
         drop(rift(&root, &[], &["ears", "on"])?);
@@ -2624,12 +2653,10 @@ esac
         let (mut out, mut ended) = (String::new(), desk.0.wait()?.code());
         let _: usize =
             io::Read::read_to_string(&mut desk.0.stdout.take().ok_or("stdout")?, &mut out)?;
+        // a frame in flight as the ears close is refused `closed`, as the protocol has it
+        let printed = out.lines().skip(1).filter(|line| *line != code("closed"));
         same(
-            &format!(
-                "{:?} {}",
-                ended,
-                out.lines().skip(1).collect::<Vec<_>>().join(" ")
-            ),
+            &format!("{:?} {}", ended, printed.collect::<Vec<_>>().join(" ")),
             &format!(
                 "Some(1) {{\"ears\":true}} {{\"ears\":false}} {{\"ears\":true}} {}",
                 code("unknown")
@@ -2651,40 +2678,63 @@ esac
         let line = json!({"mic": 5u8, "op": "frame", "pcm": "00".repeat(640), "t": 1u8});
         same(&say(&mut raw, &line.to_string())?, &code("bad_frame"))?;
         drop(raw);
-        // each failure: one stderr line naming the grant, exit 1
+        // each failure one stderr line naming it, the device kept: an open waited on past
+        // `$RIFT_OPEN_MS`, a refused one and exact zeros retried a poll doubled per failure
         let grant = "allow rift in System Settings \u{203a} Privacy & Security \u{203a} Microphone";
         fs::write(format!("{fake}/inputs/Stuck"), "block")?;
         fs::write(format!("{fake}/inputs/Broken"), "fail")?;
         fs::write(format!("{fake}/inputs/Silent"), "48000 1 0 0")?;
-        for (name, knob, ending) in [
-            (
-                "Stuck",
-                ("RIFT_OPEN_MS", "100"),
-                format!(" did not open within 100 ms: the microphone is not granted; {grant}"),
-            ),
-            ("Broken", ("RIFT_OPEN_MS", "100"), ": refused".to_owned()),
+        let (begun, mut failing) = (Instant::now(), Vec::new());
+        for (name, ending) in [
+            ("Broken", ": refused".to_owned()),
             (
                 "Silent",
-                ("RIFT_ZERO_MS", "200"),
                 format!(
-                    " gave only exact zeros for 200 ms after it opened: the microphone is not granted, or is muted; {grant}"
+                    " gave no signal (nothing, or only exact zeros) after it opened: the microphone is not granted, or is muted; {grant}"
                 ),
             ),
+            (
+                "Stuck",
+                format!(" has not opened in 100 ms: the microphone is not granted yet; {grant}"),
+            ),
         ] {
-            let ran = rift(
-                &root,
-                &[envs[0], knob],
-                &["device", "ear", "bad", "--mic", name],
-            )?;
-            same(
-                &format!(
-                    "{} {}",
-                    ran.lines().next().unwrap_or_default(),
-                    ran.lines().last().unwrap_or_default()
-                ),
-                &format!("1 rift device: \"{name}\"{ending}"),
-            )?;
+            let mut failed = spawn(&["device", "ear", &name.to_lowercase(), "--mic", name])?;
+            let (mut errs, mut first) = (
+                BufReader::new(failed.0.stderr.take().ok_or("stderr")?),
+                String::new(),
+            );
+            let _: usize = errs.read_line(&mut first)?;
+            same(&first, &format!("rift device: \"{name}\"{ending}\n"))?;
+            failing.push((failed, errs));
         }
+        until(|| {
+            Ok(log().matches("ask Broken").count() >= 3
+                && log().matches("close Silent").count() >= 2)
+        })?;
+        // the third refusal waited a poll, then two: never sooner
+        same(
+            &format!(
+                "{} {} {}",
+                begun.elapsed() >= Duration::from_millis(300),
+                stream("ear-silent")?.len(),
+                stream("ear-stuck")?.len()
+            ),
+            "true 0 0",
+        )?;
+        // the ears off and on while the open waits: asked again, said once
+        drop(rift(&root, &[], &["ears", "off"])?);
+        drop(rift(&root, &[], &["ears", "on"])?);
+        until(|| Ok(log().matches("ask Stuck").count() == 2))?;
+        // the grant given, that open returns; the input heard, recording starts
+        fs::write(format!("{fake}/inputs/Stuck"), "16000 1 0.5 0")?;
+        fs::write(format!("{fake}/inputs/Silent"), "48000 1 0.5 0")?;
+        until(|| {
+            Ok(["ear-silent", "ear-stuck"].iter().all(|track| {
+                stream(track)
+                    .is_ok_and(|seen| seen.first().is_some_and(|event| event["kind"] == "track"))
+            }))
+        })?;
+        same(&log().matches("ask Stuck").count().to_string(), "2")?;
         // following the default while there is none: it says so and waits
         fs::remove_file(format!("{fake}/default"))?;
         let mut lost = spawn(&["device", "ear", "lost", "--mic"])?;
@@ -2699,10 +2749,17 @@ esac
             &say(&mut greet(&root)?, r#"{"op":"shutdown"}"#)?,
             r#"{"ok":true}"#,
         )?;
-        // the waiting device ends with the daemon, so its run counts toward coverage
+        // the waiting devices end with the daemon, so their runs count toward coverage; nothing
+        // said twice
+        let mut codes = vec![again.0.wait()?.code(), lost.0.wait()?.code()];
+        for (mut failed, mut errs) in failing {
+            let mut rest = String::new();
+            let _: usize = io::Read::read_to_string(&mut errs, &mut rest)?;
+            codes.push(failed.0.wait()?.code().filter(|_| rest.is_empty()));
+        }
         same(
-            &format!("{:?} {:?}", again.0.wait()?.code(), lost.0.wait()?.code()),
-            "Some(0) Some(1)",
+            &format!("{codes:?}"),
+            "[Some(0), Some(1), Some(1), Some(1), Some(1)]",
         )
     }
 }

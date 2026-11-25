@@ -215,7 +215,7 @@
   </header>
   <ul class="stack">
     <li><strong>Which input.</strong> Alone, <code class="code">--mic</code> follows the system's
-      default input, asked every <code class="code">$RIFT_POLL_MS</code>; a change closes the
+      default input, listed every <code class="code">$RIFT_POLL_MS</code>; a change closes the
       microphone and opens the new default. With a name it holds that input, matched exactly, and
       never follows the default. An input not present (the named one, or no default at all) is one
       stderr line listing the inputs present, then a wait: it opens when the input appears, and
@@ -231,13 +231,20 @@
     <li><strong>Conversion.</strong> Channel 0 of whatever the input delivers (a sum of channels
       would cancel or clip), through a Hann-windowed sinc low-pass under 7 kHz, a millisecond each
       side, then read at 16 kHz between the filtered samples; 16-bit, 20 ms frames, stamped as a
-      file-fed device stamps them.</li>
-    <li><strong>A withheld grant is said, never silent.</strong> Under launchd an ungranted
-      microphone either blocks the open or delivers exact zeros with no error. An open past
-      <code class="code">$RIFT_OPEN_MS</code> (10 s) and exact zeros for
-      <code class="code">$RIFT_ZERO_MS</code> (2 s) after an open each exit 1 with one line naming
-      System Settings › Privacy &amp; Security › Microphone. An input that fails to open is
-      <code class="code">rift device: "&lt;microphone&gt;": &lt;cause&gt;</code>, exit 1.</li>
+      file-fed device stamps them, from its first sample other than exact zero. Pings are answered
+      as they arrive, on the thread that reads them: a pong held up by an open or a listing would
+      place frames early by half its delay, and leave that much hole at the next ping.</li>
+    <li><strong>A withheld grant is said, never fatal.</strong> Under launchd an ungranted
+      microphone either blocks the open while macOS's prompt waits or delivers exact zeros with no
+      error. An open past <code class="code">$RIFT_OPEN_MS</code> (10 s) is named and waited on:
+      Allow returns it and recording starts. Exact zeros for <code class="code">$RIFT_ZERO_MS</code>
+      (2 s) after an open, an input silent a poll long and a refused open
+      (<code class="code">rift device: "&lt;microphone&gt;": &lt;cause&gt;</code>) close it; the next
+      open waits <code class="code">$RIFT_POLL_MS</code> (1 s), doubled per failure in a row to 64 s.
+      Zeros are never sent, so an unheard input is a hole, not silence on disk. Each line, naming
+      System Settings › Privacy &amp; Security › Microphone where the grant is the cause, is said once
+      until the input is heard; the ears close and open throughout, and the device exits only with
+      its connection.</li>
   </ul>
 </section>
 
@@ -377,14 +384,14 @@
         <tr><td class="table-mono">RIFT_DRAIN_MS</td><td>the drain's budget for open connections before they are cut, default 1000 (launchd's <code class="code">ExitTimeOut</code> is 3 s)</td></tr>
         <tr><td class="table-mono">RIFT_LOG_CAP</td><td>the size at which <code class="code">serve.log</code> and <code class="code">serve.err</code> each rotate to <code class="code">.1</code>, default 1 MiB</td></tr>
         <tr><td class="table-mono">RIFT_MIC</td><td>the suite's fake microphones in place of the system's: a directory, its format in <code class="code">src/ear.rs</code></td></tr>
-        <tr><td class="table-mono">RIFT_OPEN_MS</td><td>how long a microphone's open may take before <code class="code">--mic</code> exits naming the grant, default 10000</td></tr>
+        <tr><td class="table-mono">RIFT_OPEN_MS</td><td>how long a microphone's open may wait before <code class="code">--mic</code> names the grant, waiting on, default 10000</td></tr>
         <tr><td class="table-mono">RIFT_PING_MS</td><td>how long after a device's last ping a frame's reply carries the next, default 10000</td></tr>
-        <tr><td class="table-mono">RIFT_POLL_MS</td><td>how often <code class="code">--mic</code> asks for the inputs, and how long one may fall silent before it closes, default 1000</td></tr>
+        <tr><td class="table-mono">RIFT_POLL_MS</td><td>how often <code class="code">--mic</code> lists the inputs, how long one may fall silent before it closes, and the wait after a failed open, doubled per failure in a row to 64 times, default 1000</td></tr>
         <tr><td class="table-mono">RIFT_READY_MS</td><td><code class="code">setup</code>'s wait for the loaded daemon to answer health ready, default 30000</td></tr>
         <tr><td class="table-mono">RIFT_ROOT</td><td>the state root, default <code class="code">~/.local/state/rift</code>; the socket path under it must fit 103 bytes</td></tr>
         <tr><td class="table-mono">RIFT_SEGMENT_MS</td><td>a segment's length, in whole 20 ms frames, at least one, default 10000</td></tr>
         <tr><td class="table-mono">RIFT_SIGN_MS</td><td>how long <code class="code">setup</code> lets each <code class="code">security</code>, <code class="code">openssl</code> and <code class="code">codesign</code> call run before killing it, default 30000</td></tr>
-        <tr><td class="table-mono">RIFT_ZERO_MS</td><td>how long a microphone may give only exact zeros after its open before <code class="code">--mic</code> exits naming the grant, default 2000</td></tr>
+        <tr><td class="table-mono">RIFT_ZERO_MS</td><td>how long a microphone may give only exact zeros after its open before <code class="code">--mic</code> closes it as a failed open, naming the grant, default 2000</td></tr>
       </tbody>
     </table>
   </div>
@@ -414,7 +421,7 @@ mise run dist                           # a checkout: this host's release archiv
         <tr><td class="table-mono">rift listen &lt;track&gt;</td><td>prints each frame placed on the track, live</td></tr>
         <tr><td class="table-mono">rift read &lt;track&gt; &lt;from us&gt; &lt;to us&gt;</td><td>prints the range's frames, silence where nothing is held</td></tr>
         <tr><td class="table-mono">rift device ear|mouth &lt;name&gt; &lt;file.pcm&gt; [--fast]</td><td>a device, its own process: plays a raw PCM file (16 kHz, mono, 16-bit little-endian) as the track's frames, a short tail dropped, answering every ping, paced in real time and stamped from now, a pause or clock step of over 100 ms playing on from the clock as a hole, or with <code class="code">--fast</code> sent as fast as each is answered and stamped as if captured ending now; prints its reply, then each notice and refusal; exit 0 once every frame is answered, <code class="code">{"code":"unknown","ok":false}</code> and exit 1 if the connection ends first; an unreadable file is <code class="code">rift device: &lt;cause&gt;</code>, exit 1</td></tr>
-        <tr><td class="table-mono">rift device ear &lt;name&gt; --mic [&lt;microphone&gt;]</td><td>a device, its own process, macOS only: hears the default input, or the one named, while the ears are open (<a href="#microphone">the microphone</a>); prints its reply, then each notice and refusal; <code class="code">{"code":"unknown","ok":false}</code> and exit 1 when the connection ends, one stderr line and exit 1 for a withheld grant or a failed open; on Linux exit 2</td></tr>
+        <tr><td class="table-mono">rift device ear &lt;name&gt; --mic [&lt;microphone&gt;]</td><td>a device, its own process, macOS only: hears the default input, or the one named, while the ears are open (<a href="#microphone">the microphone</a>); prints its reply, then each notice and refusal; <code class="code">{"code":"unknown","ok":false}</code> and exit 1 when the connection ends, its only exit; a withheld grant or a failed open is one stderr line, and it keeps trying; on Linux exit 2</td></tr>
         <tr><td class="table-mono">rift setup [--print | --remove]</td><td>brings the release into hotswap's layout and links <code class="code">~/.local/bin/rift</code> (with none installed, the latest, through packslip), signs the release with <a href="#identity">rift's identity</a>, then writes and loads the agent on that link, or swaps it with one <code class="code">kickstart -k</code>, then waits for the new daemon to answer health ready; <code class="code">--print</code> prints the plist, <code class="code">--remove</code> has hotswap forget the layout and the upgrade agent, unloads the agent and removes the plist, the link, the keychain and its password</td></tr>
         <tr><td class="table-mono">rift upgrade [--check | --back | --retry]</td><td>hotswap's swap onto a newer release: installed beside the running one, <code class="code">current</code> moved, <code class="code">rift setup</code>, then the smoke (<code class="code">rift version</code>, <code class="code">rift status</code> until the daemon answers with it); a failure rolls back. Exit 0 green or settled, 1 red, 2 unable to try</td></tr>
         <tr><td class="table-mono">rift version</td><td>the build, as the hello reports it</td></tr>

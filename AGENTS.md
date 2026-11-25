@@ -55,10 +55,12 @@ the stream ends), exit 0 on `"ok":true`; `down` and `unknown` exit 1. A daemon o
 one stderr line naming both and the fix (`rift setup`), exit 1; another version, the same line
 beside the reply. `rift device`, as `docs/index.html#cli` has it, answers the reply's ping before its
 first frame, so the daemon never refuses it `unsynced`. With `--mic` (`src/ear.rs`) one channel
-carries everything the device hears: the reader thread's lines (the reply pushed first) and each
-open's buffers, tagged with the open's number so a closed open's last buffers are dropped; the
-inputs are polled between messages. The stream (`hold`) is built, held and dropped on a thread of
-its own, closed by dropping its stop sender.
+carries everything the device hears, and the loop that drains it never calls the system: the
+reader thread's lines (the reply first), each ping answered there under the writer's mutex before
+the line is passed on; the inputs, listed on a thread every poll; each open's outcome and buffers,
+tagged with the open's number so a closed open's are dropped. The stream (`hold`) is built, held
+and dropped on a thread of its own, closed by dropping its stop sender; an open abandoned while it
+waits closes as soon as it returns.
 
 ### `rift setup`
 
@@ -103,10 +105,12 @@ anything is written), `gui/<id -u>` the domain, each call that changes something
    unlock first and the deadline; the linker's ad-hoc signature leaves `Info.plist=not bound`, the
    re-sign binds it (`Info.plist entries=3`). On a Mac (observed 2026-11-25): a signed copy run
    as `device ear <name> --mic` under launchd is asked once, and while the prompt waits the open
-   blocks, so the device exits on `$RIFT_OPEN_MS` and a restart after Allow records; a rebuild
-   under another version, signed by the same identity, records with no prompt; `ears off` stops
-   the segments. Each open leaves one hole of about 25 ms after its first segment, cause not
-   found;
+   blocks, and the device waits on it; a rebuild under another version, signed by the same
+   identity, records with no prompt; `ears off` stops the segments. Each run left one hole of
+   about 25 ms ending its first segment early (158400 samples): the reply's pong waited on two
+   input listings (about 50 ms), and the next ping, 10 s on, moved placement by half that. The
+   suite reproduces it with slow fake listings; pongs leave on the reader thread (unverified
+   2026-11-25 · the fix not yet run on the Mac);
 5. the plist by temp + rename (`wrote <path>`);
 6. the same plist already loaded: `kickstart -k`, the swap; else booted out when loaded, then
    `bootstrap`;

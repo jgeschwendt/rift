@@ -263,8 +263,9 @@
       <code class="code">$RIFT_PING_MS</code> (<a href="index.html#environment">default</a> 10 s) has
       passed since the last. The daemon takes the midpoint between sending a ping and reading its pong
       as the instant the device's clock read the pong's <code class="code">t</code>, and places each
-      later frame by that offset, never later than the frame is read. A device stamps its frames on
-      the clock its pongs read. A frame before the first pong is refused
+      later frame by that offset, never later than the frame is read, so a device answers a ping
+      as it arrives: a pong late by <em>d</em> places its frames <em>d</em>/2 early until the next.
+      A device stamps its frames on the clock its pongs read. A frame before the first pong is refused
       <code class="code">unsynced</code>. Pings ride frame replies, so an idle device is not
       re-measured until it sends again.</li>
     <li>A track's first frame in a boot starts it (<code class="code">track</code>). A frame half a

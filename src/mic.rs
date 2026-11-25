@@ -27,11 +27,11 @@ impl Source for Mic {
         };
         match opened() {
             Ok((stream, rate, channels)) => {
-                drop(ready.send(Ok((rate, channels))));
+                ready(Ok((rate, channels)));
                 stop.recv().unwrap_or_default();
                 drop(stream);
             }
-            Err(cause) => drop(ready.send(Err(cause.to_string()))),
+            Err(cause) => ready(Err(cause.to_string())),
         }
     }
 

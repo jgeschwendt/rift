@@ -6,7 +6,7 @@
 use crate::mic::Mic;
 use crate::{BEHIND, FRAME, append, error, hex, now, setting};
 use serde_json::{Value, json};
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::env;
 use std::f64::consts::PI;
 use std::fs;
@@ -16,14 +16,15 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 /// Where a microphone's grant is given, in each message about one withheld.
 const GRANT: &str = "allow rift in System Settings \u{203a} Privacy & Security \u{203a} Microphone";
 
-/// An open's outcome: the input's sample rate and channel count, else why it failed.
-pub type Ready = Sender<Result<(u32, u16), String>>;
+/// Called once an open returns: the input's sample rate and channel count, else why it failed.
+pub type Ready = Box<dyn FnOnce(Result<(u32, u16), String>) + Send>;
 
 /// Where an open input's interleaved buffers go, called from its own thread.
 pub type Sound = Box<dyn FnMut(&[f32]) + Send>;
@@ -40,8 +41,9 @@ pub trait Source: Sync {
 /// The suite's microphones under `$RIFT_MIC`: `default` names the default input; each file under
 /// `inputs/` is an input, holding `<rate> <channels> <level> <swing>` (channel 0 the level plus and
 /// minus the swing at alternate samples, every other channel full scale), `block` (an open that
-/// never returns) or `fail`; `log` gets an `open` and a `close` line per open. An input whose
-/// file goes is unlisted and falls silent.
+/// waits, as for a grant's prompt, until the file says otherwise) or `fail`; `log` gets an `ask`
+/// line per open asked for, then an `open` and a `close` line per open that returned; `slow`, the
+/// milliseconds a listing takes. An input whose file goes is unlisted and falls silent.
 struct Fake(PathBuf);
 
 impl Source for Fake {
@@ -50,8 +52,24 @@ impl Source for Fake {
         reason = "a test signal: the level plus or minus the swing"
     )]
     fn hold(&self, name: &str, ready: Ready, mut sound: Sound, stop: Receiver<()>) {
-        let input = self.0.join("inputs").join(name);
-        let spec = fs::read_to_string(&input).unwrap_or_default();
+        let (input, log) = (self.0.join("inputs").join(name), self.0.join("log"));
+        let tick = || {
+            matches!(
+                stop.recv_timeout(Duration::from_millis(10)),
+                Err(RecvTimeoutError::Timeout)
+            )
+        };
+        drop(append(&log, format!("ask {name}\n").as_bytes()));
+        let mut spec = fs::read_to_string(&input).unwrap_or_default();
+        while spec.trim() == "block" {
+            if !tick() {
+                return;
+            }
+            spec = fs::read_to_string(&input).unwrap_or_default();
+        }
+        if spec.trim() == "fail" {
+            return ready(Err("refused".to_owned()));
+        }
         let words: Vec<&str> = spec.split_whitespace().collect();
         let word = |at: usize| words.get(at).copied().unwrap_or_default();
         let (rate, channels): (u32, u16) = (
@@ -62,43 +80,35 @@ impl Source for Fake {
             word(2).parse().unwrap_or_default(),
             word(3).parse().unwrap_or_default(),
         );
-        let log = self.0.join("log");
-        match spec.trim() {
-            "block" => stop.recv().unwrap_or_default(),
-            "fail" => drop(ready.send(Err("refused".to_owned()))),
-            _ => {
-                drop(ready.send(Ok((rate, channels))));
-                drop(append(&log, format!("open {name}\n").as_bytes()));
-                // paced on the clock, as a device's own is
-                let (begun, mut given) = (Instant::now(), 0u128);
-                while matches!(
-                    stop.recv_timeout(Duration::from_millis(10)),
-                    Err(RecvTimeoutError::Timeout)
-                ) {
-                    let due = (begun.elapsed().as_micros().saturating_mul(rate.into()))
-                        .checked_div(1_000_000)
-                        .unwrap_or_default();
-                    let count = due.saturating_sub(given);
-                    given = due;
-                    if input.exists() {
-                        let chunk: Vec<f32> = (0..count)
-                            .flat_map(|_| {
-                                swing = -swing;
-                                iter::once(level + swing).chain(iter::repeat_n(
-                                    1.0,
-                                    usize::from(channels).saturating_sub(1),
-                                ))
-                            })
-                            .collect();
-                        sound(&chunk);
-                    }
-                }
-                drop(append(&log, format!("close {name}\n").as_bytes()));
+        ready(Ok((rate, channels)));
+        drop(append(&log, format!("open {name}\n").as_bytes()));
+        // paced on the clock, as a device's own is
+        let (begun, mut given) = (Instant::now(), 0u128);
+        while tick() {
+            let due = (begun.elapsed().as_micros().saturating_mul(rate.into()))
+                .checked_div(1_000_000)
+                .unwrap_or_default();
+            let count = due.saturating_sub(given);
+            given = due;
+            if input.exists() {
+                let chunk: Vec<f32> = (0..count)
+                    .flat_map(|_| {
+                        swing = -swing;
+                        iter::once(level + swing)
+                            .chain(iter::repeat_n(1.0, usize::from(channels).saturating_sub(1)))
+                    })
+                    .collect();
+                sound(&chunk);
             }
         }
+        drop(append(&log, format!("close {name}\n").as_bytes()));
     }
 
     fn inputs(&self) -> (Option<String>, Vec<String>) {
+        let slow = fs::read_to_string(self.0.join("slow")).unwrap_or_default();
+        thread::sleep(Duration::from_millis(
+            slow.trim().parse().unwrap_or_default(),
+        ));
         let mut names: Vec<String> = fs::read_dir(self.0.join("inputs"))
             .into_iter()
             .flatten()
@@ -184,28 +194,30 @@ impl From<u32> for Convert {
     }
 }
 
-/// What the device hears: a line from the daemon (`None` at its end), or a buffer from the open of
-/// that number.
+/// What the device hears, on one channel: the inputs, a line from the daemon (`None` at its end),
+/// and each open's outcome and buffers, tagged with its number.
 enum Heard {
-    /// A line from the daemon.
-    Line(Option<String>),
+    /// The default input's name, if there is one, and every input's.
+    Inputs((Option<String>, Vec<String>)),
+    /// A line from the daemon, its ping answered already.
+    Line(Option<Value>),
+    /// An open returned.
+    Opened(u64, Result<(u32, u16), String>),
     /// A buffer of interleaved samples.
     Sound(u64, Vec<f32>),
 }
 
-/// The input open now.
+/// The input open now, or opening.
 struct Open {
     /// Dropped, it closes.
     _stop: Sender<()>,
     /// Where its frame 0 starts on this device's clock.
     base: u64,
-    /// Its channels, of which channel 0 is read.
-    channels: usize,
-    /// Its converter.
-    convert: Convert,
+    /// Once it opened: its channels, of which channel 0 is read, and its converter.
+    format: Option<(usize, Convert)>,
     /// Whether it has given a sample other than exact zero.
     heard: bool,
-    /// When it last gave sound.
+    /// When it last gave sound, or opened.
     last: Instant,
     /// Its name.
     name: String,
@@ -215,21 +227,23 @@ struct Open {
     pcm: Vec<u8>,
     /// Its frames sent.
     sent: u64,
-    /// When it opened.
+    /// When it was asked to open, then when it opened.
     since: Instant,
 }
 
-/// The device after its reply, until the daemon goes (`unknown`, exit 1) or a stated failure (one
-/// stderr line, exit 1): every line from the daemon (the reply first) answered, printed unless ok
-/// and obeyed for the ears; the inputs asked every `$RIFT_POLL_MS`, the wanted one opened while
-/// the ears are on and closed when they go off, another is wanted or it falls silent; its sound
-/// sent as frames.
+/// The device after its reply, until the daemon goes (`unknown`, exit 1): every ping answered on
+/// the reader's thread as it arrives; every line printed unless ok and obeyed for the ears; the
+/// inputs listed on a thread of their own every `$RIFT_POLL_MS`; the wanted one opened while the
+/// ears are on and closed when they go off or another is wanted; its sound sent as frames from its
+/// first sample other than exact zero. A failure (the open refused, no signal `$RIFT_ZERO_MS` after
+/// it, a poll's silence) closes it, and the next open waits a poll doubled per failure in a row, 64
+/// at most; each line is said once until the input is heard. Nothing here waits on the system.
 #[expect(
     clippy::single_call_fn,
     reason = "the device's entry: main calls it once, on macOS"
 )]
 pub fn run(reader: BufReader<UnixStream>, reply: &Value, pinned: Option<&str>) -> ExitCode {
-    let hear = || -> Option<String> {
+    let hear = || -> Option<()> {
         let source: &'static dyn Source =
             env::var_os("RIFT_MIC").map_or(&Mic, |dir| Box::leak(Box::new(Fake(dir.into()))));
         let [deadline, zeros, poll] = [
@@ -238,104 +252,97 @@ pub fn run(reader: BufReader<UnixStream>, reply: &Value, pinned: Option<&str>) -
             ("RIFT_POLL_MS", 1000),
         ]
         .map(|(key, default)| Duration::from_millis(setting(key, default)));
-        let mut out = reader.get_ref().try_clone().ok()?;
+        let out = Arc::new(Mutex::new(reader.get_ref().try_clone().ok()?));
         reader.get_ref().set_read_timeout(None).ok()?;
         let (heard, hearing) = mpsc::sync_channel(BEHIND);
-        heard.send(Heard::Line(Some(reply.to_string()))).ok()?;
-        let lines = heard.clone();
+        let (lines, pongs, first) = (heard.clone(), Arc::clone(&out), reply.clone());
         drop(thread::spawn(move || {
-            reader
-                .lines()
-                .map_while(Result::ok)
+            let read = reader.lines().map_while(Result::ok);
+            iter::once(first)
+                .chain(read.map(|text| serde_json::from_str(&text).unwrap_or_default()))
                 .map(Some)
                 .chain([None])
-                .try_for_each(|line| lines.send(Heard::Line(line)))
+                .try_for_each(|line: Option<Value>| {
+                    if let Some(ping) = line
+                        .as_ref()
+                        .map(|held| &held["ping"])
+                        .filter(|ping| ping.is_u64())
+                    {
+                        let pong = json!({"op": "pong", "ping": ping, "t": now()});
+                        drop(pongs.lock().map(|mut held| writeln!(held, "{pong}")));
+                    }
+                    lines.send(Heard::Line(line))
+                })
         }));
-        let (named, listed) = source.inputs();
-        let wanted = pinned.map(str::to_owned).or(named);
-        if !wanted.as_ref().is_some_and(|name| listed.contains(name)) {
+        let mut inputs = source.inputs();
+        let wanted = pinned.map(str::to_owned).or_else(|| inputs.0.clone());
+        if !wanted.as_ref().is_some_and(|name| inputs.1.contains(name)) {
             eprintln!(
                 "rift device: waiting for {}; the inputs present: {}",
                 wanted.map_or_else(|| "a default input".to_owned(), |name| format!("{name:?}")),
-                listed.join(", ")
+                inputs.1.join(", ")
             );
         }
-        let (mut ears, mut open, mut number, mut polled) =
-            (false, None::<Open>, 0u64, None::<Instant>);
+        let listing = heard.clone();
+        drop(thread::spawn(move || {
+            iter::repeat_with(|| {
+                thread::sleep(poll);
+                source.inputs()
+            })
+            .try_for_each(|listed| listing.send(Heard::Inputs(listed)))
+        }));
+        let (mut ears, mut failed, mut number, mut open, mut retry, mut said) = (
+            false,
+            0u32,
+            0u64,
+            None::<Open>,
+            None::<Instant>,
+            BTreeSet::new(),
+        );
         loop {
-            if polled.is_none_or(|at| at.elapsed() >= poll) {
-                polled = Some(Instant::now());
-                let (default, present) = source.inputs();
-                let want = pinned
-                    .map(str::to_owned)
-                    .or(default)
-                    .filter(|name| ears && present.contains(name));
-                // another input wanted, or this one silent a poll long: closed
-                if open.as_ref().is_some_and(|held| {
-                    Some(&held.name) != want.as_ref() || held.last.elapsed() >= poll
-                }) {
-                    open = None;
-                }
-                if let Some(name) = want.filter(|_| open.is_none()) {
-                    number = number.saturating_add(1);
-                    let (ready, opened) = mpsc::channel();
-                    let (stop, stopped) = mpsc::channel();
-                    let (sounds, at, called) = (heard.clone(), number, name.clone());
-                    drop(thread::spawn(move || {
-                        let sound = move |data: &[f32]| {
-                            drop(sounds.try_send(Heard::Sound(at, data.to_vec())));
-                        };
-                        source.hold(&called, ready, Box::new(sound), stopped);
-                    }));
-                    let (rate, channels) = match opened.recv_timeout(deadline) {
-                        Ok(Ok(format)) => format,
-                        Ok(Err(cause)) => return Some(format!("{name:?}: {cause}")),
-                        Err(_) => {
-                            return Some(format!(
-                                "{name:?} did not open within {} ms: the microphone is not granted; {GRANT}",
-                                deadline.as_millis()
-                            ));
-                        }
-                    };
-                    open = Some(Open {
-                        _stop: stop,
-                        base: 0,
-                        channels: usize::from(channels).max(1),
-                        convert: Convert::from(rate),
-                        heard: false,
-                        last: Instant::now(),
-                        name,
-                        number,
-                        pcm: Vec::new(),
-                        sent: 0,
-                        since: Instant::now(),
-                    });
-                }
-            }
+            // a line to say once, and whether the open failed
+            let mut noted = None::<(Option<String>, bool)>;
             match hearing.recv_timeout(poll) {
-                Ok(Heard::Line(Some(text))) => {
-                    let line: Value = serde_json::from_str(&text).unwrap_or_default();
-                    if line["ping"].is_u64() {
-                        let pong = json!({"op": "pong", "ping": line["ping"], "t": now()});
-                        writeln!(out, "{pong}").ok()?;
-                    }
+                Ok(Heard::Inputs(listed)) => inputs = listed,
+                Ok(Heard::Line(Some(line))) => {
                     if line["ok"] != true {
                         println!("{line}");
                     }
-                    // the next poll opens or closes the microphone at once
                     if let Some(on) = line["ears"].as_bool() {
-                        (ears, polled) = (on, None);
+                        (ears, retry) = (on, None);
                     }
                 }
                 Ok(Heard::Line(None)) => return None,
-                Ok(Heard::Sound(at, data))
+                Ok(Heard::Opened(at, opened))
                     if open.as_ref().is_some_and(|held| held.number == at) =>
                 {
                     let held = open.as_mut()?;
+                    match opened {
+                        Ok((rate, channels)) => {
+                            let format = (usize::from(channels).max(1), Convert::from(rate));
+                            (held.format, held.last, held.since) =
+                                (Some(format), Instant::now(), Instant::now());
+                        }
+                        Err(cause) => {
+                            noted = Some((Some(format!("{:?}: {cause}", held.name)), true));
+                        }
+                    }
+                }
+                Ok(Heard::Sound(at, data))
+                    if open
+                        .as_ref()
+                        .is_some_and(|held| held.number == at && held.format.is_some()) =>
+                {
+                    let held = open.as_mut()?;
+                    let &mut (channels, ref mut convert) = held.format.as_mut()?;
+                    let channel = data.iter().step_by(channels).copied();
                     held.last = Instant::now();
-                    let channel = data.iter().step_by(held.channels).copied();
                     held.heard |= channel.clone().any(|sample| sample != 0.0);
-                    held.convert.feed(channel, &mut held.pcm);
+                    // exact zeros before it are no signal, never sent as audio
+                    if held.heard {
+                        (failed, said) = (0, BTreeSet::new());
+                        convert.feed(channel, &mut held.pcm);
+                    }
                     // stamped as `rift device` stamps a file: from the clock, over 100 ms off it rebased
                     while held.pcm.len() >= FRAME {
                         let frame: Vec<u8> = held.pcm.drain(..FRAME).collect();
@@ -347,25 +354,90 @@ pub fn run(reader: BufReader<UnixStream>, reply: &Value, pinned: Option<&str>) -
                             held.base = clock.saturating_sub(stamp);
                         }
                         let sent = json!({"mic": held.name, "op": "frame", "pcm": hex(&frame), "t": held.base.saturating_add(stamp)});
-                        writeln!(out, "{sent}").ok()?;
+                        writeln!(out.lock().ok()?, "{sent}").ok()?;
                         held.sent = held.sent.saturating_add(1);
                     }
-                    if !held.heard && held.since.elapsed() >= zeros {
-                        return Some(format!(
-                            "{:?} gave only exact zeros for {} ms after it opened: the microphone is not granted, or is muted; {GRANT}",
-                            held.name,
-                            zeros.as_millis()
-                        ));
-                    }
                 }
-                // an earlier open's last buffers, or a poll with nothing heard
-                Ok(Heard::Sound(..)) | Err(_) => {}
+                // an earlier open's, or a poll with nothing heard
+                Ok(Heard::Opened(..) | Heard::Sound(..)) | Err(_) => {}
+            }
+            noted = noted.or_else(|| match open.as_ref() {
+                // the open goes on: a grant's prompt holds it until answered
+                Some(held) if held.format.is_none() && held.since.elapsed() >= deadline => Some((
+                    Some(format!(
+                        "{:?} has not opened in {} ms: the microphone is not granted yet; {GRANT}",
+                        held.name,
+                        deadline.as_millis()
+                    )),
+                    false,
+                )),
+                Some(held)
+                    if held.format.is_some()
+                        && (held.last.elapsed() >= poll
+                            || !held.heard && held.since.elapsed() >= zeros) =>
+                {
+                    let why = format!(
+                        "{:?} gave no signal (nothing, or only exact zeros) after it opened: the microphone is not granted, or is muted; {GRANT}",
+                        held.name
+                    );
+                    // a heard input fallen silent: closed, nothing said
+                    Some(((!held.heard).then_some(why), true))
+                }
+                _ => None,
+            });
+            if let Some((line, closes)) = noted {
+                if let Some(why) = line
+                    && said.insert(why.clone())
+                {
+                    eprintln!("rift device: {why}");
+                }
+                if closes {
+                    let wait = poll.saturating_mul(2u32.saturating_pow(failed.min(6)));
+                    (failed, open, retry) = (
+                        failed.saturating_add(1),
+                        None,
+                        Instant::now().checked_add(wait),
+                    );
+                }
+            }
+            let want = (pinned.map(str::to_owned).or_else(|| inputs.0.clone()))
+                .filter(|name| ears && inputs.1.contains(name));
+            if open
+                .as_ref()
+                .is_some_and(|held| Some(&held.name) != want.as_ref())
+            {
+                open = None;
+            }
+            if let Some(name) =
+                want.filter(|_| open.is_none() && retry.is_none_or(|at| at <= Instant::now()))
+            {
+                number = number.saturating_add(1);
+                let (stop, stopped) = mpsc::channel();
+                let (sounds, at, called) = (heard.clone(), number, name.clone());
+                drop(thread::spawn(move || {
+                    let opened = sounds.clone();
+                    let ready = move |outcome| drop(opened.send(Heard::Opened(at, outcome)));
+                    let sound = move |data: &[f32]| {
+                        drop(sounds.try_send(Heard::Sound(at, data.to_vec())));
+                    };
+                    source.hold(&called, Box::new(ready), Box::new(sound), stopped);
+                }));
+                open = Some(Open {
+                    _stop: stop,
+                    base: 0,
+                    format: None,
+                    heard: false,
+                    last: Instant::now(),
+                    name,
+                    number,
+                    pcm: Vec::new(),
+                    sent: 0,
+                    since: Instant::now(),
+                });
             }
         }
     };
-    match hear() {
-        Some(why) => eprintln!("rift device: {why}"),
-        None => println!("{}", error("unknown")),
-    }
+    let _: Option<()> = hear();
+    println!("{}", error("unknown"));
     ExitCode::FAILURE
 }
