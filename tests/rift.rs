@@ -1814,8 +1814,9 @@ mod tests {
             &rift(&root, &[], &["device", "nose", "x", &file])?,
             &format!("1\n{}\n", code("bad_request")),
         )?;
+        // 20 s: still playing when the drain cuts it
         let long = format!("{root}/long.pcm");
-        fs::write(&long, vec![1; 64_000])?;
+        fs::write(&long, vec![1; 640_000])?;
         let spawn = |args: &[&str]| {
             Command::new(env!("CARGO_BIN_EXE_rift"))
                 .env("RIFT_ROOT", &root)
@@ -1835,27 +1836,26 @@ mod tests {
             &format!("\"{}\"", "01".repeat(640)),
         )?;
         drop(rift(&root, &[], &["ears", "off"])?);
+        // told before the drain, which then cuts it whether its next write or read fails
+        let mut said = BufReader::new(player.stdout.take().ok_or("stdout")?).lines();
+        let before = said
+            .by_ref()
+            .map_while(Result::ok)
+            .take_while(|line| line != r#"{"ears":false}"#)
+            .count();
         same(
             &say(&mut greet(&root)?, r#"{"op":"shutdown"}"#)?,
             r#"{"ok":true}"#,
         )?;
-        let mut said = String::new();
-        let _: usize =
-            io::Read::read_to_string(&mut player.stdout.take().ok_or("stdout")?, &mut said)?;
-        let lines: Vec<&str> = said.lines().collect();
         same(
             &format!(
-                "{} {} {:?} {:?} {:?}",
-                lines.get(1).unwrap_or(&""),
-                lines.last().unwrap_or(&""),
+                "{before} {} {:?} {:?} {:?}",
+                said.map_while(Result::ok).last().unwrap_or_default(),
                 player.wait()?.code(),
                 listener.wait()?.code(),
                 daemon.0.wait()?.code()
             ),
-            &format!(
-                "{{\"ears\":false}} {} Some(1) Some(0) Some(0)",
-                code("unknown")
-            ),
+            &format!("1 {} Some(1) Some(0) Some(0)", code("unknown")),
         )
     }
 
@@ -1879,8 +1879,9 @@ mod tests {
             "true",
         )?;
         drop(ahead);
+        // 20 s: still playing when stopped, then cut by the drain
         let long = format!("{root}/long.pcm");
-        fs::write(&long, vec![1; 64_000])?;
+        fs::write(&long, vec![1; 640_000])?;
         let mut player = Daemon(
             Command::new(env!("CARGO_BIN_EXE_rift"))
                 .env("RIFT_ROOT", &root)
@@ -1899,19 +1900,25 @@ mod tests {
         same(&signal(&player, "STOP")?, "")?;
         thread::sleep(Duration::from_millis(400));
         same(&signal(&player, "CONT")?, "")?;
-        same(&format!("{:?}", player.0.wait()?.code()), "Some(0)")?;
-        same(
-            &paused()?
-                .iter()
-                .any(|event| event["kind"] == "hole" && event["samples"].as_u64() >= Some(4_800))
-                .to_string(),
-            "true",
-        )?;
+        until(|| {
+            Ok(paused().is_ok_and(|held| {
+                held.iter().any(|event| {
+                    event["kind"] == "hole" && event["samples"].as_u64() >= Some(4_800)
+                })
+            }))
+        })?;
         same(
             &say(&mut greet(&root)?, r#"{"op":"shutdown"}"#)?,
             r#"{"ok":true}"#,
         )?;
-        same(&format!("{:?}", daemon.0.wait()?.code()), "Some(0)")
+        same(
+            &format!(
+                "{:?} {:?}",
+                player.0.wait()?.code(),
+                daemon.0.wait()?.code()
+            ),
+            "Some(1) Some(0)",
+        )
     }
 
     /// `serve` refuses a socket path over 103 bytes and a `run/` others can reach; a panic (the

@@ -508,13 +508,15 @@ fn main() -> ExitCode {
                                         base.saturating_add(at).saturating_sub(clock),
                                     ));
                                 }
+                                // a failed write and a failed read are one path: which one a
+                                // daemon gone mid-play fails is a race
                                 writeln!(
                                     reader.get_mut(),
                                     "{}",
                                     json!({"op": "frame", "pcm": hex(frame), "t": base.saturating_add(at)})
-                                )?;
+                                )
                                 // notices and refusals printed, pings answered, until its reply
-                                loop {
+                                .and_then(|()| loop {
                                     let line = answer(&mut reader)?;
                                     if line["ping"].is_u64() {
                                         pong(&mut reader, &line["ping"])?;
@@ -525,7 +527,7 @@ fn main() -> ExitCode {
                                     if line.get("ok").is_some() {
                                         break Ok(());
                                     }
-                                }
+                                })
                             })
                         });
                         return played.map_or_else(
