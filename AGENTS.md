@@ -58,7 +58,8 @@ first frame, so the daemon never refuses it `unsynced`. With `--mic` (`src/ear.r
 carries everything the device hears, and the loop that drains it never calls the system: the
 reader thread's lines (the reply first), each ping answered there under the writer's mutex before
 the line is passed on; the inputs, listed on a thread every poll; each open's outcome and buffers,
-tagged with the open's number so a closed open's are dropped. The stream (`hold`) is built, held
+tagged with the open's number so a closed open's are dropped, each buffer with the clock as the
+callback handed it over, which alone may rebase its frames. The stream (`hold`) is built, held
 and dropped on a thread of its own, closed by dropping its stop sender; an open abandoned while it
 waits closes as soon as it returns.
 
@@ -108,9 +109,14 @@ anything is written), `gui/<id -u>` the domain, each call that changes something
    blocks, and the device waits on it; a rebuild under another version, signed by the same
    identity, records with no prompt; `ears off` stops the segments. Each run left one hole of
    about 25 ms ending its first segment early (158400 samples): the reply's pong waited on two
-   input listings (about 50 ms), and the next ping, 10 s on, moved placement by half that. The
-   suite reproduces it with slow fake listings; pongs leave on the reader thread (unverified
-   2026-11-25 · the fix not yet run on the Mac);
+   input listings (about 50 ms), and the next ping, 10 s on, moved placement by half that. With
+   pongs on the reader thread a run still lost 20 ms at a ping (one late round trip re-placing
+   the track) and, once in 125 s, 214 ms then 11 ms with 140 ms between refused `ahead`: the daemon held up
+   past 100 ms, the device's writes waited, and its frames were rebased on the loop's clock, then
+   ran ahead of it. Freezing the daemon 300 ms reproduces the second exactly; buffers stamped
+   where the callback hands them over, and an offset a pong moves only when its span proves it
+   wrong, end both (`mic` and `late` in the suite; verified 2026-11-25 · a 200 s run, twenty
+   full segments, then a restart, its one hole, and a 300 ms freeze with none);
 5. the plist by temp + rename (`wrote <path>`);
 6. the same plist already loaded: `kickstart -k`, the swap; else booted out when loaded, then
    `bootstrap`;

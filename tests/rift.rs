@@ -1437,6 +1437,46 @@ mod tests {
         same(&format!("{:?}", daemon.0.wait()?.code()), "Some(0)")
     }
 
+    /// A late pong moves no frame: the offset moves only as far as a pong's span, from its ping to
+    /// its reading, proves it wrong, as a device clock stepped a second ahead does.
+    #[test]
+    fn late() -> Outcome {
+        let root = temp("late")?;
+        let (mut daemon, _) = serve(&root, &[("RIFT_PING_MS", "0")])?;
+        drop(rift(&root, &[], &["ears", "on"])?);
+        let (mut ear, hi) = device(&root, r#"{"kind":"ear","name":"l","op":"device"}"#, 0)?;
+        let at = hi["ping"].as_u64().unwrap_or_default() - 1_000_000;
+        let mut placed = Vec::new();
+        for (step, wait, skew) in [(0, 60, 0), (20_000, 0, 1_000_000), (1_040_000, 0, 0)] {
+            let reply = frame(&mut ear, at + step, 1)?;
+            let ping = reply["ping"].as_u64().ok_or("no ping")?;
+            thread::sleep(Duration::from_millis(wait));
+            let answer = json!({"op": "pong", "ping": ping, "t": ping + skew});
+            ear.get_mut().write_all(format!("{answer}\n").as_bytes())?;
+            placed.push(reply["t"].as_u64().ok_or("unplaced")?);
+        }
+        let first = placed.first().copied().unwrap_or_default();
+        same(
+            &format!(
+                "{:?}",
+                placed.iter().map(|stamp| stamp - first).collect::<Vec<_>>()
+            ),
+            "[0, 20000, 40000]",
+        )?;
+        same(
+            &events(&root)?
+                .iter()
+                .any(|event| event["e"]["kind"] == "hole")
+                .to_string(),
+            "false",
+        )?;
+        same(
+            &say(&mut greet(&root)?, r#"{"op":"shutdown"}"#)?,
+            r#"{"ok":true}"#,
+        )?;
+        same(&format!("{:?}", daemon.0.wait()?.code()), "Some(0)")
+    }
+
     /// A kill mid-segment: the next boot cuts its torn tail to whole frames and closes it with its
     /// event, its start the track's; the range reads back; the boot after finds it closed.
     #[test]
@@ -2499,7 +2539,8 @@ esac
     /// next microphone's; ears off closes the microphone. A second device pinned to an absent
     /// input says so and waits, records it once it appears and stops when it goes. A torn segment
     /// keeps its microphone; a frame whose `mic` is not a string is refused. Pongs leave on the
-    /// reader's thread, so listings slower than a ping leave no hole. An open waited on, a refused
+    /// reader's thread, so listings slower than a ping leave no hole; a daemon frozen past a poll
+    /// holds up the frames, which go on from the sample count, no hole. An open waited on, a refused
     /// open and exact zeros are each said once and the device kept: the waited open returns when
     /// granted, the others are retried, a poll doubled per failure, until heard.
     #[cfg(target_os = "macos")]
@@ -2588,6 +2629,32 @@ esac
                 opening[1]["samples"]
             ),
             "false 3200",
+        )?;
+        // the daemon frozen for 300 ms, three polls: the device's writes wait, its microphone
+        // stays open, and the frames held up go on from the sample count, no hole and none ahead
+        let freeze = |signal: &str| {
+            Command::new("kill")
+                .args([signal, &daemon.0.id().to_string()])
+                .status()
+                .map(drop)
+        };
+        freeze("-STOP")?;
+        thread::sleep(Duration::from_millis(300));
+        freeze("-CONT")?;
+        let frozen = opening.len();
+        until(|| Ok(stream("ear-desk").is_ok_and(|held| held.len() >= frozen + 5)))?;
+        let kinds: Vec<Value> = stream("ear-desk")?
+            .iter()
+            .map(|event| event["kind"].clone())
+            .collect();
+        same(
+            &json!(kinds).to_string(),
+            &json!(
+                iter::once("track")
+                    .chain(iter::repeat_n("segment", kinds.len() - 1))
+                    .collect::<Vec<_>>()
+            )
+            .to_string(),
         )?;
         // a second device pinned to an input not yet there
         let mut spare = spawn(&["device", "ear", "spare", "--mic", "Spare Mic"])?;

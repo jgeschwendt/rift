@@ -230,10 +230,11 @@
       separates by microphone with no guessing (<a href="protocol.html#devices">the protocol</a>).</li>
     <li><strong>Conversion.</strong> Channel 0 of whatever the input delivers (a sum of channels
       would cancel or clip), through a Hann-windowed sinc low-pass under 7 kHz, a millisecond each
-      side, then read at 16 kHz between the filtered samples; 16-bit, 20 ms frames, stamped as a
-      file-fed device stamps them, from its first sample other than exact zero. Pings are answered
-      as they arrive, on the thread that reads them: a pong held up by an open or a listing would
-      place frames early by half its delay, and leave that much hole at the next ping.</li>
+      side, then read at 16 kHz between the filtered samples; 16-bit, 20 ms frames from its first
+      sample other than exact zero, stamped by the sample count and rebased only when that strays
+      over 100 ms from the clock as each buffer was handed over, which is audio really missing: a
+      write held up by a busy daemon delays frames, never moves them. Pings are answered as they
+      arrive, on the thread that reads them.</li>
     <li><strong>A withheld grant is said, never fatal.</strong> Under launchd an ungranted
       microphone either blocks the open while macOS's prompt waits or delivers exact zeros with no
       error. An open past <code class="code">$RIFT_OPEN_MS</code> (10 s) is named and waited on:

@@ -203,8 +203,8 @@ enum Heard {
     Line(Option<Value>),
     /// An open returned.
     Opened(u64, Result<(u32, u16), String>),
-    /// A buffer of interleaved samples.
-    Sound(u64, Vec<f32>),
+    /// A buffer of interleaved samples, and this device's clock as it was handed over.
+    Sound(u64, u64, Vec<f32>),
 }
 
 /// The input open now, or opening.
@@ -217,7 +217,7 @@ struct Open {
     format: Option<(usize, Convert)>,
     /// Whether it has given a sample other than exact zero.
     heard: bool,
-    /// When it last gave sound, or opened.
+    /// When its last sound was sent, or it opened.
     last: Instant,
     /// Its name.
     name: String,
@@ -328,7 +328,7 @@ pub fn run(reader: BufReader<UnixStream>, reply: &Value, pinned: Option<&str>) -
                         }
                     }
                 }
-                Ok(Heard::Sound(at, data))
+                Ok(Heard::Sound(at, when, data))
                     if open
                         .as_ref()
                         .is_some_and(|held| held.number == at && held.format.is_some()) =>
@@ -336,19 +336,20 @@ pub fn run(reader: BufReader<UnixStream>, reply: &Value, pinned: Option<&str>) -
                     let held = open.as_mut()?;
                     let &mut (channels, ref mut convert) = held.format.as_mut()?;
                     let channel = data.iter().step_by(channels).copied();
-                    held.last = Instant::now();
                     held.heard |= channel.clone().any(|sample| sample != 0.0);
                     // exact zeros before it are no signal, never sent as audio
                     if held.heard {
                         (failed, said) = (0, BTreeSet::new());
                         convert.feed(channel, &mut held.pcm);
                     }
-                    // stamped as `rift device` stamps a file: from the clock, over 100 ms off it rebased
+                    // stamped by the sample count from the first; over 100 ms off the clock as the
+                    // buffer was handed over (audio really missing) rebased: never this loop's
+                    // clock, which a write held up by the daemon would turn into holes
                     while held.pcm.len() >= FRAME {
                         let frame: Vec<u8> = held.pcm.drain(..FRAME).collect();
                         let (stamp, clock) = (
                             held.sent.saturating_mul(20_000),
-                            now().saturating_sub(20_000),
+                            when.saturating_sub(20_000),
                         );
                         if clock.abs_diff(held.base.saturating_add(stamp)) > 100_000 {
                             held.base = clock.saturating_sub(stamp);
@@ -357,6 +358,8 @@ pub fn run(reader: BufReader<UnixStream>, reply: &Value, pinned: Option<&str>) -
                         writeln!(out.lock().ok()?, "{sent}").ok()?;
                         held.sent = held.sent.saturating_add(1);
                     }
+                    // after the writes: a write held up is not the input fallen silent
+                    held.last = Instant::now();
                 }
                 // an earlier open's, or a poll with nothing heard
                 Ok(Heard::Opened(..) | Heard::Sound(..)) | Err(_) => {}
@@ -418,7 +421,7 @@ pub fn run(reader: BufReader<UnixStream>, reply: &Value, pinned: Option<&str>) -
                     let opened = sounds.clone();
                     let ready = move |outcome| drop(opened.send(Heard::Opened(at, outcome)));
                     let sound = move |data: &[f32]| {
-                        drop(sounds.try_send(Heard::Sound(at, data.to_vec())));
+                        drop(sounds.try_send(Heard::Sound(at, now(), data.to_vec())));
                     };
                     source.hold(&called, Box::new(ready), Box::new(sound), stopped);
                 }));

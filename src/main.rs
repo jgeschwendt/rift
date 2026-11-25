@@ -1124,10 +1124,26 @@ fn main() -> ExitCode {
                                     && request["ping"].is_u64()
                                     && request["t"].is_u64() =>
                             {
-                                clock = Some((
+                                let (ping, theirs, back) = (
+                                    request["ping"].as_u64().unwrap_or_default(),
                                     request["t"].as_u64().unwrap_or_default(),
-                                    request["ping"].as_u64().unwrap_or_default().midpoint(now()),
-                                ));
+                                    now(),
+                                );
+                                // the pong was stamped between the ping and its reading: the
+                                // first is placed at the midpoint, a later one moves the offset
+                                // only as far as that span proves it wrong, so a late pong moves
+                                // nothing
+                                let ours = clock.map_or_else(
+                                    || ping.midpoint(back),
+                                    |(was, at)| {
+                                        theirs
+                                            .saturating_add(at)
+                                            .saturating_sub(was)
+                                            .max(ping)
+                                            .min(back)
+                                    },
+                                );
+                                clock = Some((theirs, ours));
                                 (Ok(Value::Null), Next::Go)
                             }
                             (true, Some("read"))
