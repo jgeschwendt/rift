@@ -1,7 +1,8 @@
-//! `rift`, for now only its plumbing. `serve` is the daemon, an append-only event log served
-//! over a unix socket (docs/protocol.html, protocol 1); `status`,
-//! `quiet` and `feed` are thin clients of that socket; `setup` installs the release and its launchd
-//! agent, `upgrade` swaps in a newer release; `version` prints the build.
+//! `rift`. `serve` is the daemon, an append-only event log served over a unix socket
+//! (docs/protocol.html, protocol 1) and an audio stream its devices feed onto one clock; `status`,
+//! `quiet`, `ears`, `keep`, `feed`, `listen` and `read` are thin clients of that socket, `device`
+//! one that plays a raw PCM file as frames; `setup` installs the release and its launchd agent,
+//! `upgrade` swaps in a newer release; `version` prints the build.
 
 use serde_json::{Value, json};
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
@@ -10,13 +11,14 @@ use signal_hook::low_level::signal_name;
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::env;
+use std::fmt::Write as _;
 use std::fs::{self, DirBuilder, OpenOptions, Permissions, TryLockError};
 use std::io::{self, BufRead as _, BufReader, Read as _, Write as _};
 use std::net::Shutdown;
 use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::panic;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, id};
 use std::str::FromStr;
 use std::sync::mpsc::{self, Receiver, SyncSender};
@@ -26,6 +28,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// A feed client this many events behind is dropped (docs/protocol.html#feed).
 const BEHIND: usize = 1024;
+
+/// A frame's bytes: 20 ms of 16 kHz mono 16-bit little-endian PCM.
+const FRAME: usize = 640;
 
 /// The longest request line, its `\n` not counted (docs/protocol.html#framing).
 const LINE: u64 = 1 << 16;
@@ -47,6 +52,8 @@ static STOP: OnceLock<String> = OnceLock::new();
 enum Next {
     /// Close it: a refused hello or a line past the limit.
     Close,
+    /// Become a device: its replies and notices leave through this queue, by a writer of its own.
+    Device(Receiver<String>),
     /// Become a feed: the replay, then every live event until the daemon drops it.
     Feed(Vec<String>, Receiver<String>),
     /// Read the next request.
@@ -60,18 +67,27 @@ enum Next {
 /// The daemon's state behind one mutex: an append and a feed's subscription each hold it, so a
 /// replay and the live events after it are one sequence.
 struct Live {
+    /// The directory a segment leaving the window moves into, else null: it is deleted.
+    archive: Value,
     /// This boot's number, derived from the log.
     boot: u64,
     /// Every open connection by key, for the drain's forced close and a slow feed's drop.
     conns: BTreeMap<u64, UnixStream>,
-    /// `<root>/events.ndjson`, the only durable state.
-    events: PathBuf,
-    /// Each feed's queue and its connection's key.
-    feeds: Vec<(SyncSender<String>, u64)>,
+    /// Whether the ears are open: whether devices' frames are taken.
+    ears: bool,
+    /// Each feed's queue, its connection's key and its topic: `""` the events, `"ears"` a
+    /// device's replies and notices, else the track a listener follows.
+    feeds: Vec<(SyncSender<String>, u64, String)>,
+    /// The closed segments still under `audio/`, as their events, in log order.
+    held: Vec<Value>,
     /// The last connection key handed out.
     keys: u64,
     /// The quiet setting.
     quiet: bool,
+    /// The state root; `events.ndjson` under it is the only durable state.
+    root: PathBuf,
+    /// A segment's length in samples, whole frames.
+    segment: u64,
     /// The last event's `seq` in this boot.
     seq: u64,
     /// When this boot started, RFC 3339.
@@ -80,27 +96,56 @@ struct Live {
     sock: PathBuf,
     /// `ready`, `degraded` (the last append failed) or `stopping`.
     state: &'static str,
+    /// Every track of this boot, by name.
+    tracks: BTreeMap<String, Track>,
+    /// The window in seconds: a closed segment that ended longer ago leaves `audio/`.
+    window: u64,
+}
+
+/// A track, one device's sound on the daemon's clock, in this boot.
+#[derive(Default)]
+struct Track {
+    /// The key of the connection streaming it, while one does.
+    conn: Option<u64>,
+    /// Where its next frame goes on the timeline, once it has had one.
+    end: Option<u64>,
+    /// The next segment's number.
+    next: u64,
+    /// The open segment's number, start and samples written.
+    open: Option<(u64, u64, u64)>,
 }
 
 impl Live {
+    /// Closes the open segment of `only`, else of every track, each with its event, then sweeps.
+    fn close(&mut self, only: Option<&str>) -> io::Result<()> {
+        let boot = self.boot;
+        let closing: Vec<Value> = self
+            .tracks
+            .iter_mut()
+            .filter(|entry| only.is_none_or(|one| one == entry.0.as_str()))
+            .filter_map(|(name, track)| {
+                let (num, start, samples) = track.open.take()?;
+                Some(json!({"kind": "segment", "n": num, "path": format!("audio/{boot}/{name}/{num}.pcm"), "samples": samples, "start": start, "track": name}))
+            })
+            .collect();
+        for event in closing {
+            let logged = self.emit(&event)?;
+            self.held.push(logged);
+        }
+        self.sweep();
+        Ok(())
+    }
+
     /// Appends `event` to the log as this boot's next `seq` (the file opened, written whole and
-    /// closed), then queues it to every feed, dropping a feed that is full or gone. A failed
-    /// append is cut back to the log's length before it, so nothing changed, and the state is
+    /// closed), then queues it to every feed of the events; the line as logged. A failed append
+    /// is cut back to the log's length before it, so nothing changed, and the state is
     /// `degraded` until an append succeeds.
-    fn emit(&mut self, event: &Value) -> io::Result<()> {
+    fn emit(&mut self, event: &Value) -> io::Result<Value> {
         let seq = self.seq.saturating_add(1);
-        let line = format!(
-            "{}\n",
-            json!({"boot": self.boot, "e": event, "seq": seq, "t": utc(SystemTime::now())})
-        );
-        let appended = OpenOptions::new()
-            .append(true)
-            .open(&self.events)
-            .and_then(|mut file| {
-                let len = file.metadata()?.len();
-                file.write_all(line.as_bytes())
-                    .inspect_err(|_| drop(file.set_len(len)))
-            });
+        let logged =
+            json!({"boot": self.boot, "e": event, "seq": seq, "t": utc(SystemTime::now())});
+        let line = format!("{logged}\n");
+        let appended = append(&self.root.join("events.ndjson"), line.as_bytes());
         self.state = if appended.is_ok() {
             "ready"
         } else {
@@ -108,21 +153,46 @@ impl Live {
         };
         appended?;
         self.seq = seq;
+        self.fan("", &line);
+        Ok(logged)
+    }
+
+    /// Queues `line` to every feed of `topic`, dropping one that is full or gone.
+    fn fan(&mut self, topic: &str, line: &str) {
         let conns = &self.conns;
         self.feeds.retain(|feed| {
-            let kept = feed.0.try_send(line.clone()).is_ok();
+            let kept = feed.2 != topic || feed.0.try_send(line.to_owned()).is_ok();
             if !kept {
                 drop(conns.get(&feed.1).map(|conn| conn.shutdown(Shutdown::Both)));
             }
             kept
         });
-        Ok(())
     }
 
-    /// The health reply: hello's fields, `quiet` and `seq`.
+    /// The health reply: hello's fields, then the stream's and the switches'.
     fn health(&self) -> Value {
         let mut reply = self.hello();
-        (reply["quiet"], reply["seq"]) = (self.quiet.into(), self.seq.into());
+        let devices: Vec<&String> = self
+            .tracks
+            .iter()
+            .filter(|&(_, track)| track.conn.is_some())
+            .map(|(name, _)| name)
+            .collect();
+        (
+            reply["archive"],
+            reply["devices"],
+            reply["ears"],
+            reply["quiet"],
+            reply["seq"],
+            reply["window"],
+        ) = (
+            self.archive.clone(),
+            json!(devices),
+            self.ears.into(),
+            self.quiet.into(),
+            self.seq.into(),
+            self.window.into(),
+        );
         reply
     }
 
@@ -130,6 +200,54 @@ impl Live {
     fn hello(&self) -> Value {
         json!({"boot": self.boot, "ok": true, "pid": id(), "proto": PROTO, "since": self.since, "state": self.state, "version": VERSION})
     }
+
+    /// Moves every closed segment that ended more than the window ago out of `audio/`: into the
+    /// archive, its event appended to the archive's `index.ndjson`, else deleted. One that fails
+    /// stays for the next sweep.
+    fn sweep(&mut self) {
+        let cutoff = now().saturating_sub(self.window.saturating_mul(1_000_000));
+        let (root, archive) = (&self.root, &self.archive);
+        self.held.retain(|event| {
+            let path = event["e"]["path"].as_str().unwrap_or_default();
+            let from = root.join(path);
+            end(&event["e"]) >= cutoff
+                || archive
+                    .as_str()
+                    .map(Path::new)
+                    .map_or(Ok(()), |dir| {
+                        let into = dir.join(path);
+                        into.parent().map_or(Ok(()), fs::create_dir_all)?;
+                        let _: u64 = fs::copy(&from, &into)?;
+                        append(&dir.join("index.ndjson"), format!("{event}\n").as_bytes())
+                    })
+                    .and_then(|()| fs::remove_file(&from))
+                    .is_err()
+        });
+    }
+}
+
+/// Appends `bytes` to `path`, created when absent, in one write: a failed one is cut back to the
+/// length before it.
+fn append(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut file = OpenOptions::new().append(true).create(true).open(path)?;
+    let len = file.metadata()?.len();
+    file.write_all(bytes)
+        .inspect_err(|_| drop(file.set_len(len)))
+}
+
+/// Where a stream event's span ends on the daemon's clock: its `start` plus its `samples` (a
+/// `track` event has none) at 16 kHz.
+#[expect(
+    clippy::integer_division,
+    clippy::integer_division_remainder_used,
+    reason = "a sample is 62.5 microseconds: the timeline's whole microseconds round down"
+)]
+fn end(event: &Value) -> u64 {
+    let samples = event["samples"].as_u64().unwrap_or_default();
+    event["start"]
+        .as_u64()
+        .unwrap_or_default()
+        .saturating_add(samples.saturating_mul(125) / 2)
 }
 
 /// The error reply with `code`.
@@ -144,6 +262,14 @@ fn events(bytes: &[u8]) -> Vec<Value> {
         .filter(|line| line.ends_with(b"\n"))
         .filter_map(|line| serde_json::from_slice(line).ok())
         .collect()
+}
+
+/// `bytes` as lowercase hex, a frame's encoding on the wire.
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().fold(String::new(), |mut text, byte| {
+        write!(text, "{byte:02x}").unwrap_or_default();
+        text
+    })
 }
 
 /// The guard on `live`, a poisoned lock taken as it stands.
@@ -174,6 +300,28 @@ fn manifest() -> hotswap::Manifest {
         ],
         ..hotswap::Manifest::default()
     }
+}
+
+/// This host's clock in microseconds since the epoch: the daemon's, the stream's one timeline;
+/// a device's own.
+fn now() -> u64 {
+    u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros(),
+    )
+    .unwrap_or(u64::MAX)
+}
+
+/// The samples at 16 kHz in `micros`: a time's index on the timeline's sample grid.
+#[expect(
+    clippy::integer_division,
+    clippy::integer_division_remainder_used,
+    reason = "a sample is 62.5 microseconds: a time between two samples takes the earlier"
+)]
+const fn samples(micros: u64) -> u64 {
+    micros.saturating_mul(2) / 125
 }
 
 /// `$key` parsed, else `default`.
@@ -222,16 +370,42 @@ fn main() -> ExitCode {
     );
     let (rundir, sock) = (root.join("run"), root.join("run/rift.sock"));
     let asked = match *words.as_slice() {
+        ["device", kind, name, _] | ["device", kind, name, _, "--fast"] => {
+            Some(json!({"kind": kind, "name": name, "op": "device"}))
+        }
+        [op @ ("ears" | "quiet"), on @ ("on" | "off")] => Some(json!({"on": on == "on", "op": op})),
         ["feed"] => Some(json!({"after": null, "op": "feed"})),
         ["feed", "--after", at] => at.split_once(':').and_then(|(boot, seq)| {
             Some(json!({"after": {"boot": boot.parse::<u64>().ok()?, "seq": seq.parse::<u64>().ok()?}, "op": "feed"}))
         }),
-        ["quiet", on @ ("on" | "off")] => Some(json!({"on": on == "on", "op": "quiet"})),
+        ["keep", secs] | ["keep", secs, _] => secs.parse::<u64>().ok().map(|window| {
+            let archive = words
+                .get(2)
+                .map(|dir| env::current_dir().unwrap_or_default().join(dir));
+            json!({"archive": archive, "op": "keep", "window": window})
+        }),
+        ["listen", track] => Some(json!({"op": "listen", "track": track})),
+        ["read", track, from, to] => from.parse::<u64>().ok().zip(to.parse::<u64>().ok()).map(
+            |(start, stop)| json!({"from": start, "op": "read", "to": stop, "track": track}),
+        ),
         ["status"] => Some(json!({"op": "health"})),
         _ => None,
     };
     match (words.as_slice(), asked) {
         (&[verb, ..], Some(wanted)) => {
+            // a device's file, read before it connects
+            let pcm = match words
+                .get(3)
+                .filter(|_| verb == "device")
+                .map(fs::read)
+                .transpose()
+            {
+                Ok(pcm) => pcm.unwrap_or_default(),
+                Err(cause) => {
+                    eprintln!("rift device: {cause}");
+                    return ExitCode::FAILURE;
+                }
+            };
             let answer = |reader: &mut BufReader<UnixStream>| -> io::Result<Value> {
                 let mut line = String::new();
                 let _: usize = reader.read_line(&mut line)?;
@@ -268,14 +442,71 @@ fn main() -> ExitCode {
                     );
                     ExitCode::FAILURE
                 }
-                Ok((hello, reply, reader)) if hello["ok"] == true => {
+                Ok((hello, reply, mut reader)) if hello["ok"] == true => {
                     if hello["version"] != VERSION {
                         eprintln!(
                             "rift {verb}: the daemon is {}, this client {VERSION}; fix: rift setup",
                             hello["version"].as_str().unwrap_or_default()
                         );
                     }
-                    if verb == "feed" && reply["ok"] == true {
+                    if verb == "device" && reply["ok"] == true {
+                        println!("{reply}");
+                        let fast = words.len() == 5;
+                        // a reply carrying `ping` is answered with this device's clock
+                        let pong = |conn: &mut BufReader<UnixStream>, ping: &Value| {
+                            writeln!(
+                                conn.get_mut(),
+                                "{}",
+                                json!({"op": "pong", "ping": ping, "t": now()})
+                            )
+                        };
+                        let frames = pcm.chunks_exact(FRAME);
+                        // stamped from now in real time, or, sent as fast as accepted, ending now
+                        let (base, begun) = (
+                            now().saturating_sub(
+                                u64::try_from(frames.len())
+                                    .unwrap_or_default()
+                                    .saturating_mul(20_000)
+                                    .saturating_mul(u64::from(fast)),
+                            ),
+                            Instant::now(),
+                        );
+                        let played = pong(&mut reader, &reply["ping"]).and_then(|()| {
+                            (0u64..).step_by(20_000).zip(frames).try_for_each(|(at, frame)| {
+                                if !fast {
+                                    thread::sleep(
+                                        Duration::from_micros(at).saturating_sub(begun.elapsed()),
+                                    );
+                                }
+                                writeln!(
+                                    reader.get_mut(),
+                                    "{}",
+                                    json!({"op": "frame", "pcm": hex(frame), "t": base.saturating_add(at)})
+                                )?;
+                                // notices and refusals printed, pings answered, until its reply
+                                loop {
+                                    let line = answer(&mut reader)?;
+                                    if line["ping"].is_u64() {
+                                        pong(&mut reader, &line["ping"])?;
+                                    }
+                                    if line["ok"] != true {
+                                        println!("{line}");
+                                    }
+                                    if line.get("ok").is_some() {
+                                        break Ok(());
+                                    }
+                                }
+                            })
+                        });
+                        return played.map_or_else(
+                            |_| {
+                                println!("{}", error("unknown"));
+                                ExitCode::FAILURE
+                            },
+                            |()| ExitCode::SUCCESS,
+                        );
+                    }
+                    if matches!(verb, "feed" | "listen" | "read") && reply["ok"] == true {
                         if reply["reset"] == true {
                             eprintln!(
                                 "rift feed: the log does not hold that position; from this boot's first event"
@@ -382,29 +613,100 @@ fn main() -> ExitCode {
                     .map_or(0, |at| at.saturating_add(1));
                 file.set_len(u64::try_from(whole).map_err(io::Error::other)?)?;
                 let held_events = events(&bytes);
+                let last = |kind: &str| {
+                    held_events
+                        .iter()
+                        .rev()
+                        .find(|event| event["e"]["kind"] == kind)
+                        .map(|event| &event["e"])
+                };
+                let kept = last("keep");
+                let closed: Vec<&Value> = held_events
+                    .iter()
+                    .filter(|event| event["e"]["kind"] == "segment")
+                    .collect();
                 let live: &'static Mutex<Live> = Box::leak(Box::new(Mutex::new(Live {
+                    archive: kept.map_or(Value::Null, |keep| keep["archive"].clone()),
                     boot: held_events
                         .last()
                         .and_then(|event| event["boot"].as_u64())
                         .unwrap_or(0)
                         .saturating_add(1),
                     conns: BTreeMap::new(),
-                    events: events_path,
+                    ears: last("ears").is_some_and(|ears| ears["on"] == true),
                     feeds: Vec::new(),
-                    keys: 0,
-                    quiet: held_events
+                    held: closed
                         .iter()
-                        .rev()
-                        .find(|event| event["e"]["kind"] == "quiet")
-                        .is_some_and(|event| event["e"]["on"] == true),
+                        .filter(|event| {
+                            root.join(event["e"]["path"].as_str().unwrap_or_default())
+                                .exists()
+                        })
+                        .map(|&event| event.clone())
+                        .collect(),
+                    keys: 0,
+                    quiet: last("quiet").is_some_and(|quiet| quiet["on"] == true),
+                    root: root.clone(),
+                    segment: setting("RIFT_SEGMENT_MS", 10_000u64)
+                        .checked_div(20)
+                        .unwrap_or_default()
+                        .max(1)
+                        .saturating_mul(320),
                     seq: 0,
                     since: utc(SystemTime::now()),
                     sock: sock.clone(),
                     state: "ready",
+                    tracks: BTreeMap::new(),
+                    window: kept.map_or(600, |keep| keep["window"].as_u64().unwrap_or_default()),
                 })));
                 // the pid file first: a failure past the boot event or the rename leaves no trace
                 fs::write(&pid, id().to_string())?;
-                lock(live).emit(&json!({"kind": "boot", "pid": id(), "version": VERSION}))?;
+                let mut guard = lock(live);
+                drop(guard.emit(&json!({"kind": "boot", "pid": id(), "version": VERSION}))?);
+                // a segment a kill left open: cut to whole frames and closed with its event, its
+                // start where its track's last event of that boot ended
+                let mut torn: Vec<String> = fs::read_dir(root.join("audio"))
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .flat_map(|boot| fs::read_dir(boot.path()).into_iter().flatten().flatten())
+                    .flat_map(|track| fs::read_dir(track.path()).into_iter().flatten().flatten())
+                    .filter_map(|entry| {
+                        Some(entry.path().strip_prefix(&root).ok()?.to_str()?.to_owned())
+                    })
+                    .filter(|path| {
+                        Path::new(path).extension().is_some_and(|ext| ext == "pcm")
+                            && !closed
+                                .iter()
+                                .any(|event| event["e"]["path"] == path.as_str())
+                    })
+                    .collect();
+                torn.sort();
+                for path in torn {
+                    let (folder, name) = path.rsplit_once('/').unwrap_or_default();
+                    let (top, track) = folder.rsplit_once('/').unwrap_or_default();
+                    let boot: u64 = top.trim_start_matches("audio/").parse().unwrap_or_default();
+                    let handle = OpenOptions::new().write(true).open(root.join(&path))?;
+                    let frames = handle
+                        .metadata()?
+                        .len()
+                        .checked_div(640)
+                        .unwrap_or_default();
+                    handle.set_len(frames.saturating_mul(640))?;
+                    let start = held_events
+                        .iter()
+                        .rev()
+                        .find(|event| {
+                            event["boot"] == boot
+                                && event["e"]["track"] == track
+                                && event["e"]["start"].is_u64()
+                        })
+                        .map_or(0, |event| end(&event["e"]));
+                    let num: u64 = name.trim_end_matches(".pcm").parse().unwrap_or_default();
+                    let logged = guard.emit(&json!({"kind": "segment", "n": num, "path": path, "samples": frames.saturating_mul(320), "start": start, "track": track}))?;
+                    guard.held.push(logged);
+                }
+                guard.sweep();
+                drop(guard);
                 fs::rename(&tmp, &sock)?;
                 Ok((held, listener, live, signals))
             };
@@ -447,17 +749,30 @@ fn main() -> ExitCode {
                     }
                 };
                 let note = write.clone();
-                drop(thread::spawn(move || -> io::Result<()> {
-                    let (read, held) = (stream.try_clone()?, stream.try_clone()?);
+                #[expect(
+                    clippy::cognitive_complexity,
+                    reason = "a connection is one read loop over one match of its requests: split, each arm would be a function called once"
+                )]
+                let connection = move || -> io::Result<()> {
+                    let (read, listed) = (stream.try_clone()?, stream.try_clone()?);
                     let key = {
                         let mut guard = lock(live);
                         guard.keys = guard.keys.saturating_add(1);
                         let key = guard.keys;
-                        drop(guard.conns.insert(key, held));
+                        drop(guard.conns.insert(key, listed));
                         key
                     };
                     let (mut reader, mut writer, mut greeted) =
                         (BufReader::new(read), stream, false);
+                    // a device's track, its clock and the daemon's at one instant (by its last
+                    // pong; until one, the same), its last ping, and the queue its writer drains
+                    let (mut device, mut clock, mut pinged, mut queue) = (
+                        None::<String>,
+                        (0, 0),
+                        Instant::now(),
+                        None::<SyncSender<String>>,
+                    );
+                    let every = Duration::from_millis(setting("RIFT_PING_MS", 10_000));
                     loop {
                         let mut raw = Vec::new();
                         drop((&mut reader).take(LINE + 1).read_until(b'\n', &mut raw));
@@ -471,52 +786,289 @@ fn main() -> ExitCode {
                         let id_ok = request["id"].is_null()
                             || request["id"].is_string()
                             || request["id"].is_number();
+                        let (track, named) = (
+                            request["track"].as_str().unwrap_or_default(),
+                            request["kind"]
+                                .as_str()
+                                .filter(|&kind| matches!(kind, "ear" | "mouth"))
+                                .zip(request["name"].as_str().filter(|name| {
+                                    (1..=64).contains(&name.len())
+                                        && name.bytes().all(|byte| {
+                                            byte.is_ascii_alphanumeric() || b"-_".contains(&byte)
+                                        })
+                                }))
+                                .map(|(kind, name)| format!("{kind}-{name}")),
+                        );
+                        let pcm = request["pcm"]
+                            .as_str()
+                            .filter(|text| text.len() == FRAME * 2)
+                            .and_then(|text| {
+                                text.as_bytes()
+                                    .chunks(2)
+                                    .map(|pair| {
+                                        u8::from_str_radix(str::from_utf8(pair).ok()?, 16).ok()
+                                    })
+                                    .collect::<Option<Vec<u8>>>()
+                            });
                         let mut guard = lock(live);
-                        let (mut reply, next) = match (greeted, request["op"].as_str()) {
-                            _ if over => (error("too_long"), Next::Close),
+                        let (result, next) = match (greeted, request["op"].as_str()) {
+                            _ if over => (Ok(error("too_long")), Next::Close),
                             _ if !request.is_object() || !id_ok => (
-                                error("bad_request"),
+                                Ok(error("bad_request")),
                                 if greeted { Next::Go } else { Next::Close },
                             ),
                             (false, Some("hello"))
                                 if request["client"].is_string() && request["proto"] == PROTO =>
                             {
-                                (guard.hello(), Next::Greet)
+                                (Ok(guard.hello()), Next::Greet)
                             }
                             (false, Some("hello"))
                                 if request["client"].is_string() && request["proto"].is_u64() =>
                             {
                                 (
-                                    json!({"code": "proto", "ok": false, "proto": PROTO, "version": VERSION}),
+                                    Ok(
+                                        json!({"code": "proto", "ok": false, "proto": PROTO, "version": VERSION}),
+                                    ),
                                     Next::Close,
                                 )
                             }
-                            (false, _) => (error("bad_request"), Next::Close),
+                            (false, _) => (Ok(error("bad_request")), Next::Close),
                             (true, Some(op)) if guard.state == STOPPING && op != "health" => {
-                                (error(STOPPING), Next::Go)
+                                (Ok(error(STOPPING)), Next::Go)
                             }
-                            (true, Some("health")) => (guard.health(), Next::Go),
-                            (true, Some("quiet")) if request["on"].is_boolean() => {
+                            // a device's connection carries its frames, never a stream of replies
+                            (true, Some("device" | "feed" | "listen" | "read"))
+                                if device.is_some() =>
+                            {
+                                (Ok(error("bad_request")), Next::Go)
+                            }
+                            (true, Some("device"))
+                                if named.as_ref().is_some_and(|name| {
+                                    guard
+                                        .tracks
+                                        .get(name)
+                                        .is_some_and(|held| held.conn.is_some())
+                                }) =>
+                            {
+                                (Ok(error("taken")), Next::Go)
+                            }
+                            (true, Some("device")) if named.is_some() => {
+                                let name = named.unwrap_or_default();
+                                let (sender, incoming) = mpsc::sync_channel(BEHIND);
+                                guard.tracks.entry(name.clone()).or_default().conn = Some(key);
+                                guard.feeds.push((sender.clone(), key, "ears".to_owned()));
+                                queue = Some(sender);
+                                let reply = json!({"ears": guard.ears, "ok": true, "ping": now(), "track": name});
+                                device = Some(name);
+                                (Ok(reply), Next::Device(incoming))
+                            }
+                            (true, Some(op @ ("ears" | "quiet"))) if request["on"].is_boolean() => {
                                 let on = request["on"] == true;
-                                let changed = on != guard.quiet;
-                                let appended = if changed {
-                                    guard.emit(&json!({"kind": "quiet", "on": on}))
+                                let changed = on
+                                    != if op == "ears" {
+                                        guard.ears
+                                    } else {
+                                        guard.quiet
+                                    };
+                                let toggled = (|| {
+                                    if changed && op == "ears" {
+                                        if !on {
+                                            guard.close(None)?;
+                                        }
+                                        guard.fan("ears", &format!("{}\n", json!({"ears": on})));
+                                    }
+                                    if changed {
+                                        drop(guard.emit(&json!({"kind": op, "on": on}))?);
+                                        *(if op == "ears" {
+                                            &mut guard.ears
+                                        } else {
+                                            &mut guard.quiet
+                                        }) = on;
+                                    }
+                                    Ok(json!({"changed": changed, "ok": true, "seq": guard.seq}))
+                                })();
+                                (toggled, Next::Go)
+                            }
+                            (true, Some("frame")) if device.is_some() && request["t"].is_u64() => {
+                                match pcm {
+                                    None => (Ok(error("bad_frame")), Next::Go),
+                                    Some(_) if !guard.ears => (Ok(error("closed")), Next::Go),
+                                    Some(bytes) => {
+                                        let (name, state) =
+                                            (device.clone().unwrap_or_default(), &mut *guard);
+                                        let at = request["t"]
+                                            .as_u64()
+                                            .unwrap_or_default()
+                                            .saturating_add(clock.1)
+                                            .saturating_sub(clock.0);
+                                        let placed = (|| {
+                                            let start = match state
+                                                .tracks
+                                                .get(&name)
+                                                .and_then(|held| held.end)
+                                            {
+                                                None => {
+                                                    drop(state.emit(&json!({"kind": "track", "start": at, "track": name}))?);
+                                                    at
+                                                }
+                                                // half a frame or more past the track's end is a hole
+                                                Some(last) if at >= last.saturating_add(10_000) => {
+                                                    state.close(Some(&name))?;
+                                                    end(&state.emit(&json!({"kind": "hole", "samples": samples(at.saturating_sub(last)), "start": last, "track": name}))?["e"])
+                                                }
+                                                Some(last) => last,
+                                            };
+                                            let held =
+                                                state.tracks.entry(name.clone()).or_default();
+                                            let (num, first, written) =
+                                                held.open.unwrap_or_else(|| {
+                                                    held.next = held.next.saturating_add(1);
+                                                    (held.next.saturating_sub(1), start, 0)
+                                                });
+                                            let dir = state
+                                                .root
+                                                .join(format!("audio/{}/{name}", state.boot));
+                                            fs::create_dir_all(&dir)?;
+                                            append(&dir.join(format!("{num}.pcm")), &bytes)?;
+                                            let full = written.saturating_add(320);
+                                            (held.open, held.end) = (
+                                                Some((num, first, full)),
+                                                Some(start.saturating_add(20_000)),
+                                            );
+                                            if full >= state.segment {
+                                                state.close(Some(&name))?;
+                                            }
+                                            state.fan(
+                                                &name,
+                                                &format!(
+                                                    "{}\n",
+                                                    json!({"pcm": request["pcm"], "t": start})
+                                                ),
+                                            );
+                                            let mut reply = json!({"ok": true, "t": start});
+                                            if pinged.elapsed() >= every {
+                                                (reply["ping"], pinged) =
+                                                    (now().into(), Instant::now());
+                                            }
+                                            Ok(reply)
+                                        })();
+                                        (placed, Next::Go)
+                                    }
+                                }
+                            }
+                            (true, Some("health")) => (Ok(guard.health()), Next::Go),
+                            (true, Some("keep"))
+                                if request["window"].is_u64()
+                                    && (request["archive"].is_null()
+                                        || request["archive"]
+                                            .as_str()
+                                            .is_some_and(|dir| Path::new(dir).is_absolute())) =>
+                            {
+                                let kept = guard
+                                    .emit(&json!({"archive": request["archive"], "kind": "keep", "window": request["window"]}))
+                                    .map(|_| {
+                                        (guard.archive, guard.window) = (
+                                            request["archive"].clone(),
+                                            request["window"].as_u64().unwrap_or_default(),
+                                        );
+                                        guard.sweep();
+                                        json!({"ok": true, "seq": guard.seq})
+                                    });
+                                (kept, Next::Go)
+                            }
+                            (true, Some("listen")) if request["track"].is_string() => {
+                                let (sender, incoming) = mpsc::sync_channel(BEHIND);
+                                guard.feeds.push((sender, key, track.to_owned()));
+                                (Ok(json!({"ok": true})), Next::Feed(Vec::new(), incoming))
+                            }
+                            // a pong is answered by nothing
+                            (true, Some("pong"))
+                                if device.is_some()
+                                    && request["ping"].is_u64()
+                                    && request["t"].is_u64() =>
+                            {
+                                clock = (
+                                    request["t"].as_u64().unwrap_or_default(),
+                                    request["ping"].as_u64().unwrap_or_default().midpoint(now()),
+                                );
+                                (Ok(Value::Null), Next::Go)
+                            }
+                            (true, Some("read"))
+                                if request["track"].is_string()
+                                    && matches!(
+                                        (request["from"].as_u64(), request["to"].as_u64()),
+                                        (Some(from), Some(to)) if from < to
+                                    ) =>
+                            {
+                                let (from, clock_now) =
+                                    (request["from"].as_u64().unwrap_or_default(), now());
+                                if from
+                                    < clock_now
+                                        .saturating_sub(guard.window.saturating_mul(1_000_000))
+                                {
+                                    (Ok(error("gone")), Next::Go)
                                 } else {
-                                    Ok(())
-                                };
-                                appended.map_or_else(
-                                    |cause| {
-                                        note(json!({"event": "degraded", "reason": cause.to_string()}));
-                                        (error("io"), Next::Go)
-                                    },
-                                    |()| {
-                                        guard.quiet = on;
-                                        (
-                                            json!({"changed": changed, "ok": true, "seq": guard.seq}),
-                                            Next::Go,
+                                    // silence wherever nothing is held, the segments laid on the sample grid
+                                    let (first, last) = (
+                                        samples(from),
+                                        samples(
+                                            request["to"]
+                                                .as_u64()
+                                                .unwrap_or_default()
+                                                .min(clock_now),
+                                        ),
+                                    );
+                                    let mut sound = vec![
+                                        0u8;
+                                        usize::try_from(
+                                            last.saturating_sub(first).saturating_mul(2)
                                         )
-                                    },
-                                )
+                                        .unwrap_or_default()
+                                    ];
+                                    let open = guard.tracks.get(track).and_then(|held| held.open).map(|(num, start, _)| {
+                                        json!({"path": format!("audio/{}/{track}/{num}.pcm", guard.boot), "start": start, "track": track})
+                                    });
+                                    for held in guard
+                                        .held
+                                        .iter()
+                                        .map(|event| &event["e"])
+                                        .chain(open.as_ref())
+                                        .filter(|held| held["track"] == track)
+                                    {
+                                        let bytes = fs::read(
+                                            guard
+                                                .root
+                                                .join(held["path"].as_str().unwrap_or_default()),
+                                        )
+                                        .unwrap_or_default();
+                                        for (sample, pair) in
+                                            (samples(held["start"].as_u64().unwrap_or_default())..)
+                                                .zip(bytes.chunks_exact(2))
+                                        {
+                                            if let Some(slot) = sample
+                                                .checked_sub(first)
+                                                .and_then(|index| {
+                                                    usize::try_from(index.saturating_mul(2)).ok()
+                                                })
+                                                .and_then(|index| {
+                                                    sound.get_mut(index..index.saturating_add(2))
+                                                })
+                                            {
+                                                slot.copy_from_slice(pair);
+                                            }
+                                        }
+                                    }
+                                    let lines = sound
+                                        .chunks(FRAME)
+                                        .zip((from..).step_by(20_000))
+                                        .map(|(frame, at)| {
+                                            format!("{}\n", json!({"pcm": hex(frame), "t": at}))
+                                        })
+                                        .collect();
+                                    // the range, then the end of stream
+                                    let (_, ended) = mpsc::sync_channel(0);
+                                    (Ok(json!({"ok": true})), Next::Feed(lines, ended))
+                                }
                             }
                             (true, Some("feed"))
                                 if request.get("after").is_some_and(|after| {
@@ -525,8 +1077,9 @@ fn main() -> ExitCode {
                                 }) =>
                             {
                                 let after = &request["after"];
-                                let held_events =
-                                    events(&fs::read(&guard.events).unwrap_or_default());
+                                let held_events = events(
+                                    &fs::read(guard.root.join("events.ndjson")).unwrap_or_default(),
+                                );
                                 let found = held_events.iter().position(|event| {
                                     event["boot"] == after["boot"] && event["seq"] == after["seq"]
                                 });
@@ -539,27 +1092,51 @@ fn main() -> ExitCode {
                                     })
                                     .map(|(_, event)| format!("{event}\n"))
                                     .collect();
-                                let (queue, incoming) = mpsc::sync_channel(BEHIND);
-                                guard.feeds.push((queue, key));
+                                let (sender, incoming) = mpsc::sync_channel(BEHIND);
+                                guard.feeds.push((sender, key, String::new()));
                                 (
-                                    json!({"ok": true, "reset": found.is_none() && !after.is_null()}),
+                                    Ok(
+                                        json!({"ok": true, "reset": found.is_none() && !after.is_null()}),
+                                    ),
                                     Next::Feed(backlog, incoming),
                                 )
                             }
-                            (true, Some("shutdown")) => (json!({"ok": true}), Next::Stop),
-                            (true, Some("feed" | "quiet") | None) => {
-                                (error("bad_request"), Next::Go)
-                            }
-                            (true, Some(_)) => (error("unknown_op"), Next::Go),
+                            (true, Some("shutdown")) => (Ok(json!({"ok": true})), Next::Stop),
+                            (
+                                true,
+                                Some(
+                                    "device" | "ears" | "feed" | "frame" | "keep" | "listen"
+                                    | "pong" | "quiet" | "read",
+                                )
+                                | None,
+                            ) => (Ok(error("bad_request")), Next::Go),
+                            (true, Some(_)) => (Ok(error("unknown_op")), Next::Go),
                         };
                         drop(guard);
-                        if id_ok && !request["id"].is_null() {
-                            reply["id"] = request["id"].clone();
+                        let mut reply = result.unwrap_or_else(|cause| {
+                            note(json!({"event": "degraded", "reason": cause.to_string()}));
+                            error("io")
+                        });
+                        if !reply.is_null() {
+                            if id_ok && !request["id"].is_null() {
+                                reply["id"] = request["id"].clone();
+                            }
+                            // a vanished client: the next read ends the loop, a feed's first write the feed
+                            let said = format!("{reply}\n");
+                            match queue.as_ref() {
+                                Some(sender) => drop(sender.send(said)),
+                                None => drop(writer.write_all(said.as_bytes())),
+                            }
                         }
-                        // a vanished client: the next read ends the loop, a feed's first write the feed
-                        drop(writeln!(writer, "{reply}"));
                         match next {
                             Next::Close => break,
+                            Next::Device(incoming) => drop(writer.try_clone().map(|mut out| {
+                                thread::spawn(move || {
+                                    incoming
+                                        .into_iter()
+                                        .try_for_each(|line| out.write_all(line.as_bytes()))
+                                })
+                            })),
                             Next::Feed(backlog, incoming) => {
                                 // a vanished client drops its queue at once, so `incoming` ends
                                 drop(thread::spawn(move || {
@@ -583,14 +1160,25 @@ fn main() -> ExitCode {
                         }
                     }
                     drop(writer.shutdown(Shutdown::Both));
-                    drop(lock(live).conns.remove(&key));
+                    let mut guard = lock(live);
+                    drop(guard.conns.remove(&key));
+                    guard.feeds.retain(|feed| feed.1 != key);
+                    // a device's open segment closes as it leaves
+                    if let Some(name) = device {
+                        drop(guard.close(Some(&name)));
+                        guard.tracks.entry(name).or_default().conn = None;
+                    }
+                    drop(guard);
                     Ok(())
-                }));
+                };
+                drop(thread::spawn(connection));
             };
-            // stop accepting, then the last event, then the feeds end once their queues are sent
+            // stop accepting, the open segments closed, then the last event, then the feeds end
+            // once their queues are sent
             drop(listener);
             {
                 let mut guard = lock(live);
+                drop(guard.close(None));
                 drop(guard.emit(&json!({"kind": "stop", "reason": reason})));
                 guard.state = STOPPING;
                 guard.feeds.clear();
@@ -838,7 +1426,7 @@ fn main() -> ExitCode {
         }
         _ => {
             eprintln!(
-                "usage: rift serve | status | quiet on|off | feed [--after <boot>:<seq>] | setup [--print | --remove] | upgrade [--check | --back | --retry] | version"
+                "usage: rift serve | status | quiet on|off | ears on|off | keep <window s> [<archive>] | feed [--after <boot>:<seq>] | listen <track> | read <track> <from us> <to us> | device ear|mouth <name> <file.pcm> [--fast] | setup [--print | --remove] | upgrade [--check | --back | --retry] | version"
             );
             ExitCode::from(2)
         }

@@ -18,7 +18,7 @@ mod tests {
     use std::process::{Child, Command, ExitStatus, Stdio, id};
     use std::sync::mpsc;
     use std::thread;
-    use std::time::{Duration, Instant};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     /// The hello every raw connection opens with.
     const HELLO: &str = r#"{"client":"test/1","op":"hello","proto":1}"#;
@@ -181,6 +181,43 @@ mod tests {
         Ok(())
     }
 
+    /// The error reply with `name`, as the daemon writes it.
+    fn code(name: &str) -> String {
+        format!(r#"{{"code":"{name}","ok":false}}"#)
+    }
+
+    /// A raw device: `line`, its device request, sent on a fresh connection, then the reply's
+    /// ping answered by a clock `skew` microseconds off the daemon's; the connection and reply.
+    fn device(
+        root: &str,
+        line: &str,
+        skew: i64,
+    ) -> Result<(BufReader<UnixStream>, Value), Box<dyn Error>> {
+        let mut conn = greet(root)?;
+        let reply: Value = serde_json::from_str(&say(&mut conn, line)?)?;
+        let ping = reply["ping"].as_u64().ok_or("no ping")?;
+        let answer = json!({"op": "pong", "ping": ping, "t": ping.saturating_add_signed(skew)});
+        conn.get_mut().write_all(format!("{answer}\n").as_bytes())?;
+        Ok((conn, reply))
+    }
+
+    /// A frame of `fill` bytes stamped `at` sent on `conn`, and its reply.
+    fn frame(conn: &mut BufReader<UnixStream>, at: u64, fill: u8) -> Result<Value, Box<dyn Error>> {
+        let line = json!({"op": "frame", "pcm": format!("{fill:02x}").repeat(640), "t": at});
+        Ok(serde_json::from_str(&say(conn, &line.to_string())?)?)
+    }
+
+    /// The next `count` events' `e` on `feed`.
+    fn take(feed: &mut BufReader<UnixStream>, count: usize) -> Result<Value, Box<dyn Error>> {
+        Ok(Value::Array(
+            iter::repeat_with(|| -> Result<Value, Box<dyn Error>> {
+                Ok(serde_json::from_str::<Value>(&next(feed)?)?["e"].clone())
+            })
+            .take(count)
+            .collect::<Result<_, _>>()?,
+        ))
+    }
+
     /// The daemon's life: the ready line, an absent root and `run/` made 0700, a socket and its pid, a second
     /// instance refused and logged, `status` and `version`, every error code, `id` echoed, quiet's
     /// idempotence, a failed append answered `io` with health `degraded` until the next append,
@@ -193,7 +230,7 @@ mod tests {
         let (mut daemon, ready) = serve(&root, &[])?;
         let pid = daemon.0.id();
         let since = ready["since"].as_str().unwrap_or_default().to_owned();
-        let health = json!({"boot": 1u8, "ok": true, "pid": pid, "proto": 1u8, "quiet": false, "seq": 1u8, "since": since, "state": "ready", "version": built});
+        let health = json!({"archive": null, "boot": 1u8, "devices": [], "ears": false, "ok": true, "pid": pid, "proto": 1u8, "quiet": false, "seq": 1u8, "since": since, "state": "ready", "version": built, "window": 600u16});
         same(&ready.to_string(), &health.to_string())?;
         same(&since.len().to_string(), "24")?;
         for dir in [root.clone(), format!("{root}/run")] {
@@ -281,7 +318,7 @@ mod tests {
         ] {
             same(&say(&mut conn, line)?, reply)?;
         }
-        let quieted = json!({"boot": 1u8, "ok": true, "pid": pid, "proto": 1u8, "quiet": true, "seq": 2u8, "since": since, "state": "ready", "version": built});
+        let quieted = json!({"archive": null, "boot": 1u8, "devices": [], "ears": false, "ok": true, "pid": pid, "proto": 1u8, "quiet": true, "seq": 2u8, "since": since, "state": "ready", "version": built, "window": 600u16});
         // a line of exactly 65 536 bytes is read; one byte more is too long, and closes
         let pad = |len: usize| format!(r#"{{"op":"health","pad":"{}"}}"#, "x".repeat(len - 24));
         same(&say(&mut conn, &pad(0x1_0000))?, &quieted.to_string())?;
@@ -306,7 +343,7 @@ mod tests {
             &rift(&root, &[], &["quiet", "on"])?,
             "1\n{\"code\":\"io\",\"ok\":false}\n",
         )?;
-        let degraded = json!({"boot": 1u8, "ok": true, "pid": pid, "proto": 1u8, "quiet": false, "seq": 3u8, "since": since, "state": "degraded", "version": built});
+        let degraded = json!({"archive": null, "boot": 1u8, "devices": [], "ears": false, "ok": true, "pid": pid, "proto": 1u8, "quiet": false, "seq": 3u8, "since": since, "state": "degraded", "version": built, "window": 600u16});
         same(&rift(&root, &[], &["status"])?, &format!("0\n{degraded}\n"))?;
         fs::rename(&aside, &log)?;
         same(
@@ -822,6 +859,572 @@ mod tests {
         )
     }
 
+    /// The stream: refused requests; two devices whose clocks are three hours apart placed on the
+    /// daemon's one timeline; a second device on a live track taken; closed ears refusing frames
+    /// until opened, each device told; segments cut at their length, a gap a hole, a drop closing
+    /// the open segment, each with its event and file; a listener fed each frame live; a range
+    /// read with silence for the hole; a failed segment write answered `io`; closing the ears
+    /// closing open segments; the window moving closed segments to the archive with an index line
+    /// each, a range that has left it gone, then deleting them with no archive; ears, window and
+    /// archive kept across a restart.
+    #[test]
+    fn stream() -> Outcome {
+        let root = temp("stream")?;
+        let archive = format!("{root}/archive");
+        let envs = [("RIFT_DRAIN_MS", "100"), ("RIFT_SEGMENT_MS", "100")];
+        let (mut daemon, ready) = serve(&root, &envs)?;
+        same(
+            &format!(
+                "{} {} {} {}",
+                ready["archive"], ready["devices"], ready["ears"], ready["window"]
+            ),
+            "null [] false 600",
+        )?;
+        let mut feed = greet(&root)?;
+        same(
+            &say(&mut feed, r#"{"after":null,"op":"feed"}"#)?,
+            r#"{"ok":true,"reset":false}"#,
+        )?;
+        drop(take(&mut feed, 1)?);
+        let mut conn = greet(&root)?;
+        for (line, reply) in [
+            (r#"{"kind":"nose","name":"a","op":"device"}"#, "bad_request"),
+            (
+                r#"{"kind":"ear","name":"../a","op":"device"}"#,
+                "bad_request",
+            ),
+            (r#"{"op":"frame","pcm":"00","t":1}"#, "bad_request"),
+            (r#"{"op":"pong","ping":1,"t":1}"#, "bad_request"),
+            (r#"{"op":"listen"}"#, "bad_request"),
+            (
+                r#"{"from":2,"op":"read","to":1,"track":"ear-a"}"#,
+                "bad_request",
+            ),
+            (r#"{"from":1,"op":"read","to":2,"track":"ear-a"}"#, "gone"),
+            (
+                r#"{"archive":"here","op":"keep","window":1}"#,
+                "bad_request",
+            ),
+            (r#"{"on":1,"op":"ears"}"#, "bad_request"),
+        ] {
+            same(&say(&mut conn, line)?, &code(reply))?;
+        }
+        // one clock an hour ahead of the daemon's, one two hours behind
+        let (mut ear, hi) = device(
+            &root,
+            r#"{"kind":"ear","name":"a","op":"device"}"#,
+            3_600_000_000,
+        )?;
+        let (mut mouth, mouth_hi) = device(
+            &root,
+            r#"{"kind":"mouth","name":"b","op":"device"}"#,
+            -7_200_000_000,
+        )?;
+        same(
+            &format!("{} {}", hi["ears"], hi["track"]),
+            r#"false "ear-a""#,
+        )?;
+        same(
+            &say(
+                &mut greet(&root)?,
+                r#"{"kind":"ear","name":"a","op":"device"}"#,
+            )?,
+            &code("taken"),
+        )?;
+        same(
+            &say(&mut ear, r#"{"after":null,"op":"feed"}"#)?,
+            &code("bad_request"),
+        )?;
+        let status: Value =
+            serde_json::from_str(rift(&root, &[], &["status"])?.trim_start_matches("0\n"))?;
+        same(&status["devices"].to_string(), r#"["ear-a","mouth-b"]"#)?;
+        // each device stamps its frames on its own clock, from two seconds before it connected
+        let ear_at = |index: u64| {
+            hi["ping"].as_u64().unwrap_or_default() + 3_600_000_000 - 2_000_000 + index * 20_000
+        };
+        same(&frame(&mut ear, ear_at(0), 0)?.to_string(), &code("closed"))?;
+        same(
+            &rift(&root, &[], &["ears", "on"])?,
+            "0\n{\"changed\":true,\"ok\":true,\"seq\":2}\n",
+        )?;
+        same(
+            &format!("{} {}", next(&mut ear)?, next(&mut mouth)?),
+            r#"{"ears":true} {"ears":true}"#,
+        )?;
+        same(
+            &take(&mut feed, 1)?.to_string(),
+            r#"[{"kind":"ears","on":true}]"#,
+        )?;
+        for line in [
+            r#"{"op":"frame","pcm":"00","t":1}"#.to_owned(),
+            json!({"op": "frame", "pcm": "zz".repeat(640), "t": 1u8}).to_string(),
+        ] {
+            same(&say(&mut ear, &line)?, &code("bad_frame"))?;
+        }
+        same(
+            &say(&mut ear, r#"{"op":"frame","pcm":"00"}"#)?,
+            &code("bad_request"),
+        )?;
+        let mut listen = greet(&root)?;
+        same(
+            &say(&mut listen, r#"{"op":"listen","track":"mouth-b"}"#)?,
+            r#"{"ok":true}"#,
+        )?;
+        // eight frames, a second of them missing, three more; then the device drops
+        let mut placed = Vec::new();
+        for index in (0..8).chain(58..61) {
+            placed.push(frame(&mut ear, ear_at(index), u8::try_from(index)?)?["t"].clone());
+        }
+        drop(ear);
+        let first = placed[0].as_u64().ok_or("unplaced")?;
+        same(
+            &(first.abs_diff(hi["ping"].as_u64().unwrap_or_default() - 2_000_000) < 1_000_000)
+                .to_string(),
+            "true",
+        )?;
+        same(
+            &json!(placed).to_string(),
+            &json!(
+                (0..8)
+                    .chain(58..61)
+                    .map(|index| first + index * 20_000)
+                    .collect::<Vec<_>>()
+            )
+            .to_string(),
+        )?;
+        let segment = |num: u8, samples: u32, start: u64| json!({"kind": "segment", "n": num, "path": format!("audio/1/ear-a/{num}.pcm"), "samples": samples, "start": start, "track": "ear-a"});
+        same(
+            &take(&mut feed, 5)?.to_string(),
+            &json!([
+                {"kind": "track", "start": first, "track": "ear-a"},
+                segment(0, 1600, first),
+                segment(1, 960, first + 100_000),
+                {"kind": "hole", "samples": 16_000u16, "start": first + 160_000, "track": "ear-a"},
+                segment(2, 960, first + 1_160_000),
+            ])
+            .to_string(),
+        )?;
+        let fills =
+            |range: &[u8]| -> Vec<u8> { range.iter().flat_map(|&fill| [fill; 640]).collect() };
+        for (num, range) in [
+            (0u8, &[0, 1, 2, 3, 4][..]),
+            (1, &[5, 6, 7]),
+            (2, &[58, 59, 60]),
+        ] {
+            same(
+                &(fs::read(format!("{root}/audio/1/ear-a/{num}.pcm"))? == fills(range)).to_string(),
+                "true",
+            )?;
+        }
+        // the mouth's frames land beside the ear's, its clock three hours from the ear's
+        let mouth_at = mouth_hi["ping"].as_u64().unwrap_or_default() - 7_200_000_000 - 2_000_000;
+        let mut heard = Vec::new();
+        for index in 0..5 {
+            let reply = frame(&mut mouth, mouth_at + index * 20_000, 9)?;
+            heard.push(json!({"pcm": "09".repeat(640), "t": reply["t"]}).to_string());
+        }
+        let mouth_first = serde_json::from_str::<Value>(heard.first().ok_or("unheard")?)?["t"]
+            .as_u64()
+            .unwrap_or_default();
+        same(
+            &(mouth_first.abs_diff(first) < 1_000_000).to_string(),
+            "true",
+        )?;
+        same(
+            &iter::repeat_with(|| next(&mut listen))
+                .take(5)
+                .collect::<io::Result<Vec<_>>>()?
+                .join("\n"),
+            &heard.join("\n"),
+        )?;
+        same(
+            &take(&mut feed, 2)?.to_string(),
+            &json!([
+                {"kind": "track", "start": mouth_first, "track": "mouth-b"},
+                {"kind": "segment", "n": 0u8, "path": "audio/1/mouth-b/0.pcm", "samples": 1600u16, "start": mouth_first, "track": "mouth-b"},
+            ])
+            .to_string(),
+        )?;
+        // the whole of the ear's track: its frames, silence where the hole is
+        let read = rift(
+            &root,
+            &[],
+            &[
+                "read",
+                "ear-a",
+                &first.to_string(),
+                &(first + 1_220_000).to_string(),
+            ],
+        )?;
+        same(
+            &read,
+            &format!(
+                "0\n{}",
+                (0u8..61).fold(String::new(), |lines, index| {
+                    let fill = if (8..58).contains(&index) { 0 } else { index };
+                    let line = json!({"pcm": format!("{fill:02x}").repeat(640), "t": first + u64::from(index) * 20_000});
+                    format!("{lines}{line}\n")
+                })
+            ),
+        )?;
+        // a segment that cannot be written: the track begins, the frame is refused
+        fs::write(format!("{root}/audio/1/ear-z"), "")?;
+        let (mut broken, broken_hi) =
+            device(&root, r#"{"kind":"ear","name":"z","op":"device"}"#, 0)?;
+        same(
+            &frame(
+                &mut broken,
+                broken_hi["ping"].as_u64().unwrap_or_default(),
+                1,
+            )?
+            .to_string(),
+            &code("io"),
+        )?;
+        drop(take(&mut feed, 1)?);
+        // closing the ears closes the open segment, and its device is told
+        let (mut open, open_hi) = device(&root, r#"{"kind":"ear","name":"c","op":"device"}"#, 0)?;
+        let open_at = open_hi["ping"].as_u64().unwrap_or_default() - 1_000_000;
+        for index in 0..2 {
+            drop(frame(&mut open, open_at + index * 20_000, 3)?);
+        }
+        // an open segment reads back too
+        let open_first = take(&mut feed, 1)?[0]["start"].as_u64().unwrap_or_default();
+        same(
+            &rift(
+                &root,
+                &[],
+                &[
+                    "read",
+                    "ear-c",
+                    &open_first.to_string(),
+                    &(open_first + 40_000).to_string(),
+                ],
+            )?,
+            &format!(
+                "0\n{}\n{}\n",
+                json!({"pcm": "03".repeat(640), "t": open_first}),
+                json!({"pcm": "03".repeat(640), "t": open_first + 20_000})
+            ),
+        )?;
+        same(
+            &rift(&root, &[], &["ears", "off"])?,
+            "0\n{\"changed\":true,\"ok\":true,\"seq\":13}\n",
+        )?;
+        same(&next(&mut open)?, r#"{"ears":false}"#)?;
+        same(
+            &frame(&mut open, open_at + 40_000, 3)?.to_string(),
+            &code("closed"),
+        )?;
+        let closing = take(&mut feed, 2)?;
+        same(
+            &format!(
+                "{} {} {}",
+                closing[0]["kind"], closing[0]["samples"], closing[1]
+            ),
+            r#""segment" 640 {"kind":"ears","on":false}"#,
+        )?;
+        // a window of nothing: every closed segment moves to the archive, in log order
+        same(
+            &rift(&root, &[], &["keep", "0", &archive])?,
+            "0\n{\"ok\":true,\"seq\":14}\n",
+        )?;
+        let indexed: Vec<Value> = fs::read_to_string(format!("{archive}/index.ndjson"))?
+            .lines()
+            .map(serde_json::from_str)
+            .collect::<Result<_, _>>()?;
+        same(
+            &indexed
+                .iter()
+                .map(|event| event["e"]["path"].as_str().unwrap_or_default())
+                .collect::<Vec<_>>()
+                .join(" "),
+            "audio/1/ear-a/0.pcm audio/1/ear-a/1.pcm audio/1/ear-a/2.pcm audio/1/mouth-b/0.pcm audio/1/ear-c/0.pcm",
+        )?;
+        same(
+            &format!(
+                "{} {}",
+                fs::read(format!("{archive}/audio/1/ear-a/0.pcm"))? == fills(&[0, 1, 2, 3, 4]),
+                fs::exists(format!("{root}/audio/1/ear-a/0.pcm"))?
+            ),
+            "true false",
+        )?;
+        same(
+            &rift(
+                &root,
+                &[],
+                &[
+                    "read",
+                    "ear-a",
+                    &first.to_string(),
+                    &(first + 20_000).to_string(),
+                ],
+            )?,
+            &format!("1\n{}\n", code("gone")),
+        )?;
+        // no archive: a segment leaving the window is deleted
+        same(
+            &rift(&root, &[], &["keep", "0"])?,
+            "0\n{\"ok\":true,\"seq\":15}\n",
+        )?;
+        drop(rift(&root, &[], &["ears", "on"])?);
+        same(&next(&mut open)?, r#"{"ears":true}"#)?;
+        for index in 0..5 {
+            drop(frame(&mut open, open_at + 200_000 + index * 20_000, 4)?);
+        }
+        same(
+            &format!(
+                "{} {} {}",
+                fs::exists(format!("{root}/audio/1/ear-c/1.pcm"))?,
+                fs::exists(format!("{archive}/audio/1/ear-c/1.pcm"))?,
+                fs::read_to_string(format!("{archive}/index.ndjson"))?
+                    .lines()
+                    .count()
+            ),
+            "false false 5",
+        )?;
+        same(
+            &rift(&root, &[], &["keep", "5", &archive])?,
+            "0\n{\"ok\":true,\"seq\":19}\n",
+        )?;
+        same(
+            &say(&mut greet(&root)?, r#"{"op":"shutdown"}"#)?,
+            r#"{"ok":true}"#,
+        )?;
+        same(&format!("{:?}", daemon.0.wait()?.code()), "Some(0)")?;
+        // drained, not killed, so its coverage is written
+        let (mut restarted, again) = serve(&root, &envs)?;
+        same(
+            &say(&mut greet(&root)?, r#"{"op":"shutdown"}"#)?,
+            r#"{"ok":true}"#,
+        )?;
+        same(
+            &format!(
+                "{} {} {} {:?}",
+                again["archive"],
+                again["ears"],
+                again["window"],
+                restarted.0.wait()?.code()
+            ),
+            &format!("\"{archive}\" true 5 Some(0)"),
+        )
+    }
+
+    /// A kill mid-segment: the next boot cuts its torn tail to whole frames and closes it with its
+    /// event, its start the track's; the range reads back; the boot after finds it closed.
+    #[test]
+    fn resume() -> Outcome {
+        let root = temp("resume")?;
+        let (mut daemon, _) = serve(&root, &[])?;
+        drop(rift(&root, &[], &["ears", "on"])?);
+        let (mut ear, hi) = device(&root, r#"{"kind":"ear","name":"k","op":"device"}"#, 0)?;
+        let at = hi["ping"].as_u64().unwrap_or_default() - 1_000_000;
+        let mut placed = Vec::new();
+        for fill in 0u8..3 {
+            placed.push(frame(&mut ear, at + u64::from(fill) * 20_000, fill)?["t"].clone());
+        }
+        daemon.0.kill()?;
+        let _: ExitStatus = daemon.0.wait()?;
+        let segment = format!("{root}/audio/1/ear-k/0.pcm");
+        OpenOptions::new()
+            .append(true)
+            .open(&segment)?
+            .write_all(&[9; 100])?;
+        let (mut again, ready) = serve(&root, &[])?;
+        same(&ready["ears"].to_string(), "true")?;
+        let start = placed[0].as_u64().ok_or("unplaced")?;
+        same(
+            &events(&root)?.pop().ok_or("no events")?["e"].to_string(),
+            &json!({"kind": "segment", "n": 0u8, "path": "audio/1/ear-k/0.pcm", "samples": 960u16, "start": start, "track": "ear-k"}).to_string(),
+        )?;
+        same(&fs::metadata(&segment)?.len().to_string(), "1920")?;
+        let mut conn = greet(&root)?;
+        same(
+            &say(
+                &mut conn,
+                &json!({"from": start, "op": "read", "to": start + 60_000, "track": "ear-k"})
+                    .to_string(),
+            )?,
+            r#"{"ok":true}"#,
+        )?;
+        same(
+            &drain(&mut conn)?
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+            &(0u8..3)
+                .map(|fill| {
+                    json!({"pcm": format!("{fill:02x}").repeat(640), "t": placed[usize::from(fill)]})
+                        .to_string()
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )?;
+        same(
+            &say(&mut greet(&root)?, r#"{"op":"shutdown"}"#)?,
+            r#"{"ok":true}"#,
+        )?;
+        same(&format!("{:?}", again.0.wait()?.code()), "Some(0)")?;
+        // drained, not killed, so its coverage is written
+        let (mut third, _) = serve(&root, &[])?;
+        same(
+            &say(&mut greet(&root)?, r#"{"op":"shutdown"}"#)?,
+            r#"{"ok":true}"#,
+        )?;
+        same(&format!("{:?}", third.0.wait()?.code()), "Some(0)")?;
+        same(
+            &events(&root)?
+                .iter()
+                .rev()
+                .take(2)
+                .map(|event| event["e"]["kind"].to_string())
+                .collect::<Vec<_>>()
+                .join(" "),
+            r#""stop" "boot""#,
+        )
+    }
+
+    /// `rift device`: refused while the ears are closed, each refusal printed; sent as fast as
+    /// accepted, a ping answered on every frame, its frames contiguous segments ending by now, a
+    /// short last frame dropped; paced in real time; a missing file; a refused device request; a
+    /// live `rift listen` beside a device told the ears closed, then cut by the drain: `unknown`,
+    /// exit 1, while the listener ends cleanly.
+    #[test]
+    fn play() -> Outcome {
+        let root = temp("play")?;
+        let envs = [
+            ("RIFT_DRAIN_MS", "200"),
+            ("RIFT_PING_MS", "0"),
+            ("RIFT_SEGMENT_MS", "40"),
+        ];
+        let (mut daemon, _) = serve(&root, &envs)?;
+        let mut feed = greet(&root)?;
+        same(
+            &say(&mut feed, r#"{"after":null,"op":"feed"}"#)?,
+            r#"{"ok":true,"reset":false}"#,
+        )?;
+        drop(take(&mut feed, 1)?);
+        let file = format!("{root}/five.pcm");
+        fs::write(
+            &file,
+            (0u8..5)
+                .flat_map(|fill| [fill; 640])
+                .chain([7; 10])
+                .collect::<Vec<_>>(),
+        )?;
+        let refused = rift(&root, &[], &["device", "ear", "cli", &file, "--fast"])?;
+        same(
+            &refused
+                .lines()
+                .filter(|&line| line != "0")
+                .skip(1)
+                .collect::<Vec<_>>()
+                .join("\n"),
+            &[
+                code("closed"),
+                code("closed"),
+                code("closed"),
+                code("closed"),
+                code("closed"),
+            ]
+            .join("\n"),
+        )?;
+        drop(rift(&root, &[], &["ears", "on"])?);
+        let fast = rift(&root, &[], &["device", "ear", "cli", &file, "--fast"])?;
+        same(
+            &format!(
+                "{} {}",
+                fast.lines().count(),
+                fast.contains(r#""track":"ear-cli""#)
+            ),
+            "2 true",
+        )?;
+        let logged = take(&mut feed, 5)?;
+        let start = logged[1]["start"].as_u64().unwrap_or_default();
+        same(
+            &format!(
+                "{} {} {} {}",
+                logged[2]["samples"],
+                logged[3]["samples"],
+                logged[4]["samples"],
+                [&logged[3], &logged[4]]
+                    .iter()
+                    .zip([start + 40_000, start + 80_000])
+                    .all(|(event, at)| event["start"] == at)
+            ),
+            "640 640 320 true",
+        )?;
+        same(
+            &(start + 100_000
+                <= u64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_micros())?)
+            .to_string(),
+            "true",
+        )?;
+        let begun = Instant::now();
+        same(
+            &rift(&root, &[], &["device", "mouth", "paced", &file])?
+                .lines()
+                .count()
+                .to_string(),
+            "2",
+        )?;
+        same(
+            &(begun.elapsed() >= Duration::from_millis(80)).to_string(),
+            "true",
+        )?;
+        same(
+            &rift(&root, &[], &["device", "ear", "x", "/nonexistent.pcm"])?,
+            "1\nrift device: No such file or directory (os error 2)\n",
+        )?;
+        same(
+            &rift(&root, &[], &["device", "nose", "x", &file])?,
+            &format!("1\n{}\n", code("bad_request")),
+        )?;
+        let long = format!("{root}/long.pcm");
+        fs::write(&long, vec![1; 64_000])?;
+        let spawn = |args: &[&str]| {
+            Command::new(env!("CARGO_BIN_EXE_rift"))
+                .env("RIFT_ROOT", &root)
+                .args(args)
+                .stdout(Stdio::piped())
+                .spawn()
+        };
+        let (mut listener, mut player) = (
+            spawn(&["listen", "ear-long"])?,
+            spawn(&["device", "ear", "long", &long])?,
+        );
+        let mut heard = String::new();
+        let _: usize =
+            BufReader::new(listener.stdout.take().ok_or("stdout")?).read_line(&mut heard)?;
+        same(
+            &serde_json::from_str::<Value>(&heard)?["pcm"].to_string(),
+            &format!("\"{}\"", "01".repeat(640)),
+        )?;
+        drop(rift(&root, &[], &["ears", "off"])?);
+        same(
+            &say(&mut greet(&root)?, r#"{"op":"shutdown"}"#)?,
+            r#"{"ok":true}"#,
+        )?;
+        let mut said = String::new();
+        let _: usize =
+            io::Read::read_to_string(&mut player.stdout.take().ok_or("stdout")?, &mut said)?;
+        let lines: Vec<&str> = said.lines().collect();
+        same(
+            &format!(
+                "{} {} {:?} {:?} {:?}",
+                lines.get(1).unwrap_or(&""),
+                lines.last().unwrap_or(&""),
+                player.wait()?.code(),
+                listener.wait()?.code(),
+                daemon.0.wait()?.code()
+            ),
+            &format!(
+                "{{\"ears\":false}} {} Some(1) Some(0) Some(0)",
+                code("unknown")
+            ),
+        )
+    }
+
     /// `serve` refuses a socket path over 103 bytes and a `run/` others can reach; a panic (the
     /// ready line into a closed stdout) is logged before the process dies.
     #[test]
@@ -893,10 +1496,13 @@ mod tests {
                 "1\n{\"code\":\"down\",\"ok\":false}\n",
             )?;
         }
-        let usage = "2\nusage: rift serve | status | quiet on|off | feed [--after <boot>:<seq>] | setup [--print | --remove] | upgrade [--check | --back | --retry] | version\n";
+        let usage = "2\nusage: rift serve | status | quiet on|off | ears on|off | keep <window s> [<archive>] | feed [--after <boot>:<seq>] | listen <track> | read <track> <from us> <to us> | device ear|mouth <name> <file.pcm> [--fast] | setup [--print | --remove] | upgrade [--check | --back | --retry] | version\n";
         for args in [
             &[][..],
+            &["device", "ear", "a"],
+            &["keep", "x"],
             &["quiet", "maybe"],
+            &["read", "ear-a", "1", "x"],
             &["feed", "--after", "1"],
             &["feed", "--after", "a:1"],
             &["setup", "--now"],
