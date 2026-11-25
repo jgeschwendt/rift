@@ -101,7 +101,12 @@ anything is written), `gui/<id -u>` the domain, each call that changes something
    rift renames its own copy so it does not rest on codesign's internals. A locked keychain makes
    `codesign`, and `security show-keychain-info`, ask at the screen rather than fail, hence the
    unlock first and the deadline; the linker's ad-hoc signature leaves `Info.plist=not bound`, the
-   re-sign binds it (`Info.plist entries=3`);
+   re-sign binds it (`Info.plist entries=3`). On a Mac (observed 2026-11-25): a signed copy run
+   as `device ear <name> --mic` under launchd is asked once, and while the prompt waits the open
+   blocks, so the device exits on `$RIFT_OPEN_MS` and a restart after Allow records; a rebuild
+   under another version, signed by the same identity, records with no prompt; `ears off` stops
+   the segments. Each open leaves one hole of about 25 ms after its first segment, cause not
+   found;
 5. the plist by temp + rename (`wrote <path>`);
 6. the same plist already loaded: `kickstart -k`, the swap; else booted out when loaded, then
    `bootstrap`;
