@@ -89,10 +89,11 @@ anything is written), `gui/<id -u>` the domain, each call that changes something
    one `sh -c`: `openssl req -x509 -newkey rsa:2048 -nodes -days 36500 -subj /CN=rift` with
    `keyUsage=critical,digitalSignature` and `extendedKeyUsage=critical,codeSigning`, `openssl
    pkcs12 -export` 3DES with a SHA-1 MAC (LibreSSL's and OpenSSL 3's alike readable by `security`),
-   `security import -T /usr/bin/codesign`, `security set-key-partition-list -S apple-tool:,apple:
-   -s`, in `<root>/identity.new/`, removed on exit (`made the code-signing identity <sha1> in
-   <keychain>`); then `codesign -v -R=identifier "dev.gigantic.rift" and certificate leaf =
-   H"<sha1>"` on the canonical release, and when that fails, the release copied to `<release>.new`,
+   `security import -T /usr/bin/codesign`, in `<root>/identity.new/`, removed on exit (`made the
+   code-signing identity <sha1> in <keychain>`); `security set-key-partition-list -S
+   apple-tool:,apple: -s` every run, so an import a failure left without it never prompts; then
+   `codesign -v -R=identifier "dev.gigantic.rift" and certificate leaf = H"<sha1>"` on the
+   canonical release, and when that fails, the release copied to `<release>.new`,
    `codesign -f -s <sha1> --keychain <keychain> -i dev.gigantic.rift` on the copy, renamed over the
    release (`signed <release> as dev.gigantic.rift by <sha1>`), the copy removed on a failure.
    Observed (observed 2026-11-25): `codesign -f -s` in place already writes a new inode, and a

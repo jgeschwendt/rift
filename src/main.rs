@@ -409,7 +409,8 @@ fn main() -> ExitCode {
     };
     match (words.as_slice(), asked) {
         (&[verb, ..], Some(wanted)) => {
-            let mic = verb == "device" && words.get(3) == Some(&"--mic");
+            // an ear's alone: a mouth's `--mic` is the file it plays
+            let mic = matches!(*words.as_slice(), ["device", "ear", _, "--mic", ..]);
             #[cfg(not(target_os = "macos"))]
             if mic {
                 eprintln!("rift device: --mic is macOS only; a file-fed device plays anywhere");
@@ -1619,8 +1620,7 @@ fn main() -> ExitCode {
                 if hash.is_empty() {
                     // the key and certificate in a 0700 directory, gone once imported; the bundle
                     // 3DES with a SHA-1 MAC, which `security import` reads from LibreSSL and
-                    // OpenSSL 3 alike; the partition list, else codesign's first use of the key
-                    // asks at the screen
+                    // OpenSSL 3 alike
                     need(
                         "sh",
                         &[
@@ -1628,8 +1628,7 @@ fn main() -> ExitCode {
                             r#"set -e; rm -rf "$1"; mkdir -m 700 "$1"; trap 'rm -rf "$1"' EXIT
 openssl req -x509 -newkey rsa:2048 -nodes -days 36500 -subj /CN=rift -addext keyUsage=critical,digitalSignature -addext extendedKeyUsage=critical,codeSigning -keyout "$1/key.pem" -out "$1/cert.pem"
 openssl pkcs12 -export -inkey "$1/key.pem" -in "$1/cert.pem" -out "$1/identity.p12" -passout "pass:$2" -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES -macalg sha1
-security import "$1/identity.p12" -k "$3" -P "$2" -T /usr/bin/codesign
-security set-key-partition-list -S apple-tool:,apple: -s -k "$2" "$3" >/dev/null"#,
+security import "$1/identity.p12" -k "$3" -P "$2" -T /usr/bin/codesign"#,
                             "sh",
                             &root.join("identity.new").to_string_lossy(),
                             &secret,
@@ -1642,6 +1641,20 @@ security set-key-partition-list -S apple-tool:,apple: -s -k "$2" "$3" >/dev/null
                         keychain.display()
                     );
                 }
+                // every run, else codesign's use of the key asks at the screen: an import that a
+                // failure or a kill left without one is found next run and never made again
+                need(
+                    "security",
+                    &[
+                        "set-key-partition-list",
+                        "-S",
+                        "apple-tool:,apple:",
+                        "-s",
+                        "-k",
+                        &secret,
+                        &kc,
+                    ],
+                )?;
                 // the release itself, not the link: signed unless it already is, by this identity
                 let target = fs::canonicalize(&linked)?;
                 let program = target.to_string_lossy();

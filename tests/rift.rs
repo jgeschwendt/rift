@@ -1763,10 +1763,13 @@ mod tests {
             &(begun.elapsed() >= Duration::from_millis(80)).to_string(),
             "true",
         )?;
-        same(
-            &rift(&root, &[], &["device", "ear", "x", "/nonexistent.pcm"])?,
-            "1\nrift device: No such file or directory (os error 2)\n",
-        )?;
+        // a mouth's `--mic` is a file it plays, never the microphone
+        for absent in ["/nonexistent.pcm", "--mic"] {
+            same(
+                &rift(&root, &[], &["device", "mouth", "x", absent])?,
+                "1\nrift device: No such file or directory (os error 2)\n",
+            )?;
+        }
         same(
             &rift(&root, &[], &["device", "nose", "x", &file])?,
             &format!("1\n{}\n", code("bad_request")),
@@ -2216,10 +2219,11 @@ esac
                 "wrote {at}/rift.keychain-pass\nmade {at}/rift.keychain-db\nmade the code-signing identity {hash} in {at}/rift.keychain-db\nsigned {release} as dev.gigantic.rift by {hash}\n"
             )
         };
-        let steady =
-            format!("security unlock-keychain\nsecurity find-identity\ncodesign -v {release}\n");
+        let steady = format!(
+            "security unlock-keychain\nsecurity find-identity\nsecurity set-key-partition-list\ncodesign -v {release}\n"
+        );
         let fresh = format!(
-            "security create-keychain\nsecurity set-keychain-settings\nsecurity unlock-keychain\nsecurity find-identity\nopenssl req\nopenssl pkcs12\nsecurity import\nsecurity set-key-partition-list\nsecurity find-identity\ncodesign -v {release}\ncodesign -f {release}.new\n"
+            "security create-keychain\nsecurity set-keychain-settings\nsecurity unlock-keychain\nsecurity find-identity\nopenssl req\nopenssl pkcs12\nsecurity import\nsecurity find-identity\nsecurity set-key-partition-list\ncodesign -v {release}\ncodesign -f {release}.new\n"
         );
         let first = format!("{}{}{}", run(&stubbed, &[], &[])?, calls()?, signs()?);
         same(
@@ -2389,6 +2393,15 @@ esac
                 "1\n{linked}rift setup: sh -c: import failed\nprint {job}\n{tended}security unlock-keychain\nsecurity find-identity\nopenssl req\nopenssl pkcs12\nsecurity import\n"
             ),
         )?;
+        // an identity imported without its partition list gets one the next run, before codesign
+        let partial = anew("fail-set-key-partition-list")?;
+        let minted = id(&blank)?;
+        same(
+            &format!("{partial}{}", anew("fail-codesign")?),
+            &format!(
+                "1\n{linked}made the code-signing identity {minted} in {blank}/rift.keychain-db\nrift setup: security set-key-partition-list: set-key-partition-list failed\nprint {job}\n{tended}security unlock-keychain\nsecurity find-identity\nopenssl req\nopenssl pkcs12\nsecurity import\nsecurity find-identity\nsecurity set-key-partition-list\n1\n{linked}rift setup: codesign -f: {release}.new: not a Mach-O file\nprint {job}\n{tended}{steady}codesign -f {release}.new\n"
+            ),
+        )?;
         // a changed plist: booted out, waited out, bootstrapped; its absent root made first
         let moved = format!("{root}/moved");
         let rerun = |args: &[&str], envs: &[(&str, &str)]| {
@@ -2494,7 +2507,7 @@ esac
         let fake = format!("{root}/fake");
         fs::create_dir_all(format!("{fake}/inputs"))?;
         fs::write(format!("{fake}/inputs/Desk Mic"), "48000 2 0.25 0.5")?;
-        fs::write(format!("{fake}/inputs/Room Mic"), "44100 1 -0.5 0")?;
+        fs::write(format!("{fake}/inputs/Hall Mic"), "44100 1 -0.5 0")?;
         fs::write(format!("{fake}/default"), "Desk Mic\n")?;
         let envs = [("RIFT_MIC", fake.as_str()), ("RIFT_POLL_MS", "100")];
         let (daemon, _) = serve(&root, &[("RIFT_SEGMENT_MS", "200")])?;
@@ -2554,7 +2567,7 @@ esac
             BufReader::new(spare.0.stderr.take().ok_or("stderr")?).read_line(&mut said)?;
         same(
             &said,
-            "rift device: waiting for \"Spare Mic\"; the inputs present: Desk Mic, Room Mic\n",
+            "rift device: waiting for \"Spare Mic\"; the inputs present: Desk Mic, Hall Mic\n",
         )?;
         fs::write(format!("{fake}/inputs/Spare Mic"), "16000 1 0.5 0")?;
         until(|| {
@@ -2563,19 +2576,19 @@ esac
                     .any(|event| event["kind"] == "segment" && event["mic"] == "Spare Mic")
             }))
         })?;
-        fs::write(format!("{fake}/default"), "Room Mic\n")?;
+        fs::write(format!("{fake}/default"), "Hall Mic\n")?;
         fs::remove_file(format!("{fake}/inputs/Spare Mic"))?;
         until(|| {
             Ok(stream("ear-desk").is_ok_and(|held| {
                 held.iter()
-                    .any(|event| event["kind"] == "segment" && event["mic"] == "Room Mic")
+                    .any(|event| event["kind"] == "segment" && event["mic"] == "Hall Mic")
             }) && log().contains("close Spare Mic"))
         })?;
-        // one microphone per segment: the change closes Desk Mic's and a hole opens Room Mic's
+        // one microphone per segment: the change closes Desk Mic's and a hole opens Hall Mic's
         let desk_events = stream("ear-desk")?;
         let change = desk_events
             .iter()
-            .position(|event| event["mic"] == "Room Mic")
+            .position(|event| event["mic"] == "Hall Mic")
             .ok_or("no change")?;
         same(
             &format!(
@@ -2586,19 +2599,19 @@ esac
                     .map_or(Value::Null, |event| json!([event["kind"], event["mic"]])),
                 json!([desk_events[change]["kind"], desk_events[change]["mic"]])
             ),
-            r#""track" ["segment","Desk Mic"] ["hole","Room Mic"]"#,
+            r#""track" ["segment","Desk Mic"] ["hole","Hall Mic"]"#,
         )?;
         drop(rift(&root, &[], &["ears", "off"])?);
-        until(|| Ok(log().contains("close Room Mic")))?;
+        until(|| Ok(log().contains("close Hall Mic")))?;
         let mut opened: Vec<&str> = log().leak().lines().collect();
         opened.sort_unstable();
         same(
             &opened.join("\n"),
-            "close Desk Mic\nclose Room Mic\nclose Spare Mic\nopen Desk Mic\nopen Room Mic\nopen Spare Mic",
+            "close Desk Mic\nclose Hall Mic\nclose Spare Mic\nopen Desk Mic\nopen Hall Mic\nopen Spare Mic",
         )?;
         // the ears on again, a segment torn by a kill keeps its microphone
         drop(rift(&root, &[], &["ears", "on"])?);
-        until(|| Ok(log().matches("open Room Mic").count() == 2))?;
+        until(|| Ok(log().matches("open Hall Mic").count() == 2))?;
         until(|| {
             Ok(fs::read_dir(format!("{root}/audio/1/ear-desk"))?.count()
                 > desk_events
@@ -2632,7 +2645,7 @@ esac
                 .find(|event| event["boot"] == 2u8 && event["e"]["kind"] == "segment")
                 .map_or(Value::Null, |event| event["e"]["mic"].clone())
                 .to_string(),
-            "\"Room Mic\"",
+            "\"Hall Mic\"",
         )?;
         let (mut raw, _) = device(&root, r#"{"kind":"ear","name":"raw","op":"device"}"#, 0)?;
         let line = json!({"mic": 5u8, "op": "frame", "pcm": "00".repeat(640), "t": 1u8});
@@ -2680,7 +2693,7 @@ esac
             BufReader::new(lost.0.stderr.take().ok_or("stderr")?).read_line(&mut waiting)?;
         same(
             &waiting,
-            "rift device: waiting for a default input; the inputs present: Broken, Desk Mic, Room Mic, Silent, Stuck\n",
+            "rift device: waiting for a default input; the inputs present: Broken, Desk Mic, Hall Mic, Silent, Stuck\n",
         )?;
         same(
             &say(&mut greet(&root)?, r#"{"op":"shutdown"}"#)?,
