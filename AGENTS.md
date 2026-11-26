@@ -28,7 +28,7 @@ its lines open a real microphone, which no test may, so it holds those lines and
 | `src/ear.rs` | macOS: `device ear <name> --mic`, its loop, the Bluetooth rule (`pick`), the 16 kHz converter, and `Fake`, the suite's microphones under `$RIFT_MIC` |
 | `src/mic.rs` | macOS: the cpal lines and coreaudio-rs's transport and built-in lookups alone, exempt from coverage |
 | `build.rs` | the build identity: `$RIFT_VERSION` (the release workflow's), else the crate version; then the short commit, `-dirty` over uncommitted work, `unknown` outside git; on macOS the Info.plist linked in |
-| `tests/rift.rs` | the end-to-end suite: the built binary over temp roots via `RIFT_ROOT`, stub `launchctl`, `curl`, `security`, `openssl`, `codesign` and `scutil` planted on `PATH` and a temp `HOME` (also `HOTSWAP_TEST_HOME`) hotswap's layout is laid out in, a copy of the build its release, for `setup` and `upgrade`; `$RIFT_MIC`'s fake inputs for `--mic`; a `Daemon` guard kills every process it holds, so one whose lines must count toward coverage ends by itself instead (a daemon by `shutdown`, a file-fed device with its daemon, a `--mic` one by a stop signal): a killed process writes no profile |
+| `tests/rift.rs` | the end-to-end suite: the built binary over temp roots via `RIFT_ROOT`, stub `launchctl`, `curl`, `security`, `openssl`, `codesign` and `scutil` planted on `PATH` and a temp `HOME` (also `HOTSWAP_TEST_HOME`) hotswap's layout is laid out in, a copy of the build its release, for `setup` and `upgrade`; `$RIFT_MIC`'s fake inputs for `--mic`; a `Daemon` guard kills every process it holds, so one whose lines must count toward coverage ends by itself instead (a daemon by `shutdown`, a file-fed device with its daemon, a `--mic` one by a stop signal): a killed process writes no profile; `Started` kills what the `launchctl` stub started (its pids under `loaded/` and in `holder`, each checked to be this build), whose `bootout` and `kickstart` wait for the process to exit as launchd's do, so a new daemon never meets the old one's lock; every command run to its end goes through `bounded`, killed and named past 60 s |
 | `docs/index.html` | the design page: what rift is today and what it will be |
 | `docs/protocol.html` | the wire contract, protocol 1 |
 
@@ -86,7 +86,8 @@ LocalHostName` (resolved from `PATH`, under `$RIFT_SIGN_MS`) lowercased, asked o
 and an install: `setup --print` prints both and writes nothing, the daemon's alone when there is no
 name (no `scutil`, off macOS); an install refuses one that is no track name (unset, or past
 `well`) in one line, exit 1, right after the `launchctl` check, before anything is written;
-`--remove` asks for none. `setup`, `launchctl` resolved from `PATH` (none, as on Linux: one line,
+`--remove` asks for none. `setup`, `launchctl` resolved from `PATH` and killed past
+`$RIFT_SIGN_MS` like every tool setup calls (none, as on Linux: one line,
 exit 1, before anything is written), `gui/<id -u>` the domain, each call that changes something
 printed:
 

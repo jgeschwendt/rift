@@ -1495,7 +1495,7 @@ fn main() -> ExitCode {
             let heard = path.with_file_name(format!("{ear}.plist"));
             let install = || -> io::Result<()> {
                 // a tool call past `$RIFT_SIGN_MS` is killed, since a keychain asking at the
-                // screen would hold setup forever
+                // screen, or a launchctl that never answers, would hold setup forever
                 let allowed = Duration::from_millis(setting("RIFT_SIGN_MS", 30_000));
                 let ask = |name: &str, line: &[&str]| -> io::Result<Output> {
                     let said = format!("{name} {}", line.first().unwrap_or(&""));
@@ -1562,9 +1562,11 @@ fn main() -> ExitCode {
                 }
                 let uid = Command::new("id").arg("-u").output()?.stdout;
                 let gui = format!("gui/{}", String::from_utf8_lossy(&uid).trim());
+                // under the same deadline as the signing tools: a launchctl that never answers
+                // fails setup naming it, never holds it
                 let call = |line: &[&str]| {
-                    Command::new("launchctl").args(line).output().map_err(|cause| {
-                        io::Error::other(format!("launchctl: {cause} (setup installs launchd agents, macOS only; --print prints their plists)"))
+                    ask("launchctl", line).map_err(|cause| {
+                        io::Error::other(format!("{cause} (setup installs launchd agents, macOS only; --print prints their plists)"))
                     })
                 };
                 let must = |line: &[&str]| {

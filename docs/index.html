@@ -443,7 +443,7 @@
         <tr><td class="table-mono">RIFT_RELOAD_MS</td><td><code class="code">setup</code>'s wait for health ready, or the ear among its devices, before it loads that agent afresh, once, default 15000 (past launchd's 10 s respawn hold)</td></tr>
         <tr><td class="table-mono">RIFT_ROOT</td><td>the state root, default <code class="code">~/.local/state/rift</code>; the socket path under it must fit 103 bytes</td></tr>
         <tr><td class="table-mono">RIFT_SEGMENT_MS</td><td>a segment's length, in whole 20 ms frames, at least one, default 10000</td></tr>
-        <tr><td class="table-mono">RIFT_SIGN_MS</td><td>how long <code class="code">setup</code> lets each <code class="code">security</code>, <code class="code">openssl</code> and <code class="code">codesign</code> call run before killing it, default 30000</td></tr>
+        <tr><td class="table-mono">RIFT_SIGN_MS</td><td>how long <code class="code">setup</code> lets each <code class="code">launchctl</code>, <code class="code">scutil</code>, <code class="code">security</code>, <code class="code">openssl</code> and <code class="code">codesign</code> call run before killing it and failing, naming the call, default 30000</td></tr>
         <tr><td class="table-mono">RIFT_ZERO_MS</td><td>how long a microphone may give only exact zeros after its open before <code class="code">--mic</code> closes it as a failed open, naming the grant, default 2000</td></tr>
       </tbody>
     </table>

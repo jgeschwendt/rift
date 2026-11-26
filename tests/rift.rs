@@ -19,7 +19,7 @@ mod tests {
     use std::iter;
     use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _, symlink};
     use std::os::unix::net::{UnixListener, UnixStream};
-    use std::process::{Child, ChildStderr, Command, ExitStatus, Stdio, id};
+    use std::process::{Child, ChildStderr, Command, ExitStatus, Output, Stdio, id};
     use std::sync::mpsc;
     use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -45,12 +45,65 @@ mod tests {
 
     impl Drop for Volume {
         fn drop(&mut self) {
-            drop(
-                Command::new("hdiutil")
-                    .args(["detach", "-force", &self.0])
-                    .output(),
-            );
+            drop(bounded(
+                Command::new("hdiutil").args(["detach", "-force", &self.0]),
+                "hdiutil detach",
+            ));
         }
+    }
+
+    /// The processes the `launchctl` stub started under a root, by the pids it wrote under
+    /// `loaded/` and in `holder`: each still this build's binary is killed when it drops, on every
+    /// path, a failed assertion's included.
+    struct Started(String);
+
+    impl Drop for Started {
+        fn drop(&mut self) {
+            let files = fs::read_dir(format!("{}/loaded", self.0))
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|entry| entry.path().display().to_string())
+                .chain([format!("{}/holder", self.0)]);
+            for held in files.filter_map(|file| fs::read_to_string(file).ok()) {
+                // a pid file is a hint: signalled only while it names this build's binary
+                let pid = held.trim();
+                let ours = bounded(Command::new("ps").args(["-o", "comm=", "-p", pid]), "ps")
+                    .is_ok_and(|out| {
+                        String::from_utf8_lossy(&out.stdout).trim() == env!("CARGO_BIN_EXE_rift")
+                    });
+                if ours {
+                    drop(bounded(Command::new("kill").args(["-9", pid]), "kill"));
+                }
+            }
+        }
+    }
+
+    /// `command` run to its end, its output kept; past a minute it is killed and the test fails
+    /// naming `what`, so a command that never answers is a red test, never a held suite.
+    fn bounded(command: &mut Command, what: &str) -> Result<Output, Box<dyn Error>> {
+        let child = command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let (pid, (done, ended)) = (child.id().to_string(), mpsc::channel::<()>());
+        let watch = thread::spawn(move || {
+            let late = matches!(
+                ended.recv_timeout(Duration::from_secs(60)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            );
+            if late {
+                drop(Command::new("kill").args(["-9", &pid]).status());
+            }
+            late
+        });
+        let out = child.wait_with_output()?;
+        drop(done);
+        if watch.join().unwrap_or_default() {
+            return Err(format!("{what}: no answer in 60 s").into());
+        }
+        Ok(out)
     }
 
     /// `left` equal to `right`, else an error showing both.
@@ -72,12 +125,13 @@ mod tests {
 
     /// `rift args` over `root` with `envs`: its exit code, a newline, its stdout, then its stderr.
     fn rift(root: &str, envs: &[(&str, &str)], args: &[&str]) -> Result<String, Box<dyn Error>> {
-        let out = Command::new(env!("CARGO_BIN_EXE_rift"))
-            .env("RIFT_ROOT", root)
-            .envs(envs.iter().copied())
-            .args(args)
-            .stdin(Stdio::null())
-            .output()?;
+        let out = bounded(
+            Command::new(env!("CARGO_BIN_EXE_rift"))
+                .env("RIFT_ROOT", root)
+                .envs(envs.iter().copied())
+                .args(args),
+            &format!("rift {}", args.join(" ")),
+        )?;
         Ok(format!(
             "{}\n{}{}",
             out.status.code().unwrap_or(-1),
@@ -427,9 +481,10 @@ mod tests {
 
     /// `kill -<signal>` to `daemon`, not waiting: `kill`'s stderr, empty when delivered.
     fn signal(daemon: &Daemon, name: &str) -> Result<String, Box<dyn Error>> {
-        let out = Command::new("kill")
-            .args([format!("-{name}"), daemon.0.id().to_string()])
-            .output()?;
+        let out = bounded(
+            Command::new("kill").args([format!("-{name}"), daemon.0.id().to_string()]),
+            "kill",
+        )?;
         Ok(String::from_utf8(out.stderr)?)
     }
 
@@ -447,7 +502,7 @@ mod tests {
             ][..],
             &["attach", "-nobrowse", "-mountpoint", &vol, &image],
         ] {
-            let out = Command::new("hdiutil").args(args).output()?;
+            let out = bounded(Command::new("hdiutil").args(args), "hdiutil")?;
             same(&out.status.success().to_string(), "true")?;
         }
         let _volume = Volume(vol.clone());
@@ -644,13 +699,15 @@ mod tests {
             )?;
             feeds.push((conn, replay));
         }
-        let cli = |after: &str| {
-            Command::new(env!("CARGO_BIN_EXE_rift"))
-                .env("RIFT_ROOT", &root)
-                .args(["feed", "--after", after])
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
+        let cli = |after: &str| -> io::Result<Daemon> {
+            Ok(Daemon(
+                Command::new(env!("CARGO_BIN_EXE_rift"))
+                    .env("RIFT_ROOT", &root)
+                    .args(["feed", "--after", after])
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()?,
+            ))
         };
         same(
             &rift(&root, &[], &["quiet", "off"])?,
@@ -660,7 +717,7 @@ mod tests {
         let (mut held, mut lost) = (cli("2:1")?, cli("9:9")?);
         let mut outs = Vec::new();
         for child in [&mut held, &mut lost] {
-            let mut out = BufReader::new(child.stdout.take().ok_or("stdout")?);
+            let mut out = BufReader::new(child.0.stdout.take().ok_or("stdout")?);
             let mut first = String::new();
             let _: usize = out.read_line(&mut first)?;
             outs.push((first, out));
@@ -694,7 +751,7 @@ mod tests {
         )?;
         let mut said = String::new();
         let _: usize =
-            io::Read::read_to_string(&mut lost.stderr.take().ok_or("stderr")?, &mut said)?;
+            io::Read::read_to_string(&mut lost.0.stderr.take().ok_or("stderr")?, &mut said)?;
         same(
             &said,
             "rift feed: the log does not hold that position; from this boot's first event\n",
@@ -702,8 +759,8 @@ mod tests {
         same(
             &format!(
                 "{:?} {:?} {:?}",
-                held.wait()?.code(),
-                lost.wait()?.code(),
+                held.0.wait()?.code(),
+                lost.0.wait()?.code(),
                 again.0.wait()?.code()
             ),
             "Some(0) Some(0) Some(0)",
@@ -847,7 +904,10 @@ mod tests {
             .get_ref()
             .set_read_timeout(Some(Duration::from_secs(2)))?;
         same(
-            &format!("{}", Command::new("mkfifo").arg(&log).status()?),
+            &format!(
+                "{}",
+                bounded(Command::new("mkfifo").arg(&log), "mkfifo")?.status
+            ),
             "exit status: 0",
         )?;
         let mut feed = greet(&root)?;
@@ -1634,9 +1694,8 @@ mod tests {
         let stuck = format!("{archive}/audio/1/ear-s/0.pcm");
         fs::create_dir_all(format!("{archive}/audio/1/ear-s"))?;
         same(
-            &Command::new("mkfifo")
-                .arg(&stuck)
-                .status()?
+            &bounded(Command::new("mkfifo").arg(&stuck), "mkfifo")?
+                .status
                 .success()
                 .to_string(),
             "true",
@@ -1825,6 +1884,7 @@ mod tests {
                 .args(args)
                 .stdout(Stdio::piped())
                 .spawn()
+                .map(Daemon)
         };
         let (mut listener, mut player) = (
             spawn(&["listen", "ear-long"])?,
@@ -1832,14 +1892,14 @@ mod tests {
         );
         let mut heard = String::new();
         let _: usize =
-            BufReader::new(listener.stdout.take().ok_or("stdout")?).read_line(&mut heard)?;
+            BufReader::new(listener.0.stdout.take().ok_or("stdout")?).read_line(&mut heard)?;
         same(
             &serde_json::from_str::<Value>(&heard)?["pcm"].to_string(),
             &format!("\"{}\"", "01".repeat(640)),
         )?;
         drop(rift(&root, &[], &["ears", "off"])?);
         // told before the drain, which then cuts it whether its next write or read fails
-        let mut said = BufReader::new(player.stdout.take().ok_or("stdout")?).lines();
+        let mut said = BufReader::new(player.0.stdout.take().ok_or("stdout")?).lines();
         let before = said
             .by_ref()
             .map_while(Result::ok)
@@ -1853,8 +1913,8 @@ mod tests {
             &format!(
                 "{before} {} {:?} {:?} {:?}",
                 said.map_while(Result::ok).last().unwrap_or_default(),
-                player.wait()?.code(),
-                listener.wait()?.code(),
+                player.0.wait()?.code(),
+                listener.0.wait()?.code(),
                 daemon.0.wait()?.code()
             ),
             &format!("1 {} Some(1) Some(0) Some(0)", code("unknown")),
@@ -2074,6 +2134,7 @@ mod tests {
     #[test]
     fn setup() -> Outcome {
         let root = temp("setup")?;
+        let _started = Started(root.clone());
         let (home, bin) = (format!("{root}/home"), format!("{root}/bin"));
         let file = format!("{home}/Library/LaunchAgents/dev.gigantic.rift.plist");
         let exe = format!("{home}/.local/bin/rift");
@@ -2155,32 +2216,36 @@ mod tests {
             &format!("0\n{}{}", plist(&data), ear(&data)),
         )?;
         // no RIFT_ROOT: the default under HOME
-        let out = Command::new(env!("CARGO_BIN_EXE_rift"))
-            .env("HOME", &home)
-            .env("PATH", &named)
-            .env_remove("RIFT_ROOT")
-            .args(["setup", "--print"])
-            .output()?;
+        let out = bounded(
+            Command::new(env!("CARGO_BIN_EXE_rift"))
+                .env("HOME", &home)
+                .env("PATH", &named)
+                .env_remove("RIFT_ROOT")
+                .args(["setup", "--print"]),
+            "rift setup --print",
+        )?;
         let state = format!("{home}/.local/state/rift");
         same(
             &String::from_utf8(out.stdout)?,
             &format!("{}{}", plist(&state), ear(&state)),
         )?;
         // a relative RIFT_ROOT: made absolute against where setup ran, as launchd runs from /
-        let relative = Command::new(env!("CARGO_BIN_EXE_rift"))
-            .current_dir(&root)
-            .env("HOME", &home)
-            .env("PATH", &named)
-            .env("RIFT_ROOT", "data")
-            .args(["setup", "--print"])
-            .output()?;
+        let relative = bounded(
+            Command::new(env!("CARGO_BIN_EXE_rift"))
+                .current_dir(&root)
+                .env("HOME", &home)
+                .env("PATH", &named)
+                .env("RIFT_ROOT", "data")
+                .args(["setup", "--print"]),
+            "rift setup --print",
+        )?;
         same(
             &String::from_utf8(relative.stdout)?,
             &format!("{}{}", plist(&data), ear(&data)),
         )?;
         same(
             &run("/usr/bin", &[], &[])?,
-            "1\nrift setup: launchctl: No such file or directory (os error 2) (setup installs launchd agents, macOS only; --print prints their plists)\n",
+            "1\nrift setup: launchctl print: No such file or directory (os error 2) (setup installs launchd agents, macOS only; --print prints their plists)\n",
         )?;
         same(&fs::exists(&home)?.to_string(), "false")?;
         fs::create_dir_all(&bin)?;
@@ -2192,13 +2257,14 @@ mod tests {
 printf '%s\n' "$*" >> {root}/launchctl.log
 job=${{2##*/}}
 start() {{ [ -f {root}/dead ] && return; case $1 in *.ear.plist) [ -f {root}/deaf ] && return;; esac; RIFT_ROOT=$(sed -n 's|.*<key>RIFT_ROOT</key><string>\(.*\)</string>.*|\1|p' $1) RIFT_MIC={root}/fake RIFT_POLL_MS=100 {serve} $(sed -n 's|.*<array><string>[^<]*</string>\(.*\)</array>|\1|p' $1 | sed 's|<string>||g; s|</string>| |g') >/dev/null 2>&1 & echo $! > {root}/loaded/$(basename $1 .plist); }}
+stop() {{ kill $1 2>/dev/null || return 0; while kill -0 $1 2>/dev/null; do sleep 0.02; done; }}
 hold() {{ until RIFT_ROOT=$1 {serve} status | grep -q ready; do sleep 0.05; done; RIFT_ROOT=$1 RIFT_MIC={root}/fake {serve} device ear test-mac --mic >/dev/null 2>&1 & echo $! > {root}/holder; until RIFT_ROOT=$1 {serve} status | grep -q ear-test-mac; do sleep 0.05; done; }}
 case $1 in
 print) [ -f {root}/loaded/$job.going ] && {{ rm {root}/loaded/$job.going; exit 0; }}; [ -f {root}/loaded/$job ] || exit 113;;
-bootout) kill $(cat {root}/loaded/$job) 2>/dev/null; [ -f {root}/stuck ] || mv {root}/loaded/$job {root}/loaded/$job.going;;
+bootout) stop $(cat {root}/loaded/$job); [ -f {root}/stuck ] || mv {root}/loaded/$job {root}/loaded/$job.going;;
 bootstrap) case $3 in *.upgrade.plist) touch {root}/loaded/$(basename $3 .plist); exit;; esac; held=$(sed -n 's|.*<key>RIFT_ROOT</key><string>\(.*\)</string>.*|\1|p' $3); [ -n "$(find "$held" -maxdepth 0 -perm 700)" ] && echo root 0700 >> {root}/launchctl.log; [ -f {root}/fail ] && {{ echo 'Bootstrap failed: 5: Input/output error' >&2; exit 5; }}; start $3; case $3 in *rift.plist) [ ! -f {root}/held ] || hold "$held";; esac;;
 print-disabled) [ -f {root}/disabled ] && echo '	"dev.gigantic.rift.ear" => disabled'; exit 0;;
-kickstart) kill $(cat {root}/loaded/${{3##*/}}); [ -f {root}/refuse ] && exit; {{ sleep 1; start {file}; }} >/dev/null 2>&1 &;;
+kickstart) stop $(cat {root}/loaded/${{3##*/}}); [ -f {root}/refuse ] && exit; {{ sleep 1; start {file}; }} >/dev/null 2>&1 &;;
 esac
 "#,
                 serve = env!("CARGO_BIN_EXE_rift")
@@ -2271,7 +2337,7 @@ esac
         let stubbed = format!("{bin}:{named}");
         let gui = format!(
             "gui/{}",
-            String::from_utf8(Command::new("id").arg("-u").output()?.stdout)?.trim()
+            String::from_utf8(bounded(Command::new("id").arg("-u"), "id")?.stdout)?.trim()
         );
         let job = format!("{gui}/dev.gigantic.rift");
         let agents = format!("{home}/Library/LaunchAgents");
@@ -2502,7 +2568,7 @@ esac
         fs::remove_file(format!("{root}/held"))?;
         let holder = fs::read_to_string(format!("{root}/holder"))?;
         same(
-            &String::from_utf8(Command::new("kill").arg(holder.trim()).output()?.stderr)?,
+            &String::from_utf8(bounded(Command::new("kill").arg(holder.trim()), "kill")?.stderr)?,
             "",
         )?;
         until(|| {
@@ -2510,11 +2576,11 @@ esac
                 listing["devices"]
                     .as_array()
                     .is_some_and(|held| held.len() == 1)
-            }) && !Command::new("kill")
-                .args(["-0", holder.trim()])
-                .status()?
-                .success())
+            }) && !bounded(Command::new("kill").args(["-0", holder.trim()]), "kill")
+                .is_ok_and(|alive| alive.status.success()))
         })?;
+        // gone, so the guard never signals a pid reused since
+        fs::remove_file(format!("{root}/holder"))?;
         // each failure is one line, exit 1, before the daemon is touched; a failed signing
         // leaves no copy behind
         let failed = |marker: &str, envs: &[(&str, &str)]| -> Result<String, Box<dyn Error>> {
@@ -2551,9 +2617,9 @@ esac
             ),
         )?;
         same(
-            &failed("hang", &[("RIFT_SIGN_MS", "100")])?,
+            &failed("hang", &[("RIFT_SIGN_MS", "2000")])?,
             &format!(
-                "1\n{linked}rift setup: codesign -v: no answer in 100 ms; is it asking at the screen?\nprint {job}\n{tended}{steady}"
+                "1\n{linked}rift setup: codesign -v: no answer in 2000 ms; is it asking at the screen?\nprint {job}\n{tended}{steady}"
             ),
         )?;
         fs::remove_file(format!("{root}/signature"))?;
@@ -2899,15 +2965,9 @@ esac
         )?;
         // the daemon frozen for 300 ms, three polls: the device's writes wait, its microphone
         // stays open, and the frames held up go on from the sample count, no hole and none ahead
-        let freeze = |signal: &str| {
-            Command::new("kill")
-                .args([signal, &daemon.0.id().to_string()])
-                .status()
-                .map(drop)
-        };
-        freeze("-STOP")?;
+        same(&signal(&daemon, "STOP")?, "")?;
         thread::sleep(Duration::from_millis(300));
-        freeze("-CONT")?;
+        same(&signal(&daemon, "CONT")?, "")?;
         let frozen = opening.len();
         until(|| Ok(stream("ear-desk").is_ok_and(|held| held.len() >= frozen + 5)))?;
         let kinds: Vec<Value> = stream("ear-desk")?
