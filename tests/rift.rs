@@ -304,7 +304,7 @@ mod tests {
         let (mut daemon, ready) = serve(&root, &[])?;
         let pid = daemon.0.id();
         let since = ready["since"].as_str().unwrap_or_default().to_owned();
-        let health = json!({"archive": null, "boot": 1u8, "devices": [], "ears": false, "ok": true, "pid": pid, "playing": {}, "proto": 1u8, "quiet": false, "seq": 1u8, "since": since, "state": "ready", "version": built, "window": 600u16});
+        let health = json!({"archive": null, "boot": 1u8, "devices": [], "ears": false, "engines": {}, "ok": true, "pid": pid, "playing": {}, "proto": 1u8, "quiet": false, "seq": 1u8, "since": since, "state": "ready", "version": built, "window": 600u16});
         same(&ready.to_string(), &health.to_string())?;
         same(&since.len().to_string(), "24")?;
         for dir in [root.clone(), format!("{root}/run")] {
@@ -392,7 +392,7 @@ mod tests {
         ] {
             same(&say(&mut conn, line)?, reply)?;
         }
-        let quieted = json!({"archive": null, "boot": 1u8, "devices": [], "ears": false, "ok": true, "pid": pid, "playing": {}, "proto": 1u8, "quiet": true, "seq": 2u8, "since": since, "state": "ready", "version": built, "window": 600u16});
+        let quieted = json!({"archive": null, "boot": 1u8, "devices": [], "ears": false, "engines": {}, "ok": true, "pid": pid, "playing": {}, "proto": 1u8, "quiet": true, "seq": 2u8, "since": since, "state": "ready", "version": built, "window": 600u16});
         // a line of exactly 65 536 bytes is read; one byte more is too long, and closes
         let pad = |len: usize| format!(r#"{{"op":"health","pad":"{}"}}"#, "x".repeat(len - 24));
         same(&say(&mut conn, &pad(0x1_0000))?, &quieted.to_string())?;
@@ -417,7 +417,7 @@ mod tests {
             &rift(&root, &[], &["quiet", "on"])?,
             "1\n{\"code\":\"io\",\"ok\":false}\n",
         )?;
-        let degraded = json!({"archive": null, "boot": 1u8, "devices": [], "ears": false, "ok": true, "pid": pid, "playing": {}, "proto": 1u8, "quiet": false, "seq": 3u8, "since": since, "state": "degraded", "version": built, "window": 600u16});
+        let degraded = json!({"archive": null, "boot": 1u8, "devices": [], "ears": false, "engines": {}, "ok": true, "pid": pid, "playing": {}, "proto": 1u8, "quiet": false, "seq": 3u8, "since": since, "state": "degraded", "version": built, "window": 600u16});
         same(&rift(&root, &[], &["status"])?, &format!("0\n{degraded}\n"))?;
         fs::rename(&aside, &log)?;
         same(
@@ -2513,6 +2513,98 @@ mod tests {
             r#"{"ok":true}"#,
         )?;
         same(&format!("{:?}", again.0.wait()?.code()), "Some(0)")
+    }
+
+    /// Engines over raw connections, the suite as each (docs/protocol.html#engines): the bad
+    /// requests, a device's included; the reply, its `id` echoed; a second of a kind on a track
+    /// `taken`; any other op refused on one; an unlogged connect answered `io`; `engine` on and off
+    /// in the feed, and health listing each while connected only; the drain logging each one's end
+    /// before `stop`.
+    #[test]
+    fn engines() -> Outcome {
+        let root = temp("engines")?;
+        let (mut daemon, _) = serve(&root, &[])?;
+        let mut feed = greet(&root)?;
+        same(
+            &say(&mut feed, r#"{"after":null,"op":"feed"}"#)?,
+            r#"{"ok":true,"reset":false}"#,
+        )?;
+        drop(take(&mut feed, 1)?);
+        let mut probe = greet(&root)?;
+        let (mut ear, _) = device(&root, r#"{"kind":"ear","name":"desk","op":"device"}"#, 0)?;
+        let echo = r#"{"kind":"echo","name":"a","op":"engine","track":"ear-desk"}"#;
+        for line in [
+            r#"{"kind":"nose","name":"a","op":"engine","track":"ear-desk"}"#,
+            r#"{"kind":"echo","name":"a/b","op":"engine","track":"ear-desk"}"#,
+            r#"{"kind":"echo","name":"a","op":"engine","track":"mouth-desk"}"#,
+            r#"{"kind":"speech","name":"a","op":"engine","track":"ear-desk"}"#,
+            r#"{"from":null,"kind":"words","name":"a","op":"engine","track":"mouth-desk"}"#,
+            r#"{"kind":"words","name":"a","op":"engine","track":"ear-desk"}"#,
+            r#"{"from":"x","kind":"turn","name":"a","op":"engine","track":"ear-desk"}"#,
+            r#"{"from":null,"kind":"echo","name":"a","op":"engine","track":"ear-desk"}"#,
+        ] {
+            same(&say(&mut probe, line)?, &code("bad_request"))?;
+        }
+        same(&say(&mut ear, echo)?, &code("bad_request"))?;
+        let words = r#"{"from":null,"id":7,"kind":"words","name":"transcribe","op":"engine","track":"ear-desk"}"#;
+        let mut transcribe = greet(&root)?;
+        same(
+            &say(&mut transcribe, words)?,
+            r#"{"id":7,"ok":true,"seq":2}"#,
+        )?;
+        same(
+            &say(&mut greet(&root)?, words)?,
+            r#"{"code":"taken","id":7,"ok":false}"#,
+        )?;
+        same(
+            &say(&mut transcribe, r#"{"op":"health"}"#)?,
+            &code("bad_request"),
+        )?;
+        // a connect that cannot be logged connects nothing
+        let speech = r#"{"kind":"speech","name":"read-aloud","op":"engine","track":"mouth-desk"}"#;
+        let (log, aside) = (
+            format!("{root}/events.ndjson"),
+            format!("{root}/held.ndjson"),
+        );
+        fs::rename(&log, &aside)?;
+        symlink("/dev/urandom", &log)?;
+        same(&say(&mut greet(&root)?, speech)?, &code("io"))?;
+        fs::rename(&aside, &log)?;
+        let mut aloud = greet(&root)?;
+        same(&say(&mut aloud, speech)?, r#"{"ok":true,"seq":3}"#)?;
+        let engines = || -> Result<String, Box<dyn Error>> {
+            let health: Value =
+                serde_json::from_str(&say(&mut greet(&root)?, r#"{"op":"health"}"#)?)?;
+            Ok(health["engines"].to_string())
+        };
+        same(
+            &engines()?,
+            r#"{"ear-desk":{"words":"transcribe"},"mouth-desk":{"speech":"read-aloud"}}"#,
+        )?;
+        drop(transcribe);
+        let on = |kind: &str, name: &str, track: &str, on: bool| json!({"kind": "engine", "name": name, "on": on, "stage": kind, "track": track});
+        same(
+            &take(&mut feed, 3)?.to_string(),
+            &json!([
+                on("words", "transcribe", "ear-desk", true),
+                on("speech", "read-aloud", "mouth-desk", true),
+                on("words", "transcribe", "ear-desk", false),
+            ])
+            .to_string(),
+        )?;
+        same(&engines()?, r#"{"mouth-desk":{"speech":"read-aloud"}}"#)?;
+        // the drain: the engine's end, then `stop`
+        same(&say(&mut probe, r#"{"op":"shutdown"}"#)?, r#"{"ok":true}"#)?;
+        same(
+            &take(&mut feed, 2)?.to_string(),
+            &json!([
+                on("speech", "read-aloud", "mouth-desk", false),
+                {"kind": "stop", "reason": "shutdown request"},
+            ])
+            .to_string(),
+        )?;
+        drop((ear, aloud, probe));
+        same(&format!("{:?}", daemon.0.wait()?.code()), "Some(0)")
     }
 
     /// The daemon's clock now, in microseconds since the epoch.

@@ -72,12 +72,19 @@ const VERSION: &str = concat!(env!("RIFT_RELEASE"), "-", env!("RIFT_BUILD"));
 /// Why the daemon stops (`signal TERM`, `shutdown request`), set once before `accept` is woken.
 static STOP: OnceLock<String> = OnceLock::new();
 
+/// An engine: a client doing one kind of work on one track (docs/protocol.html#engines).
+struct Engine {
+    /// Its name.
+    name: String,
+}
+
 /// What a connection does after its reply is written.
 enum Next {
     /// Close it: a refused hello or a line past the limit.
     Close,
-    /// Become a device: its replies and notices leave through this queue, by a writer of its own.
-    Device(Receiver<String>),
+    /// Become a device or an engine: the lines it starts with, then its replies and what it is
+    /// told, through this queue, by a writer of its own.
+    Device(Box<dyn Iterator<Item = String> + Send>, Receiver<String>),
     /// Become a feed: the lines it starts with, then every live one until the daemon drops it.
     Feed(Box<dyn Iterator<Item = String> + Send>, Receiver<String>),
     /// Read the next request.
@@ -104,6 +111,8 @@ struct Live {
     /// Each mouth's last play to end, by its track: its last line, its giver's and its hush's
     /// reply, kept until the next one ends.
     ended: BTreeMap<String, Value>,
+    /// Each connected engine, by its track and kind.
+    engines: BTreeMap<(String, String), Engine>,
     /// Each feed's queue, its connection's key and its topic: `""` the events, `"ears"` a
     /// device's replies and notices, else the track a listener follows.
     feeds: Vec<(SyncSender<String>, u64, String)>,
@@ -260,6 +269,11 @@ impl Live {
     /// The health reply: hello's fields, then the stream's and the switches'.
     fn health(&self) -> Value {
         let mut reply = self.hello();
+        let mut engines = json!({});
+        for (slot, engine) in &self.engines {
+            engines[&slot.0][&slot.1] = engine.name.clone().into();
+        }
+        reply["engines"] = engines;
         let devices: Vec<&String> = self
             .tracks
             .iter()
@@ -306,6 +320,18 @@ impl Live {
         self.tell(track, &json!({"hush": num}));
         if empty {
             self.finish(track, hushed);
+        }
+    }
+
+    /// Logs the end of the engine at `only`, else of every engine: the drain's, before `stop`.
+    fn leave(&mut self, only: Option<&(String, String)>) {
+        let gone: Vec<(String, String)> = (self.engines.keys())
+            .filter(|slot| only.is_none_or(|one| one == *slot))
+            .cloned()
+            .collect();
+        for slot in gone {
+            let name = self.engines.remove(&slot).map(|engine| engine.name);
+            drop(self.emit(&json!({"kind": "engine", "name": name, "on": false, "stage": slot.1, "track": slot.0})));
         }
     }
 
@@ -1017,6 +1043,7 @@ fn main() -> ExitCode {
                     conns: BTreeMap::new(),
                     ears: last("ears").is_some_and(|ears| ears["on"] == true),
                     ended: BTreeMap::new(),
+                    engines: BTreeMap::new(),
                     feeds: Vec::new(),
                     held: closed
                         .iter()
@@ -1221,6 +1248,8 @@ fn main() -> ExitCode {
                         None::<SyncSender<String>>,
                         None::<(String, u64)>,
                     );
+                    // an engine's track and kind
+                    let mut engaged = None::<(String, String)>;
                     let every = Duration::from_millis(setting("RIFT_PING_MS", 10_000));
                     loop {
                         let mut raw = Vec::new();
@@ -1247,6 +1276,23 @@ fn main() -> ExitCode {
                                 well(kind, name) && (kind == "mouth" || request["plays"] != true)
                             })
                             .map(|(kind, name)| format!("{kind}-{name}"));
+                        // an engine's kind and name: echo, turn and words on an ear, speech on a
+                        // mouth, `from` a turn's and a words engine's alone
+                        let role = request["kind"]
+                            .as_str()
+                            .zip(request["name"].as_str())
+                            .filter(|&(kind, name)| {
+                                let reads = matches!(kind, "turn" | "words");
+                                tracked
+                                    && well("ear", name)
+                                    && match kind {
+                                        "echo" => track.starts_with("ear-"),
+                                        "speech" => track.starts_with("mouth-"),
+                                        _ => reads && track.starts_with("ear-"),
+                                    }
+                                    && request.get("from").is_some() == reads
+                                    && (request["from"].is_null() || request["from"].is_u64())
+                            });
                         // what a frame names: a mouth's its output
                         let heard = &request[if device
                             .as_ref()
@@ -1312,10 +1358,54 @@ fn main() -> ExitCode {
                             // and a play's its gives
                             (
                                 true,
-                                Some("device" | "feed" | "hush" | "listen" | "play" | "read"),
+                                Some(
+                                    "device" | "engine" | "feed" | "hush" | "listen" | "play"
+                                    | "read",
+                                ),
                             ) if device.is_some() => (Ok(error("bad_request")), Next::Go),
                             (true, Some(op)) if giving.is_some() && op != "give" && op != "end" => {
                                 (Ok(error("bad_request")), Next::Go)
+                            }
+                            (true, Some(_)) if engaged.is_some() => {
+                                (Ok(error("bad_request")), Next::Go)
+                            }
+                            (true, Some("engine"))
+                                if role.is_some_and(|(kind, _)| {
+                                    guard
+                                        .engines
+                                        .contains_key(&(track.to_owned(), kind.to_owned()))
+                                }) =>
+                            {
+                                (Ok(error("taken")), Next::Go)
+                            }
+                            (true, Some("engine")) if role.is_some() => {
+                                let (kind, name) = role.unwrap_or_default();
+                                let on = guard.emit(&json!({"kind": "engine", "name": name, "on": true, "stage": kind, "track": track}));
+                                let (sender, incoming) = mpsc::sync_channel(BEHIND);
+                                match on {
+                                    Ok(_) => {
+                                        let slot = (track.to_owned(), kind.to_owned());
+                                        drop(guard.engines.insert(
+                                            slot.clone(),
+                                            Engine {
+                                                name: name.to_owned(),
+                                            },
+                                        ));
+                                        let mut reply = json!({"ok": true, "seq": guard.seq});
+                                        if !request["id"].is_null() {
+                                            reply["id"] = request["id"].clone();
+                                        }
+                                        (queue, engaged) = (Some(sender), Some(slot));
+                                        (
+                                            Ok(Value::Null),
+                                            Next::Device(
+                                                Box::new(iter::once(format!("{reply}\n"))),
+                                                incoming,
+                                            ),
+                                        )
+                                    }
+                                    Err(cause) => (Err(cause), Next::Go),
+                                }
                             }
                             (true, Some("device"))
                                 if named.as_ref().is_some_and(|name| {
@@ -1342,7 +1432,7 @@ fn main() -> ExitCode {
                                 }
                                 queue = Some(sender);
                                 device = Some(name);
-                                (Ok(reply), Next::Device(incoming))
+                                (Ok(reply), Next::Device(Box::new(iter::empty()), incoming))
                             }
                             (true, Some(op @ ("ears" | "quiet"))) if request["on"].is_boolean() => {
                                 let on = request["on"] == true;
@@ -1867,9 +1957,9 @@ fn main() -> ExitCode {
                             (
                                 true,
                                 Some(
-                                    "device" | "done" | "ears" | "end" | "feed" | "frame" | "give"
-                                    | "hush" | "keep" | "listen" | "play" | "pong" | "quiet"
-                                    | "read" | "sound",
+                                    "device" | "done" | "ears" | "end" | "engine" | "feed"
+                                    | "frame" | "give" | "hush" | "keep" | "listen" | "play"
+                                    | "pong" | "quiet" | "read" | "sound",
                                 )
                                 | None,
                             ) => (Ok(error("bad_request")), Next::Go),
@@ -1893,13 +1983,15 @@ fn main() -> ExitCode {
                         }
                         match next {
                             Next::Close => break,
-                            Next::Device(incoming) => drop(writer.try_clone().map(|mut out| {
-                                thread::spawn(move || {
-                                    incoming
-                                        .into_iter()
-                                        .try_for_each(|line| out.write_all(line.as_bytes()))
-                                })
-                            })),
+                            Next::Device(backlog, incoming) => {
+                                drop(writer.try_clone().map(|mut out| {
+                                    thread::spawn(move || {
+                                        backlog
+                                            .chain(incoming)
+                                            .try_for_each(|line| out.write_all(line.as_bytes()))
+                                    })
+                                }));
+                            }
                             Next::Feed(backlog, incoming) => {
                                 // a vanished client drops its queue at once, so `incoming` ends
                                 drop(thread::spawn(move || {
@@ -1943,6 +2035,10 @@ fn main() -> ExitCode {
                     let mut guard = lock(live);
                     drop(guard.conns.remove(&key));
                     guard.feeds.retain(|feed| feed.1 != key);
+                    // an engine's end however it comes, unless the drain logged it
+                    if let Some(slot) = engaged {
+                        guard.leave(Some(&slot));
+                    }
                     // a device's open segment closes as it leaves, and the play it held ends
                     if let Some(name) = device {
                         guard.finish(&name, "mouth");
@@ -1966,6 +2062,8 @@ fn main() -> ExitCode {
                     let left = budget.saturating_sub(begun.elapsed());
                     guard = quell(guard, &track, "stop", left).0;
                 }
+                // every engine's end logged before `stop`, which nothing follows
+                guard.leave(None);
                 drop(guard.close(None));
                 drop(guard.emit(&json!({"kind": "stop", "reason": reason})));
                 guard.state = STOPPING;
