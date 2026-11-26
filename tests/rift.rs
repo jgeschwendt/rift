@@ -3752,11 +3752,13 @@ esac
             ),
             r#""mouth" 0 8192"#,
         )?;
-        fs::remove_file(format!("{fake}/take"))?;
+        // the mouth, told to drop the play, closes its output, which never took a sample of it;
+        // only then is the output freed
         until(|| {
             Ok(fs::read_to_string(format!("{fake}/log"))
                 .is_ok_and(|log| log.contains("close Desk")))
         })?;
+        fs::remove_file(format!("{fake}/take"))?;
         same(
             &taken(&fake, "Desk")
                 .iter()
@@ -3776,11 +3778,14 @@ esac
         thread::sleep(Duration::from_millis(1500));
         drop(say(&mut paused, &give(&tone(16_000, 0.1)))?);
         drop(say(&mut paused, r#"{"op":"end"}"#)?);
+        let resumed = next(&mut paused)?;
         same(
-            &next(&mut paused)?
-                .contains(r#""dropped":0,"given":3200,"play":2,"played":3200,"reason":"end""#)
-                .to_string(),
-            "true",
+            &format!(
+                "{} {resumed}",
+                resumed
+                    .contains(r#""dropped":0,"given":3200,"play":2,"played":3200,"reason":"end""#)
+            ),
+            &format!("true {resumed}"),
         )?;
         same(&signal(&mouth, "TERM")?, "")?;
         same(&format!("{:?}", mouth.0.wait()?.code()), "Some(0)")?;
