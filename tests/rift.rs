@@ -2612,6 +2612,13 @@ mod tests {
         same(&format!("{:?}", daemon.0.wait()?.code()), "Some(0)")
     }
 
+    /// Whether health over `root` lists no `kind` engine on `track`.
+    fn unlisted(root: &str, track: &str, kind: &str) -> io::Result<bool> {
+        let mut conn = greet(root).map_err(|cause| io::Error::other(cause.to_string()))?;
+        let health: Value = serde_json::from_str(&say(&mut conn, r#"{"op":"health"}"#)?)?;
+        Ok(health["engines"][track][kind].is_null())
+    }
+
     /// The next line on `conn`, parsed.
     fn line(conn: &mut BufReader<UnixStream>) -> Result<Value, Box<dyn Error>> {
         Ok(serde_json::from_str(&next(conn)?)?)
@@ -2756,7 +2763,16 @@ mod tests {
                 .to_string(),
             &(first + 60_000).to_string(),
         )?;
-        drop((again, ear, reader));
+        // resumed in one connection from its `through`: the frame after the last final's end
+        drop(again);
+        until(|| unlisted(&root, "ear-desk", "words"))?;
+        let mut resumed = greet(&root)?;
+        drop(line_after(&mut resumed, &words(json!("through")))?);
+        same(
+            &line(&mut resumed)?["t"].to_string(),
+            &placed[3].to_string(),
+        )?;
+        drop((resumed, ear, reader));
         // an engine slower than its ear through its replay: read from disk until caught up,
         // never dropped behind a queue of live frames
         let track = |name: &str| json!({"kind": "ear", "name": name, "op": "device"}).to_string();
@@ -3013,6 +3029,8 @@ mod tests {
             &all[6].to_string(),
         )?;
         drop(words);
+        // its end logged, so the next words engine is not refused `taken`
+        until(|| unlisted(&root, "ear-desk", "words"))?;
         // replayed, here and after a restart: the turn after the frame holding its end
         let replayed = || -> Result<Vec<Value>, Box<dyn Error>> {
             let mut again = greet(&root)?;

@@ -1919,7 +1919,9 @@ fn main() -> ExitCode {
                                         _ => reads && track.starts_with("ear-"),
                                     }
                                     && request.get("from").is_some() == reads
-                                    && (request["from"].is_null() || request["from"].is_u64())
+                                    && (request["from"].is_null()
+                                        || request["from"].is_u64()
+                                        || request["from"] == "through")
                             });
                         // what a frame names: a mouth's its output
                         let heard = &request[if device
@@ -2044,17 +2046,17 @@ fn main() -> ExitCode {
                                         if !request["id"].is_null() {
                                             reply["id"] = request["id"].clone();
                                         }
+                                        let latest = |what: &str| {
+                                            guard
+                                                .latest
+                                                .get(&(track.to_owned(), what.to_owned()))
+                                                .copied()
+                                        };
+                                        // a turn engine's: its turns' and its voice's
+                                        let through = latest(kind)
+                                            .max(latest(&kind.replace("turn", "voice")));
                                         if matches!(kind, "turn" | "words") {
-                                            let latest = |what: &str| {
-                                                guard
-                                                    .latest
-                                                    .get(&(track.to_owned(), what.to_owned()))
-                                                    .copied()
-                                            };
-                                            // a turn engine's: its turns' and its voice's
-                                            reply["through"] = latest(kind)
-                                                .max(latest(&kind.replace("turn", "voice")))
-                                                .into();
+                                            reply["through"] = through.into();
                                         }
                                         // an echo engine's: where its ruling starts
                                         if kind == "echo" {
@@ -2083,7 +2085,13 @@ fn main() -> ExitCode {
                                             }));
                                         }
                                         let unread = Arc::new(AtomicUsize::new(0));
-                                        let from = request["from"].as_u64().unwrap_or(reached);
+                                        // `"through"`: from its kind's `through`, live with none;
+                                        // never `gone`, the replay starting at the oldest audio
+                                        // still held
+                                        let resumed =
+                                            through.filter(|_| request["from"] == "through");
+                                        let from =
+                                            request["from"].as_u64().or(resumed).unwrap_or(reached);
                                         let cursor = matches!(kind, "turn" | "words").then_some((
                                             from,
                                             from,

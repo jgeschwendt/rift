@@ -514,14 +514,21 @@
       <code class="code">speech</code> (a mouth's), <code class="code">turn</code> or
       <code class="code">words</code> (an ear's or a clean track's); <code class="code">name</code> is of
       a track name's form. <code class="code">from</code>, a turn's and a words engine's alone and
-      required, is a time on the stream or <code class="code">null</code> for live. The reply,
+      required, is a time on the stream, <code class="code">null</code> for live, or
+      <code class="code">"through"</code>: from its kind's <code class="code">through</code> on the
+      track, live when that is <code class="code">null</code>, so one connection resumes; never
+      <code class="code">gone</code>, the replay starting at the oldest audio still held, since a
+      resume wants all it can have. The reply,
       <code class="code">{"ok":true,"seq":20,"through":1764000000600000}</code>, logs
       <code class="code">engine</code>; <code class="code">through</code>, a turn's and a words
       engine's, is the latest time a logged report of that kind on that track names, any boot,
-      or <code class="code">null</code>; an echo engine's carries <code class="code">ruled</code>
+      or <code class="code">null</code> (a turn engine's the later of its voices' starts and its
+      turns' ends, so a resume may replay from a voice on); an echo engine's carries <code class="code">ruled</code>
       instead, where its ruling starts (below). The connection is then the engine's: its reports, each
       answered <code class="code">{"ok":true}</code> (with <code class="code">seq</code> when
-      logged), any other op <code class="code">bad_request</code>. Its end, however it comes, logs
+      logged), any other op <code class="code">bad_request</code>; every reply, a report's
+      included, echoes the request's <code class="code">id</code> when one is sent, so an engine
+      matches replies to reports. Its end, however it comes, logs
       <code class="code">engine</code> <code class="code">"on":false</code>.</li>
     <li><strong>One per kind per track.</strong> A second <code class="code">engine</code> for a
       kind and track held is refused <code class="code">taken</code>, as a device is.</li>
@@ -550,7 +557,10 @@
       waits until it has ruled on it. A words engine also reads each logged
       <code class="code">turn</code> on its track, <code class="code">{"turn":{"end":…,"start":…}}</code>,
       after the frame holding its <code class="code">end</code>, so it may finish a turn knowing it
-      has all of it. 1024 live lines unsent drop the engine, as a listener.</li>
+      has all of it. A turn line may come long after its end (a turn engine holding a turn it
+      judged unfinished), so a words engine keeps its audio past a turn's end until the line or
+      its own rule closes it. Word times are as fine as the engine can give: one without per-word
+      times may spread them within its span. 1024 live lines unsent drop the engine, as a listener.</li>
     <li><strong>What an echo engine reads.</strong> Its ear's frames, live only, and, for every
       mouth, each play's open (those open as it connects, with their runs so far, first) (<code class="code">{"play":3,"rate":24000,"track":"mouth-desk"}</code>),
       each run as its mouth reports it, on the daemon's clock
@@ -568,7 +578,8 @@
       (stop now). It gives the audio through the <a href="#plays">plays</a> path on a connection of
       its own, <code class="code">{"op":"play","rate":24000,"say":5,"track":"mouth-desk"}</code>, one
       play per say, ended only after the say's <code class="code">end</code> (before it, the play's
-      <code class="code">end</code> is <code class="code">bad_request</code>); a play naming a say
+      <code class="code">end</code> is <code class="code">bad_request</code>; after it,
+      <code class="code">{"ok":true}</code> and then the play's last line, as any play's); a play naming a say
       that is not open on that mouth, or one already played, is <code class="code">bad_request</code>.</li>
   </ul>
   <div class="table-wrap">
