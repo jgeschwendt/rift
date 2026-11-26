@@ -14,6 +14,8 @@ mod tests {
     use serde_json::{Value, json};
     use std::env;
     use std::error::Error;
+    use std::f64::consts::PI;
+    use std::fmt::Write as _;
     use std::fs::{self, File, OpenOptions, Permissions};
     use std::io::{self, BufRead, BufReader, Write as _};
     use std::iter;
@@ -301,7 +303,7 @@ mod tests {
         let (mut daemon, ready) = serve(&root, &[])?;
         let pid = daemon.0.id();
         let since = ready["since"].as_str().unwrap_or_default().to_owned();
-        let health = json!({"archive": null, "boot": 1u8, "devices": [], "ears": false, "ok": true, "pid": pid, "proto": 1u8, "quiet": false, "seq": 1u8, "since": since, "state": "ready", "version": built, "window": 600u16});
+        let health = json!({"archive": null, "boot": 1u8, "devices": [], "ears": false, "ok": true, "pid": pid, "playing": {}, "proto": 1u8, "quiet": false, "seq": 1u8, "since": since, "state": "ready", "version": built, "window": 600u16});
         same(&ready.to_string(), &health.to_string())?;
         same(&since.len().to_string(), "24")?;
         for dir in [root.clone(), format!("{root}/run")] {
@@ -389,7 +391,7 @@ mod tests {
         ] {
             same(&say(&mut conn, line)?, reply)?;
         }
-        let quieted = json!({"archive": null, "boot": 1u8, "devices": [], "ears": false, "ok": true, "pid": pid, "proto": 1u8, "quiet": true, "seq": 2u8, "since": since, "state": "ready", "version": built, "window": 600u16});
+        let quieted = json!({"archive": null, "boot": 1u8, "devices": [], "ears": false, "ok": true, "pid": pid, "playing": {}, "proto": 1u8, "quiet": true, "seq": 2u8, "since": since, "state": "ready", "version": built, "window": 600u16});
         // a line of exactly 65 536 bytes is read; one byte more is too long, and closes
         let pad = |len: usize| format!(r#"{{"op":"health","pad":"{}"}}"#, "x".repeat(len - 24));
         same(&say(&mut conn, &pad(0x1_0000))?, &quieted.to_string())?;
@@ -414,7 +416,7 @@ mod tests {
             &rift(&root, &[], &["quiet", "on"])?,
             "1\n{\"code\":\"io\",\"ok\":false}\n",
         )?;
-        let degraded = json!({"archive": null, "boot": 1u8, "devices": [], "ears": false, "ok": true, "pid": pid, "proto": 1u8, "quiet": false, "seq": 3u8, "since": since, "state": "degraded", "version": built, "window": 600u16});
+        let degraded = json!({"archive": null, "boot": 1u8, "devices": [], "ears": false, "ok": true, "pid": pid, "playing": {}, "proto": 1u8, "quiet": false, "seq": 3u8, "since": since, "state": "degraded", "version": built, "window": 600u16});
         same(&rift(&root, &[], &["status"])?, &format!("0\n{degraded}\n"))?;
         fs::rename(&aside, &log)?;
         same(
@@ -2054,10 +2056,22 @@ mod tests {
                 "1\n{\"code\":\"down\",\"ok\":false}\n",
             )?;
         }
-        let usage = "2\nusage: rift serve | status | quiet on|off | ears on|off | keep <window s> [<archive>] | feed [--after <boot>:<seq>] | listen <track> | read <track> <from us> <to us> | device ear|mouth <name> <file.pcm> [--fast] | device ear <name> --mic [<microphone>] | setup [--print | --remove] | upgrade [--check | --back | --retry] | version\n";
+        let usage = "2\nusage: rift serve | status | quiet on|off | ears on|off | keep <window s> [<archive>] | feed [--after <boot>:<seq>] | listen <track> | read <track> <from us> <to us> | play <track> <rate> [<file.pcm>] | hush <track> | device ear|mouth <name> <file.pcm> [--fast] | device ear <name> --mic [<microphone>] | device mouth <name> --speaker | setup [--print | --remove] | upgrade [--check | --back | --retry] | version\n";
+        // a play's file is opened before it connects; with none, stdin, here empty
+        same(
+            &rift(&root, &[], &["play", "mouth-a", "16000", "/nonexistent"])?,
+            "1\nrift play: No such file or directory (os error 2)\n",
+        )?;
+        for args in [&["play", "mouth-a", "16000"][..], &["hush", "mouth-a"]] {
+            same(
+                &rift(&root, &[], args)?,
+                "1\n{\"code\":\"down\",\"ok\":false}\n",
+            )?;
+        }
         for args in [
             &[][..],
             &["device", "ear", "a"],
+            &["play", "mouth-a", "fast"],
             &["keep", "x"],
             &["quiet", "maybe"],
             &["read", "ear-a", "1", "x"],
@@ -2102,12 +2116,399 @@ mod tests {
             &rift(&root, &[], &["feed"])?,
             "1\n{\"code\":\"stopping\",\"ok\":false}\n",
         )?;
+        // a play opened, then the connection ends before its last line: an unknown outcome
+        fake(&root, &[&greeted, r#"{"ok":true,"play":1,"seq":2}"#])?;
+        same(
+            &rift(&root, &[], &["play", "mouth-a", "16000"])?,
+            "1\n{\"ok\":true,\"play\":1,\"seq\":2}\n{\"code\":\"unknown\",\"ok\":false}\n",
+        )?;
         // the hello answered, the request read, then the connection ends with no reply
         fake(&root, &[&greeted])?;
         same(
             &rift(&root, &[], &["quiet", "on"])?,
             "1\n{\"code\":\"unknown\",\"ok\":false}\n",
         )
+    }
+
+    /// `line` sent on `conn`, nothing read.
+    fn send(conn: &mut BufReader<UnixStream>, line: &str) -> io::Result<()> {
+        conn.get_mut().write_all(format!("{line}\n").as_bytes())
+    }
+
+    /// The `e` of every event of `kind` (every kind: `""`) in the log's last `count`, compact, one a
+    /// line, its `start` cut: a run's start lies off its report by the ping's half round trip.
+    fn kinds(root: &str, kind: &str, count: usize) -> io::Result<String> {
+        let held = events(root).map_err(|cause| io::Error::other(cause.to_string()))?;
+        Ok(held
+            .iter()
+            .skip(held.len().saturating_sub(count))
+            .filter(|event| kind.is_empty() || event["e"]["kind"] == kind)
+            .map(|event| {
+                let mut seen = event["e"].clone();
+                drop(
+                    seen.as_object_mut()
+                        .and_then(|fields| fields.remove("start")),
+                );
+                seen.to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n"))
+    }
+
+    /// Plays over raw connections, the suite as both giver and mouth (docs/protocol.html#plays):
+    /// the refusals (`absent` with no mouth or a file-fed one, `busy`, `quiet`, the bad requests and
+    /// frames); a give passed on as given and its reply withheld while the mouth holds
+    /// `$RIFT_AHEAD_MS` untaken; runs logged as each ends; a hush answered once the mouth says
+    /// `done`, the giver's last line then its end of stream; a play to its end, its mouth's segment
+    /// closed at `done`, its frames naming the speaker; a giver gone (`left`), a mouth gone or full
+    /// (`mouth`), a mouth that never answers cut after 1 s (`mouth`), quiet set (`quiet`), the
+    /// drain (`stop`, before `stop`), and a kill (`lost`, the next boot's, its torn segment keeping
+    /// the speaker), plays numbered across boots.
+    #[test]
+    fn plays() -> Outcome {
+        let root = temp("plays")?;
+        let (mut daemon, _) = serve(&root, &[("RIFT_AHEAD_MS", "100"), ("RIFT_DRAIN_MS", "400")])?;
+        let mut probe = greet(&root)?;
+        let play = r#"{"op":"play","rate":16000,"track":"mouth-desk"}"#;
+        let zeros =
+            |samples: usize| json!({"op": "give", "pcm": "0000".repeat(samples)}).to_string();
+        let sound = |num: u8, from: u16, samples: u16| {
+            json!({"from": from, "op": "sound", "play": num, "samples": samples, "t": 1_000_000u32})
+                .to_string()
+        };
+        let hush = r#"{"op":"hush","track":"mouth-desk"}"#;
+        for (line, reply) in [
+            (
+                r#"{"kind":"ear","name":"x","op":"device","plays":true}"#,
+                code("bad_request"),
+            ),
+            (
+                r#"{"op":"play","rate":16000,"track":"ear-desk"}"#,
+                code("bad_request"),
+            ),
+            (
+                r#"{"op":"play","rate":7999,"track":"mouth-desk"}"#,
+                code("bad_request"),
+            ),
+            (play, code("absent")),
+            (hush, r#"{"ok":true,"play":null}"#.to_owned()),
+            (zeros(1).as_str(), code("bad_request")),
+            (r#"{"op":"end"}"#, code("bad_request")),
+            (sound(1, 0, 1).as_str(), code("bad_request")),
+            (r#"{"op":"done","play":1}"#, code("bad_request")),
+        ] {
+            same(&say(&mut probe, line)?, &reply)?;
+        }
+        // a file-fed mouth plays nothing
+        let (fed, fed_reply) = device(&root, r#"{"kind":"mouth","name":"desk","op":"device"}"#, 0)?;
+        same(
+            &format!("{} {}", fed_reply["plays"], say(&mut probe, play)?),
+            &format!("null {}", code("absent")),
+        )?;
+        drop(fed);
+        until(|| {
+            let mut conn = greet(&root).map_err(|cause| io::Error::other(cause.to_string()))?;
+            Ok(!say(&mut conn, r#"{"op":"health"}"#)?.contains("mouth-desk"))
+        })?;
+        // a playing mouth's report before its pong has no place yet; play and hush are not a device's
+        let mut early = greet(&root)?;
+        let early_reply: Value = serde_json::from_str(&say(
+            &mut early,
+            r#"{"kind":"mouth","name":"early","op":"device","plays":true}"#,
+        )?)?;
+        same(
+            &format!(
+                "{} {} {} {}",
+                early_reply["plays"],
+                say(&mut early, &sound(1, 0, 1))?,
+                say(&mut early, play)?,
+                say(&mut early, hush)?
+            ),
+            &format!(
+                "true {} {} {}",
+                code("unsynced"),
+                code("bad_request"),
+                code("bad_request")
+            ),
+        )?;
+        drop(early);
+        let mouth_line = r#"{"kind":"mouth","name":"desk","op":"device","plays":true}"#;
+        let (mut desk, _) = device(&root, mouth_line, 0)?;
+        drop(rift(&root, &[], &["ears", "on"])?);
+        same(&next(&mut desk)?, r#"{"ears":true}"#)?;
+        // play 1: given, paced, reported, hushed
+        let mut giver = greet(&root)?;
+        let first: Value = serde_json::from_str(&say(&mut giver, play)?)?;
+        same(
+            &format!("{} {}", first["play"], say(&mut greet(&root)?, play)?),
+            &format!("1 {}", code("busy")),
+        )?;
+        for bad in ["abc", "ABCD", ""] {
+            same(
+                &say(&mut giver, &json!({"op": "give", "pcm": bad}).to_string())?,
+                &code("bad_frame"),
+            )?;
+        }
+        same(&say(&mut giver, &zeros(800))?, r#"{"given":800,"ok":true}"#)?;
+        let passed = format!(
+            r#"{{"pcm":"{}","play":1,"rate":16000}}"#,
+            "0000".repeat(800)
+        );
+        same(&next(&mut desk)?, &passed)?;
+        // 1600 untaken, the 100 ms the mouth may hold at 16 kHz: withheld until it reports
+        send(&mut giver, &zeros(800))?;
+        same(&next(&mut desk)?, &passed)?;
+        giver
+            .get_ref()
+            .set_read_timeout(Some(Duration::from_millis(200)))?;
+        same(&next(&mut giver).is_err().to_string(), "true")?;
+        giver
+            .get_ref()
+            .set_read_timeout(Some(Duration::from_secs(10)))?;
+        send(&mut desk, &sound(1, 0, 320))?;
+        same(&next(&mut giver)?, r#"{"given":1600,"ok":true}"#)?;
+        same(
+            &say(&mut giver, r#"{"op":"health"}"#)?,
+            &code("bad_request"),
+        )?;
+        // the run grows, then a new one starts and the first is logged; a report for another play
+        // is no one's
+        for line in [
+            sound(1, 0, 640),
+            sound(1, 1000, 100),
+            sound(9, 0, 1),
+            r#"{"op":"done","play":9}"#.to_owned(),
+        ] {
+            send(&mut desk, &line)?;
+        }
+        let health: Value = serde_json::from_str(&say(&mut probe, r#"{"op":"health"}"#)?)?;
+        same(&health["playing"].to_string(), r#"{"mouth-desk":1}"#)?;
+        send(&mut probe, hush)?;
+        same(&next(&mut desk)?, r#"{"hush":1}"#)?;
+        send(&mut desk, r#"{"op":"done","play":1}"#)?;
+        let hushed: Value = serde_json::from_str(&next(&mut probe)?)?;
+        same(
+            &format!("{hushed} {} {}", next(&mut giver)?, next(&mut giver)?),
+            &format!(
+                r#"{{"dropped":500,"given":1600,"ok":true,"play":1,"played":1100,"reason":"hush","seq":{0},"track":"mouth-desk"}} {{"dropped":500,"given":1600,"play":1,"played":1100,"reason":"hush","seq":{0},"track":"mouth-desk"}} "#,
+                hushed["seq"]
+            ),
+        )?;
+        same(
+            &format!(
+                "{}\n{}",
+                kinds(&root, "sound", usize::MAX)?,
+                kinds(&root, "played", usize::MAX)?
+            ),
+            r#"{"from":0,"kind":"sound","play":1,"samples":640,"track":"mouth-desk"}
+{"from":1000,"kind":"sound","play":1,"samples":100,"track":"mouth-desk"}
+{"dropped":500,"given":1600,"kind":"played","play":1,"played":1100,"reason":"hush","track":"mouth-desk"}"#,
+        )?;
+        // a run's start: the report's on the daemon's clock, uncapped
+        same(
+            &events(&root)?
+                .iter()
+                .any(|event| {
+                    event["e"]["kind"] == "sound" && event["e"]["start"].as_u64() >= Some(1_000_000)
+                })
+                .to_string(),
+            "true",
+        )?;
+        // play 2 to its end, a frame naming the speaker in its segment, closed at `done`
+        let mut second = greet(&root)?;
+        drop(say(&mut second, play)?);
+        same(
+            &say(&mut second, &zeros(320))?,
+            r#"{"given":320,"ok":true}"#,
+        )?;
+        drop(next(&mut desk)?);
+        let framed = json!({"op": "frame", "pcm": "00".repeat(640), "speaker": "Desk Speakers", "t": now_us()});
+        same(
+            &say(&mut desk, &framed.to_string())?
+                .contains(r#""ok":true"#)
+                .to_string(),
+            "true",
+        )?;
+        same(&say(&mut second, r#"{"op":"end"}"#)?, r#"{"ok":true}"#)?;
+        same(
+            &format!(
+                "{} {}",
+                next(&mut desk)?,
+                say(&mut second, r#"{"op":"end"}"#)?
+            ),
+            &format!(r#"{{"end":2}} {}"#, code("bad_request")),
+        )?;
+        send(&mut desk, &sound(2, 0, 320))?;
+        send(&mut desk, r#"{"op":"done","play":2}"#)?;
+        same(
+            &next(&mut second)?
+                .contains(r#""dropped":0,"given":320,"play":2,"played":320,"reason":"end""#)
+                .to_string(),
+            "true",
+        )?;
+        same(
+            &events(&root)?
+                .iter()
+                .filter(|event| {
+                    event["e"]["track"] == "mouth-desk"
+                        && matches!(event["e"]["kind"].as_str(), Some("track" | "segment"))
+                })
+                .map(|event| format!("{} {}", event["e"]["kind"], event["e"]["speaker"]))
+                .collect::<Vec<_>>()
+                .join(" "),
+            r#""track" "Desk Speakers" "segment" "Desk Speakers""#,
+        )?;
+        // play 3: its giver gone before `end` hushes it
+        let mut third = greet(&root)?;
+        drop(say(&mut third, play)?);
+        drop(third);
+        same(&next(&mut desk)?, r#"{"hush":3}"#)?;
+        send(&mut desk, r#"{"op":"done","play":3}"#)?;
+        until(|| {
+            Ok(kinds(&root, "played", usize::MAX)?
+                .contains(r#""play":3,"played":0,"reason":"left""#))
+        })?;
+        // play 4: a mouth that never answers a hush is cut after 1 s
+        let mut fourth = greet(&root)?;
+        drop(say(&mut fourth, play)?);
+        let begun = Instant::now();
+        let cut: Value = serde_json::from_str(&say(&mut probe, hush)?)?;
+        same(
+            &format!(
+                "{} {} {}",
+                cut["reason"],
+                begun.elapsed() >= Duration::from_secs(1),
+                next(&mut desk)?
+            ),
+            r#""mouth" true {"hush":4}"#,
+        )?;
+        same(&next(&mut desk)?, "")?;
+        same(
+            &next(&mut fourth)?
+                .contains(r#""reason":"mouth""#)
+                .to_string(),
+            "true",
+        )?;
+        // play 5: its giver gone after `end` leaves it playing; then the mouth gone mid-play
+        let (gone, _) = device(&root, mouth_line, 0)?;
+        let mut fifth = greet(&root)?;
+        drop(say(&mut fifth, play)?);
+        same(&say(&mut fifth, r#"{"op":"end"}"#)?, r#"{"ok":true}"#)?;
+        drop(fifth);
+        same(
+            &say(&mut greet(&root)?, r#"{"op":"health"}"#)?
+                .contains(r#""playing":{"mouth-desk":5}"#)
+                .to_string(),
+            "true",
+        )?;
+        drop(gone);
+        until(|| {
+            Ok(kinds(&root, "played", usize::MAX)?
+                .contains(r#""play":5,"played":0,"reason":"mouth""#))
+        })?;
+        // play 6: quiet on hushes it and refuses the next
+        let (mut steady, _) = device(&root, mouth_line, 0)?;
+        let mut sixth = greet(&root)?;
+        drop(say(&mut sixth, play)?);
+        drop(rift(&root, &[], &["quiet", "on"])?);
+        same(&next(&mut steady)?, r#"{"hush":6}"#)?;
+        send(&mut steady, r#"{"op":"done","play":6}"#)?;
+        same(
+            &next(&mut sixth)?
+                .contains(r#""reason":"quiet""#)
+                .to_string(),
+            "true",
+        )?;
+        same(&say(&mut probe, play)?, &code("quiet"))?;
+        drop(rift(&root, &[], &["quiet", "off"])?);
+        // the drain: one mouth answers its hush (`stop`), one never does and is ended at its last
+        // report once the budget is spent, both before `stop`
+        let (mut mute, _) = device(
+            &root,
+            r#"{"kind":"mouth","name":"mute","op":"device","plays":true}"#,
+            0,
+        )?;
+        let (mut seventh, mut eighth) = (greet(&root)?, greet(&root)?);
+        drop(say(&mut seventh, play)?);
+        drop(say(
+            &mut eighth,
+            r#"{"op":"play","rate":24000,"track":"mouth-mute"}"#,
+        )?);
+        send(
+            &mut mute,
+            r#"{"from":0,"op":"sound","play":8,"samples":48,"t":5}"#,
+        )?;
+        drop(say(&mut probe, r#"{"op":"health"}"#)?);
+        same(&signal(&daemon, "TERM")?, "")?;
+        same(&next(&mut steady)?, r#"{"hush":7}"#)?;
+        send(&mut steady, r#"{"op":"done","play":7}"#)?;
+        same(&next(&mut mute)?, r#"{"hush":8}"#)?;
+        until(|| Ok(kinds(&root, "stop", usize::MAX)?.contains("stop")))?;
+        same(
+            &kinds(&root, "", 4)?,
+            r#"{"dropped":0,"given":0,"kind":"played","play":7,"played":0,"reason":"stop","track":"mouth-desk"}
+{"from":0,"kind":"sound","play":8,"samples":48,"track":"mouth-mute"}
+{"dropped":0,"given":0,"kind":"played","play":8,"played":48,"reason":"stop","track":"mouth-mute"}
+{"kind":"stop","reason":"signal TERM"}"#,
+        )?;
+        drop((
+            steady, mute, seventh, eighth, giver, second, fourth, sixth, probe,
+        ));
+        // ended by itself, so its lines count
+        same(&format!("{:?}", daemon.0.wait()?.code()), "Some(0)")?;
+        // a kill mid-play: the next boot ends it `lost`, its logged runs what it played, and its
+        // torn segment keeps the speaker; the next play is numbered past it
+        let (killed, _) = serve(&root, &[])?;
+        let (mut torn, _) = device(&root, mouth_line, 0)?;
+        let mut ninth = greet(&root)?;
+        drop(say(&mut ninth, play)?);
+        let tearing = json!({"op": "frame", "pcm": "00".repeat(640), "speaker": "Desk Speakers", "t": now_us()});
+        drop(say(&mut torn, &tearing.to_string())?);
+        for line in [sound(9, 0, 200), sound(9, 200, 10)] {
+            send(&mut torn, &line)?;
+        }
+        until(|| Ok(kinds(&root, "sound", usize::MAX)?.contains(r#""play":9"#)))?;
+        drop(killed);
+        drop((torn, ninth));
+        let (mut again, _) = serve(&root, &[])?;
+        same(
+            &format!(
+                "{}\n{}",
+                kinds(&root, "played", usize::MAX)?
+                    .lines()
+                    .last()
+                    .unwrap_or_default(),
+                events(&root)?
+                    .iter()
+                    .find(|event| event["boot"] == 3u8 && event["e"]["kind"] == "segment")
+                    .map_or(Value::Null, |event| event["e"]["speaker"].clone())
+            ),
+            "{\"kind\":\"played\",\"play\":9,\"played\":200,\"reason\":\"lost\",\"track\":\"mouth-desk\"}\n\"Desk Speakers\"",
+        )?;
+        let (last_mouth, _) = device(&root, mouth_line, 0)?;
+        same(
+            &say(&mut greet(&root)?, play)?
+                .contains(r#""play":10"#)
+                .to_string(),
+            "true",
+        )?;
+        drop(last_mouth);
+        same(
+            &say(&mut greet(&root)?, r#"{"op":"shutdown"}"#)?,
+            r#"{"ok":true}"#,
+        )?;
+        same(&format!("{:?}", again.0.wait()?.code()), "Some(0)")
+    }
+
+    /// The daemon's clock now, in microseconds since the epoch.
+    fn now_us() -> u64 {
+        u64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_micros(),
+        )
+        .unwrap_or_default()
     }
 
     /// `setup --print` prints both plists on hotswap's link, the ear's track named by a stub
@@ -3248,5 +3649,470 @@ esac
             )?;
         }
         Ok(())
+    }
+
+    /// `seconds` of a 1 kHz tone at half scale, 16-bit samples at `rate`.
+    #[expect(
+        clippy::as_conversions,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::float_arithmetic,
+        reason = "a test signal"
+    )]
+    fn tone(rate: u32, seconds: f64) -> Vec<i16> {
+        (0..(f64::from(rate) * seconds) as u32)
+            .map(|at| {
+                let phase = 2000.0f64 * PI * f64::from(at) / f64::from(rate);
+                (phase.sin() * 16384.0f64).round() as i16
+            })
+            .collect()
+    }
+
+    /// A give of `sound`, its samples as lowercase hex.
+    fn give(sound: &[i16]) -> String {
+        let pcm = (sound.iter().flat_map(|sample| sample.to_le_bytes())).fold(
+            String::new(),
+            |mut text, byte| {
+                write!(text, "{byte:02x}").unwrap_or_default();
+                text
+            },
+        );
+        json!({"op": "give", "pcm": pcm}).to_string()
+    }
+
+    /// A giver on its own thread: a play of `sound` at `rate` for `track`, given 8192 samples at a
+    /// time, then `end`; its play's reply and last line.
+    fn giver(
+        root: &str,
+        track: &str,
+        rate: u32,
+        sound: Vec<i16>,
+    ) -> thread::JoinHandle<Result<(Value, Value), String>> {
+        let (at, mouth) = (root.to_owned(), track.to_owned());
+        thread::spawn(move || {
+            let run = || -> Result<(Value, Value), Box<dyn Error>> {
+                let mut conn = greet(&at)?;
+                let asked = json!({"op": "play", "rate": rate, "track": mouth}).to_string();
+                let reply: Value = serde_json::from_str(&say(&mut conn, &asked)?)?;
+                conn.get_ref()
+                    .set_read_timeout(Some(Duration::from_secs(50)))?;
+                // each give, then `end`, answered `ok` until the play's last line, which has none
+                let lines = sound.chunks(8192).map(give);
+                for line in lines.chain([r#"{"op":"end"}"#.to_owned()]) {
+                    // a play ended under it: the write may fail, its last line is still there
+                    drop(send(&mut conn, &line));
+                    let answer: Value = serde_json::from_str(&next(&mut conn)?)?;
+                    if answer.get("ok").is_none() {
+                        return Ok((reply, answer));
+                    }
+                }
+                Ok((reply, serde_json::from_str(&next(&mut conn)?)?))
+            };
+            run().map_err(|cause| cause.to_string())
+        })
+    }
+
+    /// A giver's reply and last line, once it has ended.
+    fn joined(
+        giving: thread::JoinHandle<Result<(Value, Value), String>>,
+    ) -> Result<(Value, Value), Box<dyn Error>> {
+        Ok(giving.join().map_err(|_panic| "the giver panicked")??)
+    }
+
+    /// The samples an output of `$RIFT_SPEAKER` at `fake` took, channel 0.
+    fn taken(fake: &str, output: &str) -> Vec<i16> {
+        fs::read(format!("{fake}/heard/{output}"))
+            .unwrap_or_default()
+            .chunks_exact(2)
+            .map(|pair| {
+                let byte = |at: usize| pair.get(at).copied().unwrap_or_default();
+                i16::from_le_bytes([byte(0), byte(1)])
+            })
+            .collect()
+    }
+
+    /// A tone's frequency by its rising zero crossings and its level by its RMS, over `sound`'s
+    /// samples at `rate` that are not silence: `"<Hz> <RMS>"`, rounded to tens and hundreds.
+    #[expect(
+        clippy::as_conversions,
+        clippy::cast_precision_loss,
+        clippy::float_arithmetic,
+        clippy::single_call_fn,
+        reason = "a test signal's measure, apart from the test it serves"
+    )]
+    fn measure(sound: &[i16], rate: u32) -> String {
+        let heard: Vec<f64> = (sound.iter().map(|&sample| f64::from(sample)))
+            .skip_while(|sample| sample.abs() < 1.0f64)
+            .collect();
+        let end = heard
+            .iter()
+            .rposition(|sample| sample.abs() >= 1.0f64)
+            .unwrap_or_default();
+        let span = heard.get(..end).unwrap_or_default();
+        let rising = span
+            .windows(2)
+            .filter(|pair| matches!(pair, [low, high] if *low < 0.0f64 && *high >= 0.0f64))
+            .count();
+        let rms = (span.iter().map(|sample| sample * sample).sum::<f64>()
+            / span.len().max(1) as f64)
+            .sqrt();
+        let hz = rising as f64 * f64::from(rate) / span.len().max(1) as f64;
+        format!(
+            "{} {}",
+            (hz / 10.0f64).round() * 10.0f64,
+            (rms / 100.0f64).round() * 100.0f64
+        )
+    }
+
+    /// `device mouth <name> --speaker` over the fake outputs of `$RIFT_SPEAKER`: a play given at
+    /// 16, 24 and 48 kHz sounds on a 48 and a 44.1 kHz output as the same tone at the same level, run
+    /// to its end, one run, its track's frames naming the output and its segment closed at `done`;
+    /// a hush at a set `take` plays exactly what the output took and drops the rest, with no further
+    /// callback; a mouth run dry splits the runs and holes the track; the default changed mid-play
+    /// reopens on the new output, keeping what is queued; with no output it says so and waits, the
+    /// giver paced; a refused open is said and retried; the output lingers after a play, then
+    /// closes; an older daemon is said once and waited out; the daemon gone, it drops its play and
+    /// connects again; a stop signal ends it, exit 0.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mouth() -> Outcome {
+        let root = temp("mouth")?;
+        let fake = format!("{root}/fake");
+        fs::create_dir_all(format!("{fake}/outputs"))?;
+        fs::write(format!("{fake}/outputs/Desk"), "48000 2 5")?;
+        fs::write(format!("{fake}/outputs/Hall"), "44100 1 0")?;
+        fs::write(format!("{fake}/default"), "Desk\n")?;
+        let (mut daemon, _) = serve(&root, &[("RIFT_SEGMENT_MS", "60000")])?;
+        let spawn = |at: &str| -> io::Result<Daemon> {
+            Ok(Daemon(
+                Command::new(env!("CARGO_BIN_EXE_rift"))
+                    .env("RIFT_ROOT", at)
+                    .env("RIFT_SPEAKER", &fake)
+                    .env("RIFT_POLL_MS", "100")
+                    .env("RIFT_LINGER_MS", "300")
+                    .args(["device", "mouth", "desk", "--speaker"])
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()?,
+            ))
+        };
+        let mut desk = spawn(&root)?;
+        let mut errs = BufReader::new(desk.0.stderr.take().ok_or("stderr")?);
+        let mut said = |line: &str| -> Outcome {
+            let mut got = String::new();
+            let _: usize = errs.read_line(&mut got)?;
+            same(&got, &format!("rift device: {line}\n"))
+        };
+        let log = || fs::read_to_string(format!("{fake}/log")).unwrap_or_default();
+        let listed = |track: &str| -> io::Result<bool> {
+            let mut conn = greet(&root).map_err(|cause| io::Error::other(cause.to_string()))?;
+            Ok(say(&mut conn, r#"{"op":"health"}"#)?.contains(track))
+        };
+        until(|| listed("mouth-desk"))?;
+        drop(rift(&root, &[], &["ears", "on"])?);
+        // to its end: the same tone at each rate, on each output
+        // the default set, then every output closed: it has seen the default, which would
+        // otherwise be followed mid-play
+        let closed = || Ok(log().matches("open ").count() == log().matches("close ").count());
+        for (rate, output) in [(16_000u32, "Desk"), (24_000, "Hall"), (48_000, "Hall")] {
+            fs::write(format!("{fake}/default"), format!("{output}\n"))?;
+            until(closed)?;
+            let before = taken(&fake, output).len();
+            let (reply, last) = joined(giver(&root, "mouth-desk", rate, tone(rate, 0.5)))?;
+            let given = rate.checked_div(2).unwrap_or_default();
+            same(
+                &format!("{} {}", reply["ok"], last),
+                &format!(
+                    r#"true {{"dropped":0,"given":{given},"play":{},"played":{given},"reason":"end","seq":{},"track":"mouth-desk"}}"#,
+                    reply["play"], last["seq"]
+                ),
+            )?;
+            let out_rate = if output == "Desk" { 48_000 } else { 44_100 };
+            same(
+                &measure(
+                    taken(&fake, output).get(before..).unwrap_or_default(),
+                    out_rate,
+                ),
+                "1000 11600",
+            )?;
+        }
+        // each play one run, its track's segment naming its output, closed at `done`
+        same(
+            &kinds(&root, "sound", usize::MAX)?
+                .lines()
+                .map(|line| {
+                    serde_json::from_str::<Value>(line)
+                        .map_or(Value::Null, |run| json!([run["from"], run["samples"]]))
+                        .to_string()
+                })
+                .collect::<Vec<_>>()
+                .join(" "),
+            "[0,8000] [0,12000] [0,24000]",
+        )?;
+        let segments: Vec<Value> = events(&root)?
+            .into_iter()
+            .map(|event| event["e"].clone())
+            .filter(|event| event["kind"] == "segment")
+            .collect();
+        same(
+            &json!(
+                segments
+                    .iter()
+                    .map(|segment| segment["speaker"].clone())
+                    .collect::<Vec<_>>()
+            )
+            .to_string(),
+            r#"["Desk","Hall","Hall"]"#,
+        )?;
+        // `rift play` gives a file, its odd last byte dropped: its reply, then its last line,
+        // exit 0 at its end; a stop signal ends it, exit 1, the play hushed (`left`)
+        let file = format!("{root}/tone.pcm");
+        let mut bytes: Vec<u8> = (tone(16_000, 0.2).iter())
+            .flat_map(|sample| sample.to_le_bytes())
+            .collect();
+        bytes.push(1);
+        fs::write(&file, &bytes)?;
+        let played = rift(&root, &[], &["play", "mouth-desk", "16000", &file])?;
+        same(
+            &format!(
+                "{} {}",
+                played.starts_with("0\n{\"ok\":true,\"play\":"),
+                played.contains(r#""dropped":0,"given":3200,"#)
+            ),
+            "true true",
+        )?;
+        let lasting: Vec<u8> = (tone(16_000, 5.0).iter())
+            .flat_map(|sample| sample.to_le_bytes())
+            .collect();
+        fs::write(&file, lasting)?;
+        let mut stopped = Daemon(
+            Command::new(env!("CARGO_BIN_EXE_rift"))
+                .env("RIFT_ROOT", &root)
+                .args(["play", "mouth-desk", "16000", &file])
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()?,
+        );
+        until(|| listed(r#""playing":{"mouth-desk""#))?;
+        same(&signal(&stopped, "INT")?, "")?;
+        let mut stop_line = String::new();
+        let _: usize =
+            BufReader::new(stopped.0.stderr.take().ok_or("stderr")?).read_line(&mut stop_line)?;
+        same(
+            &format!("{:?} {stop_line}", stopped.0.wait()?.code()),
+            "Some(1) rift play: stopped by SIGINT\n",
+        )?;
+        until(|| {
+            Ok(kinds(&root, "played", usize::MAX)?
+                .lines()
+                .last()
+                .is_some_and(|line| line.contains(r#""reason":"left""#)))
+        })?;
+        // a hush once Hall has taken 100 ms (4410 samples at 44.1 kHz) and no more: the last
+        // position read is 4409 × 16000 / 44100 = 1599.6, so 1600 of the play's samples played
+        until(closed)?;
+        let all = || {
+            taken(&fake, "Desk")
+                .len()
+                .saturating_add(taken(&fake, "Hall").len())
+        };
+        let budget = all().saturating_add(4410);
+        fs::write(format!("{fake}/take"), budget.to_string())?;
+        let hushing = giver(&root, "mouth-desk", 16_000, tone(16_000, 1.0));
+        until(|| Ok(all() == budget))?;
+        let hushed: Value = serde_json::from_str(
+            rift(&root, &[], &["hush", "mouth-desk"])?
+                .trim_start_matches("0\n")
+                .trim_end(),
+        )?;
+        let (_, last) = joined(hushing)?;
+        let kept = hushed["given"]
+            .as_u64()
+            .unwrap_or_default()
+            .saturating_sub(1600);
+        same(
+            &format!(
+                "{} {} {}",
+                hushed["played"],
+                hushed["reason"],
+                hushed["dropped"] == kept
+            ),
+            r#"1600 "hush" true"#,
+        )?;
+        same(&last["played"].to_string(), "1600")?;
+        fs::remove_file(format!("{fake}/take"))?;
+        // runs contiguous from 0, together what played, for every play
+        let contiguous = || -> Result<bool, Box<dyn Error>> {
+            let held = events(&root)?;
+            Ok(held
+                .iter()
+                .filter(|event| event["e"]["kind"] == "played")
+                .all(|ended| {
+                    let runs: Vec<&Value> = held
+                        .iter()
+                        .map(|event| &event["e"])
+                        .filter(|event| {
+                            event["kind"] == "sound" && event["play"] == ended["e"]["play"]
+                        })
+                        .collect();
+                    let mut at = 0u64;
+                    runs.iter().all(|run| {
+                        let fits = run["from"] == at;
+                        at = at.saturating_add(run["samples"].as_u64().unwrap_or_default());
+                        fits
+                    }) && ended["e"]["played"] == at
+                }))
+        };
+        same(&contiguous()?.to_string(), "true")?;
+        // a giver that stalls: the mouth runs dry, its runs split, its track holes
+        until(closed)?;
+        let (start, holes) = (
+            taken(&fake, "Hall").len(),
+            kinds(&root, "hole", usize::MAX)?.lines().count(),
+        );
+        let mut slow = greet(&root)?;
+        drop(say(
+            &mut slow,
+            r#"{"op":"play","rate":16000,"track":"mouth-desk"}"#,
+        )?);
+        drop(say(&mut slow, &give(&tone(16_000, 0.1)))?);
+        // 100 ms played, then 60 ms dry, at 44.1 kHz
+        until(|| Ok(taken(&fake, "Hall").len() >= start.saturating_add(7056)))?;
+        drop(say(&mut slow, &give(&tone(16_000, 0.1)))?);
+        drop(say(&mut slow, r#"{"op":"end"}"#)?);
+        let stalled: Value = serde_json::from_str(&next(&mut slow)?)?;
+        let runs = kinds(&root, "sound", usize::MAX)?;
+        same(
+            &format!(
+                "{} {}",
+                stalled["played"],
+                runs.matches(&format!(r#""play":{}"#, stalled["play"]))
+                    .count()
+                    >= 2
+            ),
+            "3200 true",
+        )?;
+        same(&contiguous()?.to_string(), "true")?;
+        same(
+            &(kinds(&root, "hole", usize::MAX)?.lines().count() >= holes.saturating_add(2))
+                .to_string(),
+            "true",
+        )?;
+        // the default changed mid-play: reopened on the new output, what is queued kept
+        until(closed)?;
+        let moving = giver(&root, "mouth-desk", 16_000, tone(16_000, 1.0));
+        let from = taken(&fake, "Hall").len();
+        until(|| Ok(taken(&fake, "Hall").len() >= from.saturating_add(8820)))?;
+        fs::write(format!("{fake}/default"), "Desk\n")?;
+        let (_, moved) = joined(moving)?;
+        same(
+            &format!("{} {}", moved["played"], moved["reason"]),
+            r#"16000 "end""#,
+        )?;
+        same(&contiguous()?.to_string(), "true")?;
+        same(
+            &kinds(&root, "hole", usize::MAX)?
+                .contains(r#""speaker":"Desk""#)
+                .to_string(),
+            "true",
+        )?;
+        // no output at all: said, the giver paced, until one appears; a refused open said and
+        // retried
+        until(closed)?;
+        fs::remove_file(format!("{fake}/default"))?;
+        let waiting = giver(&root, "mouth-desk", 16_000, tone(16_000, 0.2));
+        said("waiting for a default output; the outputs present: Desk, Hall")?;
+        fs::write(format!("{fake}/outputs/Broken"), "fail")?;
+        fs::write(format!("{fake}/default"), "Broken\n")?;
+        said(r#""Broken": refused"#)?;
+        fs::write(format!("{fake}/default"), "Desk\n")?;
+        let (_, waited) = joined(waiting)?;
+        same(&waited["reason"].to_string(), r#""end""#)?;
+        // it lingers, then closes
+        let ended = Instant::now();
+        until(closed)?;
+        same(
+            &(ended.elapsed() >= Duration::from_millis(250)).to_string(),
+            "true",
+        )?;
+        // the ears closed: it plays, and sends no frames
+        drop(rift(&root, &[], &["ears", "off"])?);
+        let frames = events(&root)?.len();
+        let (_, deaf) = joined(giver(&root, "mouth-desk", 16_000, tone(16_000, 0.1)))?;
+        let since = events(&root)?.len().saturating_sub(frames);
+        same(
+            &format!(
+                "{} {}",
+                deaf["reason"],
+                kinds(&root, "", since)?.contains("segment")
+            ),
+            r#""end" false"#,
+        )?;
+        // the daemon drained mid-play: hushed (`stop`); the mouth drops its play and, the daemon
+        // back, connects again
+        let draining = giver(&root, "mouth-desk", 16_000, tone(16_000, 2.0));
+        until(|| listed(r#""playing":{"mouth-desk""#))?;
+        same(
+            &say(&mut greet(&root)?, r#"{"op":"shutdown"}"#)?,
+            r#"{"ok":true}"#,
+        )?;
+        drop(draining.join());
+        same(
+            &kinds(&root, "played", usize::MAX)?
+                .lines()
+                .last()
+                .unwrap_or_default()
+                .contains(r#""reason":"stop""#)
+                .to_string(),
+            "true",
+        )?;
+        same(&format!("{:?}", daemon.0.wait()?.code()), "Some(0)")?;
+        let (mut again, _) = serve(&root, &[])?;
+        until(|| listed("mouth-desk"))?;
+        // an older daemon, which plays nothing: said once, waited out as a refusal
+        let other = format!("{root}/other");
+        let hello = format!(
+            r#"{{"boot":1,"ok":true,"pid":1,"proto":1,"since":"x","state":"ready","version":"{}"}}"#,
+            version()?
+        );
+        self::fake(
+            &other,
+            &[
+                &hello,
+                r#"{"ears":false,"ok":true,"ping":1,"track":"mouth-desk"}"#,
+            ],
+        )?;
+        let mut older = spawn(&other)?;
+        let mut printed = BufReader::new(older.0.stdout.take().ok_or("stdout")?);
+        same(
+            &next(&mut printed)?,
+            r#"{"ears":false,"ok":true,"ping":1,"track":"mouth-desk"}"#,
+        )?;
+        let older_errs = BufReader::new(older.0.stderr.take().ok_or("stderr")?);
+        same(&signal(&older, "TERM")?, "")?;
+        same(
+            &format!(
+                "{:?} {}",
+                older.0.wait()?.code(),
+                older_errs
+                    .lines()
+                    .map_while(Result::ok)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
+            &format!(
+                "Some(0) rift device: the daemon {} plays nothing; fix: rift setup\nrift device: stopped by SIGTERM",
+                version()?
+            ),
+        )?;
+        // a stop signal ends it, exit 0
+        same(&signal(&desk, "TERM")?, "")?;
+        said("stopped by SIGTERM")?;
+        same(&format!("{:?}", desk.0.wait()?.code()), "Some(0)")?;
+        same(
+            &say(&mut greet(&root)?, r#"{"op":"shutdown"}"#)?,
+            r#"{"ok":true}"#,
+        )?;
+        same(&format!("{:?}", again.0.wait()?.code()), "Some(0)")
     }
 }

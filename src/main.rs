@@ -1,21 +1,26 @@
 //! `rift`. `serve` is the daemon, an append-only event log served over a unix socket
 //! (docs/protocol.html, protocol 1) and an audio stream its devices feed onto one clock; `status`,
 //! `quiet`, `ears`, `keep`, `feed`, `listen` and `read` are thin clients of that socket, `device`
-//! one that plays a raw PCM file as frames or, on macOS, hears a microphone (`ear.rs`); `setup`
-//! installs the release, signs it and loads its launchd agent, `upgrade` swaps in a newer release;
-//! `version` prints the build.
+//! one that plays a raw PCM file as frames or, on macOS, hears a microphone (`ear.rs`) or plays
+//! what it is given (`mouth.rs`), `play` and `hush` a mouth's givers; `setup` installs the
+//! release, signs it and loads its launchd agents, `upgrade` swaps in a newer release; `version`
+//! prints the build.
 
 #[cfg(target_os = "macos")]
 mod ear;
 #[cfg(target_os = "macos")]
 mod mic;
+#[cfg(target_os = "macos")]
+mod mouth;
+#[cfg(target_os = "macos")]
+mod speaker;
 
 use serde_json::{Value, json};
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 use signal_hook::low_level::signal_name;
 use std::cell::Cell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fmt::Write as _;
 use std::fs::{self, DirBuilder, OpenOptions, Permissions, TryLockError};
@@ -31,7 +36,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Output, Stdio, exit, id};
 use std::str::FromStr;
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
-use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
+use std::sync::{Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -44,11 +49,17 @@ const FRAME: usize = 640;
 /// The longest request line, its `\n` not counted (docs/protocol.html#framing).
 const LINE: u64 = 1 << 16;
 
+/// How long a hushed mouth has to answer before it is cut (docs/protocol.html#plays).
+const PATIENCE: Duration = Duration::from_secs(1);
+
 /// The wire protocol this build speaks.
 const PROTO: u64 = 1;
 
 /// The `stopping` state, the one the request handler tests for.
 const STOPPING: &str = "stopping";
+
+/// Woken at every change to a play: a withheld give, a hush and the drain wait on it with `live`.
+static ROOM: Condvar = Condvar::new();
 
 /// The release (a checkout's build: the crate version), then `build.rs`'s short commit: hello's
 /// and health's `version`.
@@ -76,6 +87,8 @@ enum Next {
 /// The daemon's state behind one mutex: an append and a feed's subscription each hold it, so a
 /// replay and the live events after it are one sequence.
 struct Live {
+    /// How far ahead of its output a play's mouth may hold it, in milliseconds.
+    ahead: u64,
     /// The directory a segment leaving the window moves into, else null: it is deleted.
     archive: Value,
     /// This boot's number, derived from the log.
@@ -84,6 +97,9 @@ struct Live {
     conns: BTreeMap<u64, UnixStream>,
     /// Whether the ears are open: whether devices' frames are taken.
     ears: bool,
+    /// Each mouth's last play to end, by its track: its last line, its giver's and its hush's
+    /// reply, kept until the next one ends.
+    ended: BTreeMap<String, Value>,
     /// Each feed's queue, its connection's key and its topic: `""` the events, `"ears"` a
     /// device's replies and notices, else the track a listener follows.
     feeds: Vec<(SyncSender<String>, u64, String)>,
@@ -92,6 +108,10 @@ struct Live {
     held: Vec<Value>,
     /// The last connection key handed out.
     keys: u64,
+    /// The last play's number, across every boot.
+    numbered: u64,
+    /// Each open play, by its mouth's track.
+    plays: BTreeMap<String, Play>,
     /// The quiet setting.
     quiet: bool,
     /// The state root; `events.ndjson` and the segments under `audio/` are its durable state.
@@ -115,6 +135,25 @@ struct Live {
     window: u64,
 }
 
+/// A play: audio given for a mouth and passed to the device streaming it, which holds what waits
+/// (docs/protocol.html#plays).
+struct Play {
+    /// Whether its giver sent `end`.
+    end: bool,
+    /// Its samples given so far, at its rate.
+    given: u64,
+    /// Its giver's connection key.
+    giver: u64,
+    /// Why it is hushed, once the mouth is told.
+    hushed: Option<&'static str>,
+    /// Its number.
+    num: u64,
+    /// The given audio's rate in Hz.
+    rate: u64,
+    /// The run under way: its first sample, its samples so far and when the first sounded.
+    run: Option<(u64, u64, u64)>,
+}
+
 /// A track, one device's sound on the daemon's clock, in this boot.
 #[derive(Default)]
 struct Track {
@@ -122,12 +161,14 @@ struct Track {
     conn: Option<u64>,
     /// Where its next frame goes on the timeline, once it has had one.
     end: Option<u64>,
-    /// The microphone its last frame named, else null.
+    /// The microphone (a mouth's: the output) its last frame named, else null.
     mic: Value,
     /// The next segment's number.
     next: u64,
     /// The open segment's number, start and samples written.
     open: Option<(u64, u64, u64)>,
+    /// Whether the device streaming it plays (docs/protocol.html#plays).
+    plays: bool,
 }
 
 impl Live {
@@ -141,7 +182,7 @@ impl Live {
             .filter(|entry| only.is_none_or(|one| one == entry.0.as_str()))
             .filter_map(|(name, track)| {
                 let (num, start, samples) = track.open?;
-                Some((name.clone(), bare(json!({"kind": "segment", "mic": track.mic, "n": num, "path": format!("audio/{boot}/{name}/{num}.pcm"), "samples": samples, "start": start, "track": name}))))
+                Some((name.clone(), labelled(json!({"kind": "segment", "n": num, "path": format!("audio/{boot}/{name}/{num}.pcm"), "samples": samples, "start": start, "track": name}), &track.mic)))
             })
             .collect();
         for (name, event) in closing {
@@ -181,6 +222,32 @@ impl Live {
         });
     }
 
+    /// Ends `track`'s open play for `reason`: its run under way and `played` logged, its last
+    /// line kept for its giver and its hush, the mouth's open segment closed, its giver woken.
+    fn finish(&mut self, track: &str, reason: &str) {
+        let Some(play) = self.plays.remove(track) else {
+            return;
+        };
+        let (num, played) = (play.num, play.played());
+        if let Some((from, samples, start)) = play.run {
+            drop(self.emit(&json!({"from": from, "kind": "sound", "play": num, "samples": samples, "start": start, "track": track})));
+        }
+        let mut last = json!({"dropped": play.given.saturating_sub(played), "given": play.given, "kind": "played", "play": num, "played": played, "reason": reason, "track": track});
+        drop(self.emit(&last));
+        if let Some(fields) = last.as_object_mut() {
+            drop(fields.remove("kind"));
+            drop(fields.insert("seq".to_owned(), self.seq.into()));
+        }
+        drop(self.ended.insert(track.to_owned(), last));
+        drop(self.close(Some(track)));
+        drop(
+            self.conns
+                .get(&play.giver)
+                .map(|conn| conn.shutdown(Shutdown::Read)),
+        );
+        ROOM.notify_all();
+    }
+
     /// The health reply: hello's fields, then the stream's and the switches'.
     fn health(&self) -> Value {
         let mut reply = self.hello();
@@ -194,6 +261,7 @@ impl Live {
             reply["archive"],
             reply["devices"],
             reply["ears"],
+            reply["playing"],
             reply["quiet"],
             reply["seq"],
             reply["window"],
@@ -201,6 +269,9 @@ impl Live {
             self.archive.clone(),
             json!(devices),
             self.ears.into(),
+            (self.plays.iter())
+                .map(|(track, play)| (track.clone(), Value::from(play.num)))
+                .collect(),
             self.quiet.into(),
             self.seq.into(),
             self.window.into(),
@@ -211,6 +282,15 @@ impl Live {
     /// The hello reply.
     fn hello(&self) -> Value {
         json!({"boot": self.boot, "ok": true, "pid": id(), "proto": PROTO, "since": self.since, "state": self.state, "version": VERSION})
+    }
+
+    /// Tells `track`'s mouth to drop its open play for `reason`, once.
+    fn hush(&mut self, track: &str, reason: &'static str) {
+        if let Some(play) = (self.plays.get_mut(track)).filter(|play| play.hushed.is_none()) {
+            play.hushed = Some(reason);
+            let num = play.num;
+            self.tell(track, &json!({"hush": num}));
+        }
     }
 
     /// `wrote`, a write to the log or a segment, as it came; the state `ready` once one
@@ -230,6 +310,21 @@ impl Live {
             .collect();
         drop(self.sweeps.send((self.archive.clone(), due)));
     }
+
+    /// Queues `line` to the playing device streaming `track`, the way its replies leave, under the
+    /// topic `<track>>`; one whose queue is full is dropped as a feed is, its play ending as it
+    /// leaves.
+    fn tell(&mut self, track: &str, line: &Value) {
+        self.fan(&format!("{track}>"), &format!("{line}\n"));
+    }
+}
+
+impl Play {
+    /// The samples its output took: the run under way's end, runs being contiguous from 0.
+    fn played(&self) -> u64 {
+        self.run
+            .map_or(0, |(from, samples, _)| from.saturating_add(samples))
+    }
 }
 
 /// Appends `bytes` to `path`, created when absent, in one write: a failed one is cut back to the
@@ -241,11 +336,55 @@ fn append(path: &Path, bytes: &[u8]) -> io::Result<()> {
         .inspect_err(|_| drop(file.set_len(len)))
 }
 
-/// `event` without its null fields: a stream event names a microphone only when its frames did.
-fn bare(mut event: Value) -> Value {
+/// A stream event naming what its frames name, `mic` on an ear's track and `speaker` on a
+/// mouth's, only when they name one: a file-fed device's events are as they were.
+fn labelled(mut event: Value, heard: &Value) -> Value {
+    let key = if event["track"]
+        .as_str()
+        .is_some_and(|track| track.starts_with("mouth-"))
+    {
+        "speaker"
+    } else {
+        "mic"
+    };
+    event[key] = heard.clone();
     (event.as_object_mut().into_iter())
         .for_each(|fields| fields.retain(|_, field| !field.is_null()));
     event
+}
+
+/// `track`'s open play hushed for `reason` and waited on until it ends; a mouth that has not
+/// answered within `patience` is cut and the play ended at its last report, `mouth` (the drain's:
+/// `stop`). Its last line, or `"play":null` with none open.
+fn quell<'guard>(
+    mut guard: MutexGuard<'guard, Live>,
+    track: &str,
+    reason: &'static str,
+    patience: Duration,
+) -> (MutexGuard<'guard, Live>, Value) {
+    let Some(num) = guard.plays.get(track).map(|play| play.num) else {
+        return (guard, json!({"play": null}));
+    };
+    guard.hush(track, reason);
+    let begun = Instant::now();
+    while guard.plays.get(track).is_some_and(|play| play.num == num) {
+        let left = patience.saturating_sub(begun.elapsed());
+        if left.is_zero() {
+            let mouth = guard.tracks.get(track).and_then(|held| held.conn);
+            drop(
+                mouth
+                    .and_then(|key| guard.conns.get(&key))
+                    .map(|conn| conn.shutdown(Shutdown::Both)),
+            );
+            guard.finish(track, if reason == "stop" { reason } else { "mouth" });
+        }
+        guard = ROOM
+            .wait_timeout(guard, left)
+            .unwrap_or_else(PoisonError::into_inner)
+            .0;
+    }
+    let last = guard.ended.get(track).cloned().unwrap_or_default();
+    (guard, last)
 }
 
 /// Where a stream event's span ends on the daemon's clock: its `start` plus its `samples` (a
@@ -394,6 +533,10 @@ fn utc(time: SystemTime) -> String {
     )
 }
 
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "main is one dispatch over the verbs: split, each arm would be a function called once"
+)]
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
     let words: Vec<&str> = args.iter().skip(1).map(String::as_str).collect();
@@ -407,6 +550,9 @@ fn main() -> ExitCode {
     let asked = match *words.as_slice() {
         ["device", "ear", name, "--mic"] | ["device", "ear", name, "--mic", _] => {
             Some(json!({"kind": "ear", "name": name, "op": "device"}))
+        }
+        ["device", "mouth", name, "--speaker"] => {
+            Some(json!({"kind": "mouth", "name": name, "op": "device", "plays": true}))
         }
         ["device", kind, name, _] | ["device", kind, name, _, "--fast"] => {
             Some(json!({"kind": kind, "name": name, "op": "device"}))
@@ -422,7 +568,12 @@ fn main() -> ExitCode {
                 .map(|dir| env::current_dir().unwrap_or_default().join(dir));
             json!({"archive": archive, "op": "keep", "window": window})
         }),
+        ["hush", track] => Some(json!({"op": "hush", "track": track})),
         ["listen", track] => Some(json!({"op": "listen", "track": track})),
+        ["play", track, rate] | ["play", track, rate, _] => rate
+            .parse::<u64>()
+            .ok()
+            .map(|hz| json!({"op": "play", "rate": hz, "track": track})),
         ["read", track, from, to] => from.parse::<u64>().ok().zip(to.parse::<u64>().ok()).map(
             |(start, stop)| json!({"from": start, "op": "read", "to": stop, "track": track}),
         ),
@@ -431,29 +582,51 @@ fn main() -> ExitCode {
     };
     match (words.as_slice(), asked) {
         (&[verb, ..], Some(wanted)) => {
-            // an ear's alone: a mouth's `--mic` is the file it plays
+            // an ear's alone: a mouth's `--mic` is the file it plays; a standing device is either
             let mic = matches!(*words.as_slice(), ["device", "ear", _, "--mic", ..]);
+            let speaker = matches!(*words.as_slice(), ["device", "mouth", _, "--speaker"]);
+            let stand = mic || speaker;
             #[cfg(not(target_os = "macos"))]
-            if mic {
-                eprintln!("rift device: --mic is macOS only; a file-fed device plays anywhere");
+            if stand {
+                eprintln!(
+                    "rift device: --mic and --speaker are macOS only; a file-fed device plays anywhere"
+                );
                 return ExitCode::from(2);
             }
-            // a stop signal ends the ear at once, wherever it waits, exit 0: it holds nothing an
-            // exit does not let go, and the daemon closes its segment as it goes
-            if mic {
+            // a stop signal ends a standing device at once, wherever it waits, exit 0: it holds
+            // nothing an exit does not let go, and the daemon closes its segment as it goes; it
+            // ends a play the same way, exit 1, its connection's end hushing the play
+            if stand || verb == "play" {
+                let said = verb.to_owned();
                 drop(Signals::new([SIGHUP, SIGINT, SIGTERM]).map(|mut signals| {
                     thread::spawn(move || {
                         let signal = signals.forever().next().unwrap_or_default();
                         let name = signal_name(signal).unwrap_or_default();
-                        drop(writeln!(io::stderr(), "rift device: stopped by {name}"));
-                        exit(0)
+                        drop(writeln!(io::stderr(), "rift {said}: stopped by {name}"));
+                        exit(i32::from(!stand))
                     })
                 }));
             }
+            // a play's audio: its file, opened before it connects, else stdin as it comes
+            let mut audio: Box<dyn io::Read> = match words
+                .get(3)
+                .filter(|_| verb == "play")
+                .map(fs::File::open)
+                .transpose()
+            {
+                Ok(file) => file.map_or_else(
+                    || -> Box<dyn io::Read> { Box::new(io::stdin()) },
+                    |held| Box::new(held),
+                ),
+                Err(cause) => {
+                    eprintln!("rift play: {cause}");
+                    return ExitCode::FAILURE;
+                }
+            };
             // a device's file, read before it connects
             let pcm = match words
                 .get(3)
-                .filter(|_| verb == "device" && !mic)
+                .filter(|_| verb == "device" && !stand)
                 .map(fs::read)
                 .transpose()
             {
@@ -476,7 +649,7 @@ fn main() -> ExitCode {
             let (refused, strikes) = (Cell::new(Value::Null), Cell::new(0u32));
             let strike = |code: &Value| {
                 strikes.set(strikes.get().saturating_add(1));
-                mic && refused.replace(code.clone()) != *code
+                stand && refused.replace(code.clone()) != *code
             };
             let tell = |line: &Value| {
                 println!("{line}");
@@ -485,9 +658,10 @@ fn main() -> ExitCode {
                 }
             };
             loop {
-                // the standing ear's launchd stderr, capped as the daemon's is, at each attempt
-                if mic {
-                    rotate(&root.join("ear.err"), setting("RIFT_LOG_CAP", 1u64 << 20));
+                // a standing device's launchd stderr, capped as the daemon's is, at each attempt
+                if stand {
+                    let err = if mic { "ear.err" } else { "mouth.err" };
+                    rotate(&root.join(err), setting("RIFT_LOG_CAP", 1u64 << 20));
                 }
                 // set once the request may have left: a failure after it is an unknown outcome
                 let sent = Cell::new(false);
@@ -513,10 +687,23 @@ fn main() -> ExitCode {
                 };
                 let code = match talk() {
                     Ok((hello, _, _)) if hello["code"] == "proto" => {
-                        if !mic || strike(&hello["code"]) {
+                        if !stand || strike(&hello["code"]) {
                             eprintln!(
                                 "rift {verb}: the daemon speaks protocol {} ({}), this client protocol {PROTO} ({VERSION}); fix: rift setup, so both are one release",
                                 hello["proto"],
+                                hello["version"].as_str().unwrap_or_default()
+                            );
+                        }
+                        ExitCode::FAILURE
+                    }
+                    // a daemon that plays nothing, an older release: waited out as a refusal
+                    Ok((hello, reply, _))
+                        if speaker && reply["ok"] == true && reply["plays"] != true =>
+                    {
+                        println!("{reply}");
+                        if strike(&json!("plays")) {
+                            eprintln!(
+                                "rift device: the daemon {} plays nothing; fix: rift setup",
                                 hello["version"].as_str().unwrap_or_default()
                             );
                         }
@@ -532,10 +719,14 @@ fn main() -> ExitCode {
                         if verb == "device" && reply["ok"] == true {
                             println!("{reply}");
                             #[cfg(target_os = "macos")]
-                            if mic {
+                            if stand {
                                 refused.set(Value::Null);
                                 strikes.set(0);
-                                ear::run(reader, &reply, words.get(4).copied());
+                                if mic {
+                                    ear::run(reader, &reply, words.get(4).copied());
+                                } else {
+                                    mouth::run(reader, &reply);
+                                }
                                 thread::sleep(poll);
                                 continue;
                             }
@@ -599,6 +790,42 @@ fn main() -> ExitCode {
                                 |()| ExitCode::SUCCESS,
                             );
                         }
+                        // a play: each 16384 bytes given as its reply allows, then `end`, then the
+                        // play's last line, which has no `ok`; a write a play's end beat is no matter
+                        if verb == "play" && reply["ok"] == true {
+                            println!("{reply}");
+                            drop(reader.get_ref().set_read_timeout(None));
+                            let mut chunk = Vec::new();
+                            let last = loop {
+                                chunk.clear();
+                                drop((&mut audio).take(0x4000).read_to_end(&mut chunk));
+                                // whole samples: an odd last byte is dropped
+                                chunk.truncate(chunk.len() & !1);
+                                let line = if chunk.is_empty() {
+                                    json!({"op": "end"})
+                                } else {
+                                    json!({"op": "give", "pcm": hex(&chunk)})
+                                };
+                                drop(writeln!(reader.get_mut(), "{line}"));
+                                match answer(&mut reader) {
+                                    Ok(said) if said.get("ok").is_some() && !chunk.is_empty() => {}
+                                    Ok(said) if said.get("ok").is_some() => {
+                                        break answer(&mut reader);
+                                    }
+                                    other => break other,
+                                }
+                            };
+                            return last.map_or_else(
+                                |_| {
+                                    println!("{}", error("unknown"));
+                                    ExitCode::FAILURE
+                                },
+                                |said| {
+                                    println!("{said}");
+                                    ExitCode::from(u8::from(said["reason"] != "end"))
+                                },
+                            );
+                        }
                         if matches!(verb, "feed" | "listen" | "read") && reply["ok"] == true {
                             if reply["reset"] == true {
                                 eprintln!(
@@ -626,7 +853,7 @@ fn main() -> ExitCode {
                         ExitCode::FAILURE
                     }
                 };
-                if !mic {
+                if !stand {
                     break code;
                 }
                 thread::sleep(poll.saturating_mul(2u32.saturating_pow(strikes.get().min(6))));
@@ -722,7 +949,30 @@ fn main() -> ExitCode {
                     .filter(|event| event["e"]["kind"] == "segment")
                     .collect();
                 let (sweeps, swept) = mpsc::channel::<(Value, Vec<Value>)>();
+                // each play the log holds without its end, with what its logged runs sounded
+                let of = |kind: &'static str| {
+                    held_events
+                        .iter()
+                        .map(|event| &event["e"])
+                        .filter(move |event| event["kind"] == kind)
+                };
+                let over: BTreeSet<u64> = of("played")
+                    .filter_map(|event| event["play"].as_u64())
+                    .collect();
+                let unended: Vec<(&Value, &Value, u64)> = of("play")
+                    .filter(|event| {
+                        !event["play"]
+                            .as_u64()
+                            .is_some_and(|num| over.contains(&num))
+                    })
+                    .map(|event| {
+                        let runs = of("sound").filter(|run| run["play"] == event["play"]);
+                        let sounded = runs.map(|run| run["samples"].as_u64().unwrap_or_default());
+                        (&event["play"], &event["track"], sounded.sum())
+                    })
+                    .collect();
                 let live: &'static Mutex<Live> = Box::leak(Box::new(Mutex::new(Live {
+                    ahead: setting("RIFT_AHEAD_MS", 200),
                     archive: kept.map_or(Value::Null, |keep| keep["archive"].clone()),
                     boot: held_events
                         .last()
@@ -731,6 +981,7 @@ fn main() -> ExitCode {
                         .saturating_add(1),
                     conns: BTreeMap::new(),
                     ears: last("ears").is_some_and(|ears| ears["on"] == true),
+                    ended: BTreeMap::new(),
                     feeds: Vec::new(),
                     held: closed
                         .iter()
@@ -741,6 +992,9 @@ fn main() -> ExitCode {
                         .map(|&event| event.clone())
                         .collect(),
                     keys: 0,
+                    numbered: last("play")
+                        .map_or(0, |play| play["play"].as_u64().unwrap_or_default()),
+                    plays: BTreeMap::new(),
                     quiet: last("quiet").is_some_and(|quiet| quiet["on"] == true),
                     root: root.clone(),
                     segment: setting("RIFT_SEGMENT_MS", 10_000u64)
@@ -796,6 +1050,10 @@ fn main() -> ExitCode {
                 fs::write(&pid, id().to_string())?;
                 let mut guard = lock(live);
                 drop(guard.emit(&json!({"kind": "boot", "pid": id(), "version": VERSION}))?);
+                // a play a kill left open: what its logged runs sounded, the rest not on disk
+                for (num, track, played) in unended {
+                    drop(guard.emit(&json!({"kind": "played", "play": num, "played": played, "reason": "lost", "track": track}))?);
+                }
                 // a segment a kill left open: cut to whole frames and closed with its event, its
                 // start where its track's last event of that boot ended
                 let mut torn: Vec<String> = fs::read_dir(root.join("audio"))
@@ -836,7 +1094,8 @@ fn main() -> ExitCode {
                     else {
                         continue;
                     };
-                    // and its microphone that event's: a microphone's change opens with a hole
+                    // and its microphone that event's: a microphone's change opens with a hole; a
+                    // play's runs are in its own samples, never the track's
                     let (start, mic) = held_events
                         .iter()
                         .rev()
@@ -844,12 +1103,15 @@ fn main() -> ExitCode {
                             event["boot"] == boot
                                 && event["e"]["track"] == track
                                 && event["e"]["start"].is_u64()
+                                && event["e"]["kind"] != "sound"
                         })
                         .map_or((0, Value::Null), |event| {
-                            (end(&event["e"]), event["e"]["mic"].clone())
+                            let heard = &event["e"];
+                            let mic = heard.get("mic").or_else(|| heard.get("speaker"));
+                            (end(heard), mic.cloned().unwrap_or_default())
                         });
                     let num: u64 = name.trim_end_matches(".pcm").parse().unwrap_or_default();
-                    let logged = guard.emit(&bare(json!({"kind": "segment", "mic": mic, "n": num, "path": path, "samples": frames.saturating_mul(320), "start": start, "track": track})))?;
+                    let logged = guard.emit(&labelled(json!({"kind": "segment", "n": num, "path": path, "samples": frames.saturating_mul(320), "start": start, "track": track}), &mic))?;
                     guard.held.push(logged);
                 }
                 guard.sweep();
@@ -913,12 +1175,13 @@ fn main() -> ExitCode {
                         (BufReader::new(read), stream, false);
                     // a device's track, its clock and the daemon's at one instant (by its last
                     // pong; until one, no frame is placed), its last ping, and the queue its
-                    // writer drains
-                    let (mut device, mut clock, mut pinged, mut queue) = (
+                    // writer drains; a giver's mouth and play
+                    let (mut device, mut clock, mut pinged, mut queue, mut giving) = (
                         None::<String>,
                         None::<(u64, u64)>,
                         Instant::now(),
                         None::<SyncSender<String>>,
+                        None::<(String, u64)>,
                     );
                     let every = Duration::from_millis(setting("RIFT_PING_MS", 10_000));
                     loop {
@@ -941,17 +1204,37 @@ fn main() -> ExitCode {
                         let named = request["kind"]
                             .as_str()
                             .zip(request["name"].as_str())
-                            .filter(|&(kind, name)| well(kind, name))
+                            // only a mouth plays
+                            .filter(|&(kind, name)| {
+                                well(kind, name) && (kind == "mouth" || request["plays"] != true)
+                            })
                             .map(|(kind, name)| format!("{kind}-{name}"));
+                        // what a frame names: a mouth's its output
+                        let heard = &request[if device
+                            .as_ref()
+                            .is_some_and(|name| name.starts_with("mouth-"))
+                        {
+                            "speaker"
+                        } else {
+                            "mic"
+                        }];
+                        // lowercase digits only: from_str_radix alone takes uppercase and a `+`
+                        let digits = |text: &&str| {
+                            text.bytes()
+                                .all(|digit| matches!(digit, b'0'..=b'9' | b'a'..=b'f'))
+                        };
+                        // a give's audio: 2 to 16384 bytes of whole samples
+                        let given = request["pcm"].as_str().filter(|text| {
+                            (4..=0x8000).contains(&text.len())
+                                && text.len().is_multiple_of(4)
+                                && digits(text)
+                        });
                         let pcm = request["pcm"]
                             .as_str()
-                            // lowercase digits only: from_str_radix alone takes uppercase and a `+`
                             .filter(|text| {
-                                (request["mic"].is_null() || request["mic"].is_string())
+                                (heard.is_null() || heard.is_string())
                                     && text.len() == FRAME * 2
-                                    && text
-                                        .bytes()
-                                        .all(|digit| matches!(digit, b'0'..=b'9' | b'a'..=b'f'))
+                                    && digits(text)
                             })
                             .and_then(|text| {
                                 text.as_bytes()
@@ -987,10 +1270,13 @@ fn main() -> ExitCode {
                             (true, Some(op)) if guard.state == STOPPING && op != "health" => {
                                 (Ok(error(STOPPING)), Next::Go)
                             }
-                            // a device's connection carries its frames, never a stream of replies
-                            (true, Some("device" | "feed" | "listen" | "read"))
-                                if device.is_some() =>
-                            {
+                            // a device's connection carries its frames, never a stream of replies,
+                            // and a play's its gives
+                            (
+                                true,
+                                Some("device" | "feed" | "hush" | "listen" | "play" | "read"),
+                            ) if device.is_some() => (Ok(error("bad_request")), Next::Go),
+                            (true, Some(op)) if giving.is_some() && op != "give" && op != "end" => {
                                 (Ok(error("bad_request")), Next::Go)
                             }
                             (true, Some("device"))
@@ -1006,10 +1292,17 @@ fn main() -> ExitCode {
                             (true, Some("device")) if named.is_some() => {
                                 let name = named.unwrap_or_default();
                                 let (sender, incoming) = mpsc::sync_channel(BEHIND);
-                                guard.tracks.entry(name.clone()).or_default().conn = Some(key);
+                                let plays = request["plays"] == true;
+                                let held = guard.tracks.entry(name.clone()).or_default();
+                                (held.conn, held.plays) = (Some(key), plays);
                                 guard.feeds.push((sender.clone(), key, "ears".to_owned()));
+                                let mut reply = json!({"ears": guard.ears, "ok": true, "ping": now(), "track": name});
+                                // a playing one is told its plays under a topic of its own
+                                if plays {
+                                    reply["plays"] = true.into();
+                                    guard.feeds.push((sender.clone(), key, format!("{name}>")));
+                                }
                                 queue = Some(sender);
-                                let reply = json!({"ears": guard.ears, "ok": true, "ping": now(), "track": name});
                                 device = Some(name);
                                 (Ok(reply), Next::Device(incoming))
                             }
@@ -1037,6 +1330,15 @@ fn main() -> ExitCode {
                                         } else {
                                             &mut guard.quiet
                                         }) = on;
+                                        // quiet on hushes every play, each waited on apart
+                                        for playing in
+                                            guard.plays.keys().filter(|_| op == "quiet" && on)
+                                        {
+                                            let mouth = playing.clone();
+                                            drop(thread::spawn(move || {
+                                                drop(quell(lock(live), &mouth, "quiet", PATIENCE));
+                                            }));
+                                        }
                                     }
                                     Ok(json!({"changed": changed, "ok": true, "seq": guard.seq}))
                                 })();
@@ -1060,15 +1362,15 @@ fn main() -> ExitCode {
                                             .min(now());
                                         let placed = (|| {
                                             // logged only once the frame is written, so a refused one changes nothing
-                                            let (known, mic) =
-                                                (state.tracks.get(&name), &request["mic"]);
+                                            let (known, mic) = (state.tracks.get(&name), heard);
                                             let (start, event) = match known
                                                 .and_then(|held| held.end)
                                             {
                                                 None => (
                                                     at,
-                                                    Some(bare(
-                                                        json!({"kind": "track", "mic": mic, "start": at, "track": name}),
+                                                    Some(labelled(
+                                                        json!({"kind": "track", "start": at, "track": name}),
+                                                        mic,
                                                     )),
                                                 ),
                                                 // half a frame or more past the track's end is a
@@ -1079,8 +1381,9 @@ fn main() -> ExitCode {
                                                             held.mic != *mic
                                                         }) =>
                                                 {
-                                                    let gap = bare(
-                                                        json!({"kind": "hole", "mic": mic, "samples": samples(at.saturating_sub(last)), "start": last, "track": name}),
+                                                    let gap = labelled(
+                                                        json!({"kind": "hole", "samples": samples(at.saturating_sub(last)), "start": last, "track": name}),
+                                                        mic,
                                                     );
                                                     (end(&gap), Some(gap))
                                                 }
@@ -1123,7 +1426,7 @@ fn main() -> ExitCode {
                                                 num.saturating_add(1),
                                                 Some((num, first, full)),
                                                 Some(start.saturating_add(20_000)),
-                                                request["mic"].clone(),
+                                                heard.clone(),
                                             );
                                             // the frame is placed: a close that fails to log
                                             // leaves the segment open for the next frame's close
@@ -1149,6 +1452,167 @@ fn main() -> ExitCode {
                                 }
                             }
                             (true, Some("health")) => (Ok(guard.health()), Next::Go),
+                            // a giver's audio: counted as it is read and passed to the mouth, its
+                            // reply withheld while the mouth holds `$RIFT_AHEAD_MS` of it untaken
+                            (true, Some("give")) if giving.is_some() && given.is_none() => {
+                                (Ok(error("bad_frame")), Next::Go)
+                            }
+                            (true, Some("give"))
+                                if giving.as_ref().is_some_and(|held| {
+                                    guard
+                                        .plays
+                                        .get(&held.0)
+                                        .is_some_and(|play| play.num == held.1)
+                                }) =>
+                            {
+                                let (mouth, num) = giving.clone().unwrap_or_default();
+                                let (ahead, text) = (guard.ahead, given.unwrap_or_default());
+                                // four hex digits a sample
+                                let count = u64::try_from(text.len())
+                                    .unwrap_or_default()
+                                    .checked_div(4)
+                                    .unwrap_or_default();
+                                let (total, rate) =
+                                    guard.plays.get_mut(&mouth).map_or((0, 0), |play| {
+                                        play.given = play.given.saturating_add(count);
+                                        (play.given, play.rate)
+                                    });
+                                let most = ahead
+                                    .saturating_mul(rate)
+                                    .checked_div(1000)
+                                    .unwrap_or_default();
+                                guard
+                                    .tell(&mouth, &json!({"pcm": text, "play": num, "rate": rate}));
+                                let open = |held: &Live, full: u64| {
+                                    held.plays.get(&mouth).is_some_and(|play| {
+                                        play.num == num
+                                            && play.given.saturating_sub(play.played()) >= full
+                                    })
+                                };
+                                while open(&guard, most) {
+                                    guard =
+                                        ROOM.wait(guard).unwrap_or_else(PoisonError::into_inner);
+                                }
+                                let next = if open(&guard, 0) {
+                                    Next::Go
+                                } else {
+                                    Next::Close
+                                };
+                                (Ok(json!({"given": total, "ok": true})), next)
+                            }
+                            (true, Some("end"))
+                                if giving.as_ref().is_some_and(|held| {
+                                    guard
+                                        .plays
+                                        .get(&held.0)
+                                        .is_some_and(|play| play.num == held.1 && !play.end)
+                                }) =>
+                            {
+                                let (mouth, num) = giving.clone().unwrap_or_default();
+                                if let Some(play) = guard.plays.get_mut(&mouth) {
+                                    play.end = true;
+                                }
+                                guard.tell(&mouth, &json!({"end": num}));
+                                (Ok(json!({"ok": true})), Next::Go)
+                            }
+                            (true, Some("hush")) if tracked && track.starts_with("mouth-") => {
+                                let (held, mut last) = quell(guard, track, "hush", PATIENCE);
+                                (guard, last["ok"]) = (held, true.into());
+                                (Ok(last), Next::Go)
+                            }
+                            (true, Some("play"))
+                                if tracked
+                                    && track.starts_with("mouth-")
+                                    && request["rate"]
+                                        .as_u64()
+                                        .is_some_and(|rate| (8000..=48_000).contains(&rate)) =>
+                            {
+                                let refused = if guard.quiet {
+                                    "quiet"
+                                } else if !guard
+                                    .tracks
+                                    .get(track)
+                                    .is_some_and(|held| held.conn.is_some() && held.plays)
+                                {
+                                    "absent"
+                                } else if guard.plays.contains_key(track) {
+                                    "busy"
+                                } else {
+                                    ""
+                                };
+                                let num = guard.numbered.saturating_add(1);
+                                let rate = request["rate"].as_u64().unwrap_or_default();
+                                let opened = if refused.is_empty() {
+                                    guard.emit(&json!({"kind": "play", "play": num, "rate": rate, "track": track})).map(|_| {
+                                        guard.numbered = num;
+                                        let _: Option<Play> = guard.plays.insert(track.to_owned(), Play { end: false, given: 0, giver: key, hushed: None, num, rate, run: None });
+                                        giving = Some((track.to_owned(), num));
+                                        json!({"ok": true, "play": num, "seq": guard.seq})
+                                    })
+                                } else {
+                                    Ok(error(refused))
+                                };
+                                (opened, Next::Go)
+                            }
+                            // a playing mouth's reports, answered by none: the run so far, then the
+                            // play over
+                            (true, Some(op @ ("done" | "sound")))
+                                if device.as_ref().is_some_and(|name| {
+                                    guard.tracks.get(name).is_some_and(|held| held.plays)
+                                }) && request["play"].is_u64()
+                                    && (op == "done"
+                                        || request["from"].is_u64()
+                                            && request["samples"].is_u64()
+                                            && request["t"].is_u64()) =>
+                            {
+                                let mouth = device.clone().unwrap_or_default();
+                                let num = request["play"].as_u64();
+                                let reply = match clock {
+                                    None => error("unsynced"),
+                                    Some((theirs, ours)) => {
+                                        let state = &mut *guard;
+                                        let field =
+                                            |name: &str| request[name].as_u64().unwrap_or_default();
+                                        let start =
+                                            field("t").saturating_add(ours).saturating_sub(theirs);
+                                        match state
+                                            .plays
+                                            .get_mut(&mouth)
+                                            .filter(|play| Some(play.num) == num)
+                                        {
+                                            Some(play) if op == "done" => {
+                                                let reason = play.hushed.unwrap_or(if play.end {
+                                                    "end"
+                                                } else {
+                                                    "mouth"
+                                                });
+                                                state.finish(&mouth, reason);
+                                            }
+                                            Some(play) => {
+                                                // a new first sample starts the next run, the last logged
+                                                let from = field("from");
+                                                let (past, kept) = (
+                                                    play.run.filter(|run| run.0 != from),
+                                                    play.run.filter(|run| run.0 == from),
+                                                );
+                                                play.run = Some((
+                                                    from,
+                                                    field("samples"),
+                                                    kept.map_or(start, |run| run.2),
+                                                ));
+                                                let played = play.num;
+                                                if let Some((first, samples, begun)) = past {
+                                                    drop(state.emit(&json!({"from": first, "kind": "sound", "play": played, "samples": samples, "start": begun, "track": mouth})));
+                                                }
+                                                ROOM.notify_all();
+                                            }
+                                            None => {}
+                                        }
+                                        Value::Null
+                                    }
+                                };
+                                (Ok(reply), Next::Go)
+                            }
                             (true, Some("keep"))
                                 if request["window"].is_u64()
                                     && (request["archive"].is_null()
@@ -1354,8 +1818,9 @@ fn main() -> ExitCode {
                             (
                                 true,
                                 Some(
-                                    "device" | "ears" | "feed" | "frame" | "keep" | "listen"
-                                    | "pong" | "quiet" | "read",
+                                    "device" | "done" | "ears" | "end" | "feed" | "frame" | "give"
+                                    | "hush" | "keep" | "listen" | "play" | "pong" | "quiet"
+                                    | "read" | "sound",
                                 )
                                 | None,
                             ) => (Ok(error("bad_request")), Next::Go),
@@ -1408,14 +1873,33 @@ fn main() -> ExitCode {
                             }
                         }
                     }
+                    // a play's last line once it is over; its giver gone before `end` hushes it,
+                    // after `end` leaves it playing, with no one to tell
+                    if let Some((mouth, num)) = giving {
+                        let mut guard = lock(live);
+                        let unended = (guard.plays.get(&mouth))
+                            .is_some_and(|play| play.num == num && !play.end);
+                        if unended {
+                            guard = quell(guard, &mouth, "left", PATIENCE).0;
+                        }
+                        let last = (guard.ended.get(&mouth))
+                            .filter(|last| last["play"] == num)
+                            .cloned();
+                        drop(guard);
+                        if let Some(line) = last {
+                            drop(writer.write_all(format!("{line}\n").as_bytes()));
+                        }
+                    }
                     drop(writer.shutdown(Shutdown::Both));
                     let mut guard = lock(live);
                     drop(guard.conns.remove(&key));
                     guard.feeds.retain(|feed| feed.1 != key);
-                    // a device's open segment closes as it leaves
+                    // a device's open segment closes as it leaves, and the play it held ends
                     if let Some(name) = device {
+                        guard.finish(&name, "mouth");
                         drop(guard.close(Some(&name)));
-                        guard.tracks.entry(name).or_default().conn = None;
+                        let held = guard.tracks.entry(name).or_default();
+                        (held.conn, held.plays) = (None, false);
                     }
                     drop(guard);
                     Ok(())
@@ -1425,18 +1909,21 @@ fn main() -> ExitCode {
             // stop accepting, the open segments closed, then the last event, then the feeds end
             // once their queues are sent
             drop(listener);
+            let budget = Duration::from_millis(setting("RIFT_DRAIN_MS", 1000));
             {
-                let mut guard = lock(live);
+                // every play hushed and waited on inside the budget, else ended at its last report
+                let (mut guard, begun) = (lock(live), Instant::now());
+                while let Some(track) = guard.plays.keys().next().cloned() {
+                    let left = budget.saturating_sub(begun.elapsed());
+                    guard = quell(guard, &track, "stop", left).0;
+                }
                 drop(guard.close(None));
                 drop(guard.emit(&json!({"kind": "stop", "reason": reason})));
                 guard.state = STOPPING;
                 guard.feeds.clear();
             }
             // open connections may still ask for health inside the budget; then they are cut
-            let (begun, budget) = (
-                Instant::now(),
-                Duration::from_millis(setting("RIFT_DRAIN_MS", 1000)),
-            );
+            let begun = Instant::now();
             while begun.elapsed() < budget && !lock(live).conns.is_empty() {
                 thread::sleep(Duration::from_millis(10));
             }
@@ -1939,7 +2426,7 @@ security import "$1/identity.p12" -k "$3" -P "$2" -T /usr/bin/codesign"#,
         }
         _ => {
             eprintln!(
-                "usage: rift serve | status | quiet on|off | ears on|off | keep <window s> [<archive>] | feed [--after <boot>:<seq>] | listen <track> | read <track> <from us> <to us> | device ear|mouth <name> <file.pcm> [--fast] | device ear <name> --mic [<microphone>] | setup [--print | --remove] | upgrade [--check | --back | --retry] | version"
+                "usage: rift serve | status | quiet on|off | ears on|off | keep <window s> [<archive>] | feed [--after <boot>:<seq>] | listen <track> | read <track> <from us> <to us> | play <track> <rate> [<file.pcm>] | hush <track> | device ear|mouth <name> <file.pcm> [--fast] | device ear <name> --mic [<microphone>] | device mouth <name> --speaker | setup [--print | --remove] | upgrade [--check | --back | --retry] | version"
             );
             ExitCode::from(2)
         }

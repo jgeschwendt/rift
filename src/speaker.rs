@@ -1,0 +1,60 @@
+//! The system's outputs through cpal: the only lines no test can run, so the gate exempts this
+//! file; everything around them is `mouth.rs`, driven in the suite by its fake.
+
+use crate::mouth::{Fill, Outputs, Ready, Sink};
+use cpal::traits::{DeviceTrait as _, HostTrait as _, StreamTrait as _};
+use std::error::Error;
+use std::sync::mpsc::Receiver;
+
+/// The system's outputs, by the names cpal gives them.
+pub struct Speaker;
+
+impl Sink for Speaker {
+    fn hold(&self, name: &str, ready: Ready, mut fill: Fill, stop: Receiver<()>) {
+        let opened = || -> Result<_, Box<dyn Error>> {
+            let device = (cpal::default_host().output_devices()?)
+                .find(|device| device.description().is_ok_and(|held| held.name() == name))
+                .ok_or("not among the outputs")?;
+            let config = device.default_output_config()?.config();
+            let (rate, channels) = (config.sample_rate, config.channels);
+            // the latency cpal reports: the I/O buffer, CoreAudio's device latency and safety offset
+            let stream = device.build_output_stream(
+                config,
+                move |data: &mut [f32], info: &cpal::OutputCallbackInfo| {
+                    let stamp = info.timestamp();
+                    let latency = stamp.playback.duration_since(stamp.callback).as_micros();
+                    fill(
+                        data,
+                        rate,
+                        channels,
+                        u64::try_from(latency).unwrap_or_default(),
+                    );
+                },
+                drop,
+                None,
+            )?;
+            stream.play()?;
+            Ok(stream)
+        };
+        match opened() {
+            Ok(stream) => {
+                ready(Ok(()));
+                stop.recv().unwrap_or_default();
+                drop(stream);
+            }
+            Err(cause) => ready(Err(cause.to_string())),
+        }
+    }
+
+    fn outputs(&self) -> Outputs {
+        let host = cpal::default_host();
+        // names read fallibly: a device gone mid-listing is skipped, where its Display would panic
+        let name = |device: cpal::Device| Some(device.description().ok()?.name().to_owned());
+        Outputs {
+            default: host.default_output_device().and_then(name),
+            names: (host.output_devices().into_iter().flatten())
+                .filter_map(name)
+                .collect(),
+        }
+    }
+}

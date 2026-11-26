@@ -154,8 +154,9 @@ impl Source for Fake {
 }
 
 /// 16 kHz from an input's rate: a windowed-sinc low-pass under 7 kHz (under 0.45 of a rate below
-/// 16 kHz), then each output sample read between the two filtered samples around it.
-struct Convert {
+/// 16 kHz), then each output sample read between the two filtered samples around it; a mouth's
+/// track is made from what its output took by the same.
+pub struct Convert {
     /// Where the next output sample falls after the last filtered sample, in input samples.
     at: f64,
     /// The last filtered sample.
@@ -177,7 +178,7 @@ struct Convert {
 )]
 impl Convert {
     /// The input samples of `sound` filtered and resampled onto `pcm` as 16-bit little-endian.
-    fn feed(&mut self, sound: impl Iterator<Item = f32>, pcm: &mut Vec<u8>) {
+    pub fn feed<Sound: Iterator<Item = f32>>(&mut self, sound: Sound, pcm: &mut Vec<u8>) {
         for sample in sound {
             let _: Option<f64> = self.recent.pop_front();
             self.recent.push_back(f64::from(sample));

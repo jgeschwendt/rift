@@ -25,7 +25,8 @@ jobs:
           tool: cargo-llvm-cov@0.9.1
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
-      # mise.toml's cover task: src/mic.rs opens a real microphone, which no test may
-      - run: cargo llvm-cov --fail-under-lines 100 --ignore-filename-regex 'src/mic\.rs$' --show-missing-lines
+      # mise.toml's cover task: src/mic.rs and src/speaker.rs open a real microphone or output,
+      # which no test may
+      - run: cargo llvm-cov --fail-under-lines 100 --ignore-filename-regex 'src/(mic|speaker)\.rs$' --show-missing-lines
     # the suite takes about a minute: a hang is a red check with its log, never a lost runner
     timeout-minutes: 10
