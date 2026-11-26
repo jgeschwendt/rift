@@ -12,6 +12,7 @@ use signal_hook as _;
 #[cfg(test)]
 mod tests {
     use serde_json::{Value, json};
+    use std::collections::BTreeSet;
     use std::env;
     use std::error::Error;
     use std::f64::consts::PI;
@@ -3737,7 +3738,7 @@ esac
         fs::write(format!("{fake}/outputs/Desk"), "48000 1 0")?;
         fs::write(format!("{fake}/default"), "Desk\n")?;
         fs::write(format!("{fake}/take"), "0")?;
-        // two seconds: room for a starved mouth's next report, short enough to wait out
+        // two seconds: headroom for a starved mouth's next report, short enough to wait out
         let (mut daemon, _) = serve(&root, &[("RIFT_STALL_MS", "2000")])?;
         let mut mouth = Daemon(
             Command::new(env!("CARGO_BIN_EXE_rift"))
@@ -4174,6 +4175,9 @@ esac
         // 100 ms played, then 60 ms dry, at 44.1 kHz
         until(|| Ok(taken(&fake, "Hall").len() >= start.saturating_add(7056)))?;
         drop(say(&mut slow, &give(&tone(16_000, 0.1)))?);
+        // its `end` held back until the mouth has run dry again, holding the interpolator's reach,
+        // so the play's tail plays as a run of its own after it
+        until(|| Ok(taken(&fake, "Hall").len() >= start.saturating_add(14_112)))?;
         drop(say(&mut slow, r#"{"op":"end"}"#)?);
         let stalled: Value = serde_json::from_str(&next(&mut slow)?)?;
         let runs = kinds(&root, "sound", usize::MAX)?;
@@ -4183,7 +4187,7 @@ esac
                 stalled["played"],
                 runs.matches(&format!(r#""play":{}"#, stalled["play"]))
                     .count()
-                    >= 2
+                    >= 3
             ),
             "3200 true",
         )?;
@@ -4319,6 +4323,99 @@ esac
                 version()?
             ),
         )?;
+        // a split tail's last frame goes before its `done`, decided by content, not time: to a
+        // stand-in daemon, a play of a positive level whose `end` waits until the mouth has run
+        // dry, then one of a negative level; no positive sample comes after the first's `done`
+        let split = format!("{root}/split");
+        let voice = format!("{split}/fake");
+        fs::create_dir_all(format!("{voice}/outputs"))?;
+        fs::create_dir_all(format!("{split}/run"))?;
+        fs::write(format!("{voice}/outputs/Desk"), "48000 1 0")?;
+        fs::write(format!("{voice}/default"), "Desk\n")?;
+        let stand_in = UnixListener::bind(format!("{split}/run/rift.sock"))?;
+        let mut splitting = Daemon(
+            Command::new(env!("CARGO_BIN_EXE_rift"))
+                .env("RIFT_ROOT", &split)
+                .env("RIFT_SPEAKER", &voice)
+                .args(["device", "mouth", "desk", "--speaker"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()?,
+        );
+        let mut wire = BufReader::new(stand_in.accept()?.0);
+        let mut told = wire.get_ref().try_clone()?;
+        drop(next(&mut wire)?);
+        wire.get_mut().write_all(format!("{hello}\n").as_bytes())?;
+        drop(next(&mut wire)?);
+        wire.get_mut().write_all(
+            b"{\"ears\":true,\"ok\":true,\"ping\":1,\"plays\":true,\"track\":\"mouth-desk\"}\n",
+        )?;
+        let level = |sample: i16| -> Result<String, Box<dyn Error>> {
+            let line: Value = serde_json::from_str(&give(&vec![sample; 1600]))?;
+            Ok(line["pcm"].as_str().unwrap_or_default().to_owned())
+        };
+        let mut lines = |done: u64| -> Result<Vec<Value>, Box<dyn Error>> {
+            let mut heard = Vec::new();
+            loop {
+                let line: Value = serde_json::from_str(&next(&mut wire)?)?;
+                if line["op"] == "done" && line["play"] == done {
+                    return Ok(heard);
+                }
+                heard.push(line);
+            }
+        };
+        let peak = |heard: &[Value]| {
+            heard
+                .iter()
+                .filter_map(|line| line["pcm"].as_str())
+                .flat_map(|pcm| {
+                    (0..pcm.len()).step_by(4).map(|at| {
+                        let byte = |from: usize| {
+                            u8::from_str_radix(pcm.get(from..from + 2).unwrap_or_default(), 16)
+                                .unwrap_or(0)
+                        };
+                        i16::from_le_bytes([byte(at), byte(at + 2)])
+                    })
+                })
+                .max()
+                .unwrap_or_default()
+        };
+        let pcm = |play: u8, sample: i16| -> Result<String, Box<dyn Error>> {
+            Ok(json!({"pcm": level(sample)?, "play": play, "rate": 16_000u16}).to_string())
+        };
+        told.write_all(format!("{}\n", pcm(1, 0x4000)?).as_bytes())?;
+        // dry: the level heard, then half a frame's worth of silence after it at 48 kHz
+        until(|| {
+            let heard = taken(&voice, "Desk");
+            Ok(heard
+                .iter()
+                .rposition(|&sample| sample > 8192)
+                .is_some_and(|at| heard.len() > at + 480))
+        })?;
+        told.write_all(b"{\"end\":1}\n")?;
+        let first = lines(1)?;
+        told.write_all(format!("{}\n", pcm(2, -0x4000)?).as_bytes())?;
+        told.write_all(b"{\"end\":2}\n")?;
+        let second = lines(2)?;
+        let froms = |heard: &[Value]| {
+            (heard.iter())
+                .filter(|line| line["op"] == "sound")
+                .map(|line| line["from"].to_string())
+                .collect::<BTreeSet<_>>()
+                .len()
+        };
+        same(
+            &format!(
+                "{} {} {}",
+                froms(&first) >= 2,
+                peak(&first) > 8192,
+                peak(&second) > 8192
+            ),
+            "true true false",
+        )?;
+        drop((wire, told, stand_in));
+        same(&signal(&splitting, "TERM")?, "")?;
+        same(&format!("{:?}", splitting.0.wait()?.code()), "Some(0)")?;
         // a stop signal ends it, exit 0
         same(&signal(&desk, "TERM")?, "")?;
         said("stopped by SIGTERM")?;

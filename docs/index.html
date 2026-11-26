@@ -341,8 +341,8 @@
       when it took it. The wire is <a href="protocol.html#plays">the protocol's plays</a>.</p>
   </header>
   <ul class="stack">
-    <li><strong>Which output.</strong> The system's default output, listed every
-      <code class="code">$RIFT_POLL_MS</code>, opened by its name when a play's first give arrives and
+    <li><strong>Which output.</strong> The system's default output, listed as the mouth connects and every
+      <code class="code">$RIFT_POLL_MS</code> after, opened by its name when a play's first give arrives and
       closed <code class="code">$RIFT_LINGER_MS</code> (10 s) after it last took a play's sample, so
       back-to-back plays share one open and an idle mouth holds no output; what the first play after
       idle pays for the open is unmeasured. A change of the
@@ -439,7 +439,7 @@
     <table data-table>
       <thead><tr><th>latency</th><th>bounded by</th><th>expected</th><th>measured by</th></tr></thead>
       <tbody>
-        <tr><td>given → sounding</td><td>the hop to the daemon and on to the mouth (under a millisecond each), the wait for the output's next callback (one I/O period, 10.7 ms at 512 frames and 48 kHz), then the output's latency; on an output not yet open, its open</td><td>under 25 ms on built-in speakers with the output open; Bluetooth adds its own, 100 to 300 ms (unverified 2026-11-26 · the period and both latencies are the Mac run's to measure)</td><td>the <code class="code">play</code> event's <code class="code">t</code> against its first <code class="code">sound</code>'s <code class="code">start</code>; on a Mac, the ear's track hearing the speakers</td></tr>
+        <tr><td>given → sounding</td><td>the hop to the daemon and on to the mouth (under a millisecond each), the wait for the output's next callback (one I/O period, 10.7 ms at 512 frames and 48 kHz), then the output's latency; on an output not yet open, its open</td><td>about 45 ms on the built-in speakers with the output open, about 90 ms when it must reopen (observed 2026-11-26, silent run); the first play after the mouth starts waited 2.1 s, inside the first open, past the listing (unverified 2026-11-26 · cpal's first stream or its first reported latency, the device's to tell); Bluetooth adds its own, 100 to 300 ms (unverified 2026-11-26 · not yet measured)</td><td>the <code class="code">play</code> event's <code class="code">t</code> against its first <code class="code">sound</code>'s <code class="code">start</code>; on a Mac, the ear's track hearing the speakers</td></tr>
         <tr><td>hush → silence</td><td>the hop to the mouth (the pipe to it holds at most what it queues, read as it arrives), the drop, one I/O period, then what the output already holds, its latency; never <code class="code">$RIFT_AHEAD_MS</code>, since the queue is dropped, not drained</td><td>under 25 ms on built-in speakers; on Bluetooth, its latency, which nothing above the output can recall</td><td>the hush reply's time against the last <code class="code">sound</code>'s end (<code class="code">start</code> + <code class="code">samples</code> / <code class="code">rate</code>); on a Mac, where sound stops in the ear's track</td></tr>
       </tbody>
     </table>

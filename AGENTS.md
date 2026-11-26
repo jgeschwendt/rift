@@ -85,7 +85,7 @@ The design is `docs/index.html#mouth`, the wire `docs/protocol.html#plays`. The 
 audio: `Live.plays` holds per mouth track at most one open `Play` (its `given`, the mouth's run
 under way, whether it was ended or hushed), `Live.ended` each mouth's last play's last line. A
 give is passed under the topic `<track>>`, a playing device's queue of its own beside `ears`, so a
-full one is dropped by `fan` as a slow feed is; its reply waits on `ROOM`, the one `Condvar` every
+full one is dropped by `fan` as a slow feed is; its reply waits on `SLACK`, the one `Condvar` every
 change to a play wakes, while `given` less taken reaches `$RIFT_AHEAD_MS`, so a giver is seen to
 leave only once that wait ends, the stall rule at the latest. A give is taken only while its play
 is neither ended nor hushed; `hush` and an `end` finish a play given nothing at once. `quell`
@@ -98,11 +98,13 @@ open a poll (`steady`), so one that opens and fails at once is said once and ret
 slowly; the ear's reset needs audio heard, so it has no such shape. `finish` logs the run under way and `played`, closes the mouth's open segment,
 keeps the last line and shuts the giver's read side, so a giver blocked on a read wakes to write
 it. `src/mouth.rs`'s loop is the ear's shape: the reader thread's lines (the reply first, pings
-answered there), the output listings on a thread every poll, each open's outcome and its end
+answered there), the output listings (the first taken as it connects, then a thread's every poll), each open's outcome and its end
 (`Closed`, a failed output) tagged with its number. The output's callback only copies: converted
 samples out of `Ring.queued`, each with its position, and what it rendered into `Ring.rendered`,
 preallocated and never grown; the loop holds the one mutex only to copy in and out, converting
 (the precomputed `window`), accounting (`absorb`, `Play::taken`), cutting and writing outside it.
+A play is judged finished only on the copy that shows `Ring.queued` empty, and what was rendered
+up to that copy is absorbed first, so a tail played as its own run is cut before `done`.
 A closed open's callback renders silence and records nothing; a closed output's queue is converted
 again from its first untaken position. The mouth ignores a give for a play it has ended or
 finished. A standing `--speaker` device stands, strikes, rotates `mouth.err` and stops as `--mic`

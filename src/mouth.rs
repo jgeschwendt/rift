@@ -472,13 +472,15 @@ pub fn run(reader: BufReader<UnixStream>, reply: &Value) {
                     lines.send(Heard::Line(line))
                 })
         }));
-        let listing = heard.clone();
+        // the first listing paid here, as it connects (the system's first can take seconds),
+        // so a play opens its output the moment it arrives; then one every poll
+        let (listing, first_listed) = (heard.clone(), sink.outputs());
         drop(thread::spawn(move || {
-            iter::repeat_with(|| sink.outputs()).try_for_each(|listed| {
-                let sent = listing.send(Heard::Outputs(listed));
+            iter::repeat_with(|| {
                 thread::sleep(poll);
-                sent
+                sink.outputs()
             })
+            .try_for_each(|listed| listing.send(Heard::Outputs(listed)))
         }));
         // two seconds of rendering at 48 kHz, drained every 10 ms
         let ring = Arc::new(Mutex::new(Ring {
@@ -491,7 +493,7 @@ pub fn run(reader: BufReader<UnixStream>, reply: &Value) {
             false,
             0u32,
             None::<Open>,
-            Outputs::default(),
+            first_listed,
             None::<Instant>,
             BTreeSet::new(),
         );
@@ -716,21 +718,30 @@ pub fn run(reader: BufReader<UnixStream>, reply: &Value) {
                 if (windowed.0, windowed.1) != (given.rate, hz) {
                     windowed = (given.rate, hz, window(given.rate, hz));
                 }
-                let room = usize::try_from(hz)
+                let headroom = usize::try_from(hz)
                     .unwrap_or_default()
                     .checked_div(4)
                     .unwrap_or_default();
-                while waiting.saturating_add(converted.len()) < room
+                while waiting.saturating_add(converted.len()) < headroom
                     && let Some(next) = given.convert(hz, &windowed.2)
                 {
                     converted.push(next);
                 }
             }
-            let (queued, number) = {
+            // what was rendered since the first copy comes out with the queue's state, so a play
+            // judged finished here has every sample its output took accounted and cut, its last
+            // frame among them, before `done`
+            let (queued, number, since) = {
                 let mut copying = shared();
                 copying.queued.extend(converted);
-                (!copying.queued.is_empty(), copying.open)
+                (
+                    !copying.queued.is_empty(),
+                    copying.open,
+                    copying.rendered.drain(..).collect::<Vec<_>>(),
+                )
             };
+            let took = absorb(since, &mut play, &mut cut, &mut frames, &mut reports, rate);
+            last = took.then(Instant::now).or(last);
             // the reports, then the frames that have sounded (none while the ears are closed),
             // then a finished play's `done`, once its last frame is sent
             let mut writer = out.lock().ok()?;

@@ -63,7 +63,7 @@ const REACH: u64 = 32;
 const STOPPING: &str = "stopping";
 
 /// Woken at every change to a play: a withheld give, a hush and the drain wait on it with `live`.
-static ROOM: Condvar = Condvar::new();
+static SLACK: Condvar = Condvar::new();
 
 /// The release (a checkout's build: the crate version), then `build.rs`'s short commit: hello's
 /// and health's `version`.
@@ -254,7 +254,7 @@ impl Live {
                 .get(&play.giver)
                 .map(|conn| conn.shutdown(Shutdown::Read)),
         );
-        ROOM.notify_all();
+        SLACK.notify_all();
     }
 
     /// The health reply: hello's fields, then the stream's and the switches'.
@@ -413,7 +413,7 @@ fn quell<'guard>(
             );
             guard.finish(track, if reason == "stop" { reason } else { "mouth" });
         }
-        guard = ROOM
+        guard = SLACK
             .wait_timeout(guard, left)
             .unwrap_or_else(PoisonError::into_inner)
             .0;
@@ -1532,7 +1532,7 @@ fn main() -> ExitCode {
                                 };
                                 while open(&guard, most) {
                                     guard =
-                                        ROOM.wait(guard).unwrap_or_else(PoisonError::into_inner);
+                                        SLACK.wait(guard).unwrap_or_else(PoisonError::into_inner);
                                 }
                                 let next = if open(&guard, 0) {
                                     Next::Go
@@ -1653,7 +1653,7 @@ fn main() -> ExitCode {
                                                 if let Some((first, samples, begun)) = past {
                                                     drop(state.emit(&json!({"from": first, "kind": "sound", "play": played, "samples": samples, "start": begun, "track": mouth})));
                                                 }
-                                                ROOM.notify_all();
+                                                SLACK.notify_all();
                                             }
                                             None => {}
                                         }
