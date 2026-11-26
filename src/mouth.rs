@@ -97,8 +97,14 @@ impl Sink for Fake {
         drop(append(&log, format!("open {name}\n").as_bytes()));
         let heard = self.dir.join("heard");
         drop(fs::create_dir_all(&heard));
-        // paced on the clock, as an output's own is, never past `take`, until stopped or failed
-        let (begun, mut given) = (Instant::now(), 0u64);
+        // paced on the clock, as an output's own is, never past `take`, until stopped or failed;
+        // a tick late renders 40 ms at most and skips the rest, as a device's late callback plays
+        // on from now, never seconds at once, and time `take` held passes as silence unasked
+        let (begun, mut given, most) = (
+            Instant::now(),
+            0u64,
+            rate.checked_div(25).unwrap_or_default(),
+        );
         while matches!(
             stop.recv_timeout(Duration::from_millis(10)),
             Err(RecvTimeoutError::Timeout)
@@ -114,7 +120,7 @@ impl Sink for Fake {
                 .ok()
                 .and_then(|all| all.trim().parse::<u64>().ok())
                 .map_or(u64::MAX, |all| all.saturating_sub(*taken));
-            let count = due.saturating_sub(given).min(allowed);
+            let count = due.saturating_sub(given).min(most).min(allowed);
             let wide = usize::try_from(channels).unwrap_or_default().max(1);
             let mut data = vec![
                 0.0f32;
@@ -132,7 +138,7 @@ impl Sink for Fake {
                 .flat_map(|sample| ((sample * 32767.0f32).round() as i16).to_le_bytes())
                 .collect();
             drop(append(&heard.join(name), &kept));
-            (given, *taken) = (given.saturating_add(count), taken.saturating_add(count));
+            (given, *taken) = (due, taken.saturating_add(count));
         }
         drop(append(&log, format!("close {name}\n").as_bytes()));
     }

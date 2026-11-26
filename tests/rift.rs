@@ -3776,27 +3776,20 @@ esac
                 .to_string(),
             "true",
         )?;
-        // a giver that pauses longer than the stall time, its mouth run dry and holding only the
-        // interpolator's reach untaken, owes nothing: the play plays on to its end
+        // a giver that pauses longer than the stall time, having given no more than the
+        // interpolator's reach (32 samples), owes nothing however slowly its mouth plays them: the
+        // play is open still
         let mut paused = greet(&root)?;
         drop(say(
             &mut paused,
             r#"{"op":"play","rate":16000,"track":"mouth-desk"}"#,
         )?);
-        drop(say(&mut paused, &give(&tone(16_000, 0.1)))?);
+        drop(say(&mut paused, &give(&[8192i16; 32]))?);
         // the time must pass for a stall to be possible: the stall time and a sweep's second over
         thread::sleep(Duration::from_millis(3500));
-        drop(say(&mut paused, &give(&tone(16_000, 0.1)))?);
-        drop(say(&mut paused, r#"{"op":"end"}"#)?);
-        let resumed = next(&mut paused)?;
-        same(
-            &format!(
-                "{} {resumed}",
-                resumed
-                    .contains(r#""dropped":0,"given":3200,"play":2,"played":3200,"reason":"end""#)
-            ),
-            &format!("true {resumed}"),
-        )?;
+        let health: Value = serde_json::from_str(&say(&mut greet(&root)?, r#"{"op":"health"}"#)?)?;
+        same(&health["playing"].to_string(), r#"{"mouth-desk":2}"#)?;
+        drop(paused);
         same(&signal(&mouth, "TERM")?, "")?;
         same(&format!("{:?}", mouth.0.wait()?.code()), "Some(0)")?;
         same(
@@ -3942,7 +3935,12 @@ esac
         fs::write(format!("{fake}/outputs/Desk"), "48000 2 5")?;
         fs::write(format!("{fake}/outputs/Hall"), "44100 1 0")?;
         fs::write(format!("{fake}/default"), "Desk\n")?;
-        let (mut daemon, _) = serve(&root, &[("RIFT_SEGMENT_MS", "60000")])?;
+        // no stall: how fast a busy machine runs the mouth decides no play here; `stuck` has
+        // the stall, decided by an output that takes nothing
+        let (mut daemon, _) = serve(
+            &root,
+            &[("RIFT_SEGMENT_MS", "60000"), ("RIFT_STALL_MS", "86400000")],
+        )?;
         let spawn = |at: &str| -> io::Result<Daemon> {
             Ok(Daemon(
                 Command::new(env!("CARGO_BIN_EXE_rift"))
@@ -4120,10 +4118,9 @@ esac
         let window = held
             .get(before..before.saturating_add(4410))
             .unwrap_or_default();
-        let lead = window
-            .iter()
-            .position(|&sample| sample != 0)
-            .unwrap_or_default();
+        // the samples it took of the play, by their level: silence before it, and wherever a
+        // starved mouth ran dry, is none of them
+        let leveled = window.iter().filter(|&&sample| sample != 0).count();
         // the positions the mouth read, stepped as it steps them
         #[expect(
             clippy::as_conversions,
@@ -4131,7 +4128,7 @@ esac
             clippy::cast_sign_loss,
             reason = "the interpolator's positions, as the mouth steps them"
         )]
-        let reached = ((1..4410usize.saturating_sub(lead))
+        let reached = ((1..leveled)
             .fold(0.0f64, |at, _| at + 16_000.0f64 / 44_100.0f64)
             .floor() as u64)
             .saturating_add(1);
@@ -4172,8 +4169,16 @@ esac
             r#"{"op":"play","rate":16000,"track":"mouth-desk"}"#,
         )?);
         drop(say(&mut slow, &give(&tone(16_000, 0.1)))?);
-        // 100 ms played, then 60 ms dry, at 44.1 kHz
-        until(|| Ok(taken(&fake, "Hall").len() >= start.saturating_add(7056)))?;
+        // played, then dry: 60 ms of silence (2646 samples at 44.1 kHz) after its last sample,
+        // so a whole frame holds none of the play's
+        until(|| {
+            let heard = taken(&fake, "Hall");
+            let since = heard.get(start..).unwrap_or_default();
+            Ok(since
+                .iter()
+                .rposition(|&sample| sample != 0)
+                .is_some_and(|at| since.len() > at + 2646))
+        })?;
         drop(say(&mut slow, &give(&tone(16_000, 0.1)))?);
         drop(say(&mut slow, r#"{"op":"end"}"#)?);
         let stalled: Value = serde_json::from_str(&next(&mut slow)?)?;

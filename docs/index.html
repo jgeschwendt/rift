@@ -469,9 +469,10 @@
       names the default output; each file under <code class="code">outputs/</code> an output holding
       <code class="code">&lt;rate&gt; &lt;channels&gt; &lt;latency ms&gt;</code> or
       <code class="code">fail</code> (an open refused, or an open one failing as its file comes to
-      say so), unlisted when the file goes; it takes in real time, and with a
+      say so), unlisted when the file goes; it takes in real time, a late tick 40 ms at most and
+      the rest skipped as a device's late callback skips it, and with a
       <code class="code">take</code> file never past the output samples it names, in all for this
-      connection, stalling there, so a test, not the clock, decides how far a play gets; every sample taken appended
+      connection, the time held there passing, so a test, not the clock, decides how far a play gets; every sample taken appended
       to <code class="code">heard/&lt;output&gt;</code> and an open and close line per open to
       <code class="code">log</code>. The cpal calls live in
       <code class="code">src/speaker.rs</code>, exempt from coverage as <code class="code">src/mic.rs</code>
@@ -491,16 +492,19 @@
       took, the give after it refused and uncounted, nothing but silence taken after; a giver that
       stalls (runs split, holes); the default changed mid-play; no output, then a refused one; an
       output failing mid-play and recovering; the linger; the ears closed; the drain; an older
-      daemon; a stop signal. <code class="code">stuck</code>: an output taking nothing, ended by the
-      stall rule. <code class="code">setup</code>: the plist, disabled, held, ready, an ear failing
+      daemon; a split tail cut before its <code class="code">done</code>; a stop signal.
+      <code class="code">stuck</code>: an output taking nothing, ended by the stall rule; a giver
+      paused past it owing nothing, open still. <code class="code">setup</code>: the plist, disabled, held, ready, an ear failing
       (the mouth not touched), a mouth failing (nothing of it left),
       <code class="code">--remove</code>.</li>
     <li><strong>Deterministic on a slow runner.</strong> Every step waits on what it can observe (a
       feed line, a log line, a count in <code class="code">heard</code>) under the suite's bounds,
       never on a sleep; how far a play gets is <code class="code">take</code>'s, never the machine's
       speed; runs are checked contiguous and summing to what played, never counted, since a busy
-      machine may run a mouth dry; a time is asserted only as a bound read around the act, the 1 s
-      cut as at least 1 s.</li>
+      machine may run a mouth dry; a hush's count and a dry spell are read from the levels in
+      <code class="code">heard</code>, never its length; only <code class="code">stuck</code> runs
+      the stall rule, since a starved mouth may report nothing for seconds; a time is asserted
+      only as a bound read around the act, the 1 s cut as at least 1 s.</li>
     <li><strong>Known limits.</strong> Samples an output took and had not sounded when it is lost
       count as played, up to one output latency. A play starting within 20 ms of the last loses up to
       20 ms of the mouth's own track. A killed daemon's <code class="code">lost</code> counts only

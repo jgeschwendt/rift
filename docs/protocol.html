@@ -281,7 +281,10 @@
       passed since the last. The device's clock read the pong's <code class="code">t</code> between
       the ping's sending and the pong's reading: the first pong is placed at the midpoint, and a
       later one moves the offset only as far as that span proves it wrong, so a late pong moves no
-      frame and a stepped clock is followed to within one round trip. Each frame is placed by that
+      frame and a stepped clock is followed to within one round trip. The first placement may be
+      off by half that first round trip, long on a busy machine: a later pong moving it half a
+      frame or more leaves a hole, or, moving it back, refuses frames
+      <code class="code">ahead</code> for as long as it moved. Each frame is placed by that
       offset, never later than it is read. A device stamps its frames on the clock its pongs read,
       and answers a ping as it arrives. A frame before the first pong is refused
       <code class="code">unsynced</code>. Pings ride frame replies, so an idle device is not
