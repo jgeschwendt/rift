@@ -3721,7 +3721,7 @@ security import "$1/identity.p12" -k "$3" -P "$2" -T /usr/bin/codesign"#,
         }
         _ => {
             eprintln!(
-                "usage: rift serve | status | quiet on|off | ears on|off | keep <window s> [<archive>] | feed [--after <boot>:<seq>] | listen <track> | read <track> <from us> <to us> | play <track> <rate> [<file.pcm>] | hush <track> | device ear|mouth <name> <file.pcm> [--fast] | device ear <name> --mic [<microphone>] | device mouth <name> --speaker | engine run tail <ear> [--tail-ms <ms>] | setup [--print | --remove] | upgrade [--check | --back | --retry] | version"
+                "usage: rift serve | status | quiet on|off | ears on|off | keep <window s> [<archive>] | feed [--after <boot>:<seq>] | listen <track> | read <track> <from us> <to us> | play <track> <rate> [<file.pcm>] | hush <track> | device ear|mouth <name> <file.pcm> [--fast] | device ear <name> --mic [<microphone>] | device mouth <name> --speaker | engine add <kind> -- <command>... | engine list | engine remove <kind> | engine run tail <ear> [--tail-ms <ms>] | setup [--print | --remove] | upgrade [--check | --back | --retry] | version"
             );
             ExitCode::from(2)
         }
