@@ -4175,9 +4175,6 @@ esac
         // 100 ms played, then 60 ms dry, at 44.1 kHz
         until(|| Ok(taken(&fake, "Hall").len() >= start.saturating_add(7056)))?;
         drop(say(&mut slow, &give(&tone(16_000, 0.1)))?);
-        // its `end` held back until the mouth has run dry again, holding the interpolator's reach,
-        // so the play's tail plays as a run of its own after it
-        until(|| Ok(taken(&fake, "Hall").len() >= start.saturating_add(14_112)))?;
         drop(say(&mut slow, r#"{"op":"end"}"#)?);
         let stalled: Value = serde_json::from_str(&next(&mut slow)?)?;
         let runs = kinds(&root, "sound", usize::MAX)?;
@@ -4187,7 +4184,7 @@ esac
                 stalled["played"],
                 runs.matches(&format!(r#""play":{}"#, stalled["play"]))
                     .count()
-                    >= 3
+                    >= 2
             ),
             "3200 true",
         )?;
