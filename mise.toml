@@ -53,6 +53,10 @@ echo "dist/rift-$target.tar.gz: rift $(target/release/rift version)"
 description = "a dev build to ~/.local/bin/rift-next, beside the release"
 run = "cargo build --release && mkdir -p ~/.local/bin && install -m 755 target/release/rift ~/.local/bin/rift-next"
 
+[tasks.install-engines]
+description = "the reference engines into ~/.local/libexec/rift/ ($RIFT_ENGINES_PREFIX overrides), out of the checkout; prints the rift engine add lines, runs none; rerun to upgrade"
+run = "engines/install.sh"
+
 [tasks.prove-engines]
 description = "the reference engines end to end: a throwaway daemon, the fixture, a fake output; needs every model (engines/README.md) and $TRANSCRIBE_MODEL"
 # copied out of target/ first: the build cache may sweep it mid-run; PROVE_FAST=1 sends the

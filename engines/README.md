@@ -12,15 +12,13 @@ Today's models on rift's socket, one engine per kind: `endpoint`, `transcribe`, 
 Libraries: onnxruntime via `ort`, `ptts`, `xn`, `rustfft` (MIT/Apache-2.0), `tokenizers`
 (Apache-2.0), `moonshine-voice` (MIT), numpy (BSD-3-Clause).
 
-Installed as rift's engine jobs, from a checkout's root, each command recorded verbatim, so its
-paths are absolute (keep the release build where it is, or install copies and name those):
+Installed as rift's engine jobs: `mise run install-engines` builds and installs all three into
+`~/.local/libexec/rift/` (rerun to upgrade) and prints this machine's three lines, which you run:
 
 ```sh
-cargo build --release --manifest-path engines/Cargo.toml
-host=$(scutil --get LocalHostName | tr '[:upper:]' '[:lower:]')
-rift engine add turn -- "$PWD/engines/target/release/endpoint" "ear-$host"
-rift engine add words -- "$(command -v uv)" run --project "$PWD/engines/transcribe" --locked transcribe "ear-$host"
-rift engine add speech -- "$PWD/engines/target/release/read-aloud" "mouth-$host"
+rift engine add turn -- ~/.local/libexec/rift/endpoint ear-<host>
+rift engine add words -- ~/.local/libexec/rift/transcribe/bin/transcribe ear-<host>
+rift engine add speech -- ~/.local/libexec/rift/read-aloud mouth-<host>
 ```
 
 `transcribe` takes `--terms <file>` (lines `Term` or `Term: heard, heard`), a file of your own,
