@@ -3718,7 +3718,8 @@ esac
 
     /// An output that takes nothing (`take` 0) while the mouth holds a play: past
     /// `$RIFT_STALL_MS` with no report the daemon ends it `mouth`, its giver, its reply withheld,
-    /// answered; the mouth told to drop it, its output taking no sample of it after.
+    /// answered; the mouth told to drop it, its output taking no sample of it after. A giver that
+    /// pauses past the stall time owes nothing, and its play plays on to its end.
     #[cfg(target_os = "macos")]
     #[test]
     fn stuck() -> Outcome {
@@ -3760,6 +3761,24 @@ esac
             &taken(&fake, "Desk")
                 .iter()
                 .all(|&sample| sample == 0)
+                .to_string(),
+            "true",
+        )?;
+        // a giver that pauses longer than the stall time, its mouth run dry and holding only the
+        // interpolator's reach untaken, owes nothing: the play plays on to its end
+        let mut paused = greet(&root)?;
+        drop(say(
+            &mut paused,
+            r#"{"op":"play","rate":16000,"track":"mouth-desk"}"#,
+        )?);
+        drop(say(&mut paused, &give(&tone(16_000, 0.1)))?);
+        // the time must pass for a stall to be possible: a sweep's second and the 300 ms over
+        thread::sleep(Duration::from_millis(1500));
+        drop(say(&mut paused, &give(&tone(16_000, 0.1)))?);
+        drop(say(&mut paused, r#"{"op":"end"}"#)?);
+        same(
+            &next(&mut paused)?
+                .contains(r#""dropped":0,"given":3200,"play":2,"played":3200,"reason":"end""#)
                 .to_string(),
             "true",
         )?;
@@ -3895,7 +3914,8 @@ esac
     /// a hush at a set `take` plays exactly what the output took and drops the rest, with no further
     /// callback; a mouth run dry splits the runs and holes the track; the default changed mid-play
     /// reopens on the new output, keeping what is queued; with no output it says so and waits, the
-    /// giver paced; a refused open is said and retried; the output lingers after a play, then
+    /// giver paced until one appears (past `$RIFT_STALL_MS` the stall rule would end the play); a
+    /// refused open is said and retried; an output failing mid-play is reopened; the output lingers after a play, then
     /// closes; an older daemon is said once and waited out; the daemon gone, it drops its play and
     /// connects again; a stop signal ends it, exit 0.
     #[cfg(target_os = "macos")]
@@ -4184,7 +4204,8 @@ esac
                 .to_string(),
             "true",
         )?;
-        // no output at all: said, the giver paced, until one appears; a refused open said and
+        // no output at all: said, the giver paced until one appears, well inside the stall time; a
+        // refused open said and
         // retried
         until(closed)?;
         fs::remove_file(format!("{fake}/default"))?;

@@ -55,6 +55,10 @@ const PATIENCE: Duration = Duration::from_secs(1);
 /// The wire protocol this build speaks.
 const PROTO: u64 = 1;
 
+/// Given samples a mouth's interpolator holds untaken as it waits for more, its window both
+/// sides (src/mouth.rs): no progress owed (docs/protocol.html#plays).
+const REACH: u64 = 32;
+
 /// The `stopping` state, the one the request handler tests for.
 const STOPPING: &str = "stopping";
 
@@ -311,13 +315,15 @@ impl Live {
         wrote
     }
 
-    /// Ends `mouth` every play whose mouth owes progress (audio it holds untaken, or its play's
-    /// end after `end`) and has reported nothing for `$RIFT_STALL_MS`: an output failed or stuck
-    /// in place, its giver answered; the mouth is told to drop it.
+    /// Ends `mouth` every play whose mouth owes progress (its play's end after `end`, or given
+    /// past what it took by more than the interpolator's `REACH`, which waits on the next give)
+    /// and has reported nothing for `$RIFT_STALL_MS`: an output failed or stuck in place, its
+    /// giver answered; the mouth is told to drop it.
     fn stalled(&mut self) {
         let stuck: Vec<String> = (self.plays.iter())
             .filter(|&(_, play)| {
-                play.heard.elapsed() >= self.stall && (play.end || play.given > play.played())
+                play.heard.elapsed() >= self.stall
+                    && (play.end || play.given > play.played().saturating_add(REACH))
             })
             .map(|(track, _)| track.clone())
             .collect();
@@ -1033,7 +1039,7 @@ fn main() -> ExitCode {
                     seq: 0,
                     since: utc(SystemTime::now()),
                     sock: sock.clone(),
-                    stall: Duration::from_millis(setting("RIFT_STALL_MS", 5000)),
+                    stall: Duration::from_millis(setting("RIFT_STALL_MS", 15_000)),
                     state: "ready",
                     sweeps,
                     tracks: BTreeMap::new(),
@@ -2486,11 +2492,11 @@ security import "$1/identity.p12" -k "$3" -P "$2" -T /usr/bin/codesign"#,
                     write(&mouthfile, &mouthsheet)?;
                     stand(mouth, "mouth", &mouthfile)
                 })()
-                .or_else(|cause| {
-                    unload(mouth)?;
+                .inspect_err(|_| {
+                    // the files go whatever the bootout says; the cause is what is reported
+                    drop(unload(mouth));
                     gone(&mouthfile);
                     gone(&mouthcopy);
-                    Err(cause)
                 })
             };
             install().map_or_else(

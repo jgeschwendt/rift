@@ -348,7 +348,7 @@
       idle pays for the open is unmeasured. A change of the
       default closes it and opens the new one, what is queued kept; an output that goes with no
       default left is one stderr line and a wait, the play queued and its giver paced, until one
-      appears. An output that fails while it stays listed (cpal pauses its stream on a rate change,
+      appears or, past <code class="code">$RIFT_STALL_MS</code>, the stall rule ends the play. An output that fails while it stays listed (cpal pauses its stream on a rate change,
       a Bluetooth profile's switch or a device lost: anything but a glitch) ends its open; the mouth
       says so, closes it as above and opens it again a poll on, a refused open retried as any. Each
       output its frames name, <code class="code">speaker</code>, as an ear's name their
@@ -382,8 +382,9 @@
       counts every given sample played. The daemon's queue to the mouth is the mouth's alone; one
       full, a mouth not reading, is dropped as a slow feed is and its play ends. A play given nothing
       ends at once at its <code class="code">end</code> or its hush; a give after either is refused
-      and the mouth ignores one for a play it has ended. A mouth that owes progress and reports none
-      for <code class="code">$RIFT_STALL_MS</code> (5 s) has its play ended
+      and the mouth ignores one for a play it has ended. A mouth that owes progress (a giver's pause
+      owes none) and reports none
+      for <code class="code">$RIFT_STALL_MS</code> (15 s) has its play ended
       <code class="code">mouth</code> and its giver answered.</li>
     <li><strong>Stamping.</strong> From the output's callback: this device's clock in the callback
       plus the latency cpal reports for it (the I/O buffer plus CoreAudio's device latency and safety
@@ -450,7 +451,7 @@
         <tr><td>the mouth dies</td><td>its queue goes with it; the play ends <code class="code">mouth</code> at its last report, launchd respawns it, nothing resumes</td><td>every run up to the last report, short by at most 20 ms plus the output's latency</td></tr>
         <tr><td>the daemon drains</td><td>each play hushed in turn inside <code class="code">$RIFT_DRAIN_MS</code>, one not answered by then ended at its last report, each logged <code class="code">stop</code> before <code class="code">stop</code>; the mouth drops its queue as the connection goes</td><td>all of it</td></tr>
         <tr><td>the daemon is killed</td><td>the mouth drops its queue as the connection goes; each giver's ends with an unknown outcome</td><td>the <code class="code">play</code> and its closed runs; the next boot logs <code class="code">played</code> <code class="code">lost</code>, the run under way not derivable but from the mouth's frames, when the ears were open</td></tr>
-        <tr><td>the output vanishes</td><td>its queue kept; the next default opened, playing on with a new run, a hole and the new <code class="code">speaker</code> in the track; no output, a wait and a paced giver</td><td>all of it; samples the old output took and had not sounded count as played</td></tr>
+        <tr><td>the output vanishes</td><td>its queue kept; the next default opened, playing on with a new run, a hole and the new <code class="code">speaker</code> in the track; no output, a wait and a paced giver, ended <code class="code">mouth</code> by the stall rule past <code class="code">$RIFT_STALL_MS</code></td><td>all of it; samples the old output took and had not sounded count as played</td></tr>
         <tr><td>the output fails, still listed</td><td>its open ended, said, opened again a poll on, playing on with a new run; stuck past <code class="code">$RIFT_STALL_MS</code>, the play ended <code class="code">mouth</code></td><td>all of it, as above</td></tr>
         <tr><td>the giver disconnects</td><td>before <code class="code">end</code>, hushed, <code class="code">left</code>; after it, played out</td><td>all of it</td></tr>
       </tbody>
@@ -639,7 +640,7 @@
         <tr><td class="table-mono">RIFT_SEGMENT_MS</td><td>a segment's length, in whole 20 ms frames, at least one, default 10000</td></tr>
         <tr><td class="table-mono">RIFT_SIGN_MS</td><td>how long <code class="code">setup</code> lets each <code class="code">launchctl</code>, <code class="code">scutil</code>, <code class="code">security</code>, <code class="code">openssl</code> and <code class="code">codesign</code> call run before killing it and failing, naming the call, default 30000</td></tr>
         <tr><td class="table-mono">RIFT_SPEAKER</td><td>the suite's fake outputs in place of the system's: a directory, its format in <code class="code">src/mouth.rs</code> (<a href="#mouth">the mouth</a>)</td></tr>
-        <tr><td class="table-mono">RIFT_STALL_MS</td><td>how long a play's mouth may report nothing while it owes progress before the daemon ends the play <code class="code">mouth</code>, checked every second, default 5000</td></tr>
+        <tr><td class="table-mono">RIFT_STALL_MS</td><td>how long a play's mouth may report nothing while it owes progress before the daemon ends the play <code class="code">mouth</code> (owed: the play's end after <code class="code">end</code>, or given past what was taken by more than the interpolator's 32 samples), checked every second, default 15000</td></tr>
         <tr><td class="table-mono">RIFT_ZERO_MS</td><td>how long a microphone may give only exact zeros after its open before <code class="code">--mic</code> closes it as a failed open, naming the grant, default 2000</td></tr>
       </tbody>
     </table>

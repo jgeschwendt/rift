@@ -334,9 +334,12 @@
       passed on. A play given nothing ends at once at its <code class="code">end</code> or its hush,
       with its reason, its mouth never having held any of it. A giver that leaves after
       <code class="code">end</code> leaves its play playing out, with no one to tell.</li>
-    <li><strong>A stall.</strong> A play whose mouth owes progress (audio it holds untaken, or the
-      play's end after <code class="code">end</code>) and has reported nothing for
-      <code class="code">$RIFT_STALL_MS</code> (default 5000; checked every second) ends
+    <li><strong>A stall.</strong> A play whose mouth owes progress (the play's end after
+      <code class="code">end</code>, or given past what its output took by more than 32 samples, the
+      interpolator's window both sides, which waits on the next give and is owed nothing, so a giver
+      may pause as long as it likes) and has reported nothing for
+      <code class="code">$RIFT_STALL_MS</code> (default 15000, room for an output's slow open such as
+      a Bluetooth wake; checked every second) ends
       <code class="code">mouth</code>, its giver answered, its mouth told to drop it: an output
       failed or stuck in place never holds a giver, and a giver gone while its reply is withheld is
       seen then at the latest.</li>

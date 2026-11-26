@@ -503,15 +503,20 @@ pub fn run(reader: BufReader<UnixStream>, reply: &Value) {
             Vec::new(),
         );
         // the last play ended, whose late lines are no one's; the window for a play and rate;
-        // whether the open output failed
-        let (mut finished, mut windowed, mut broken) = (0u64, (0u32, 0u32, Vec::new()), false);
-        // each line said once until an output opens
+        // whether the open output failed; when it opened, until it has held a poll
+        let (mut finished, mut windowed, mut broken, mut steady) =
+            (0u64, (0u32, 0u32, Vec::new()), false, None::<Instant>);
+        // each line said once until an output has opened and held a poll: one that opens and
+        // fails at once is said once, its retries backing off
         let say = |seen: &mut BTreeSet<String>, line: String| {
             if seen.insert(line.clone()) {
                 eprintln!("rift device: {line}");
             }
         };
         loop {
+            if steady.is_some_and(|at| at.elapsed() >= poll) {
+                (failed, said, steady) = (0, BTreeSet::new(), None);
+            }
             let pause = if play.is_some() || !frames.is_empty() {
                 Duration::from_millis(10)
             } else {
@@ -612,7 +617,7 @@ pub fn run(reader: BufReader<UnixStream>, reply: &Value) {
                 Ok(Heard::Line(None)) => return None,
                 Ok(Heard::Opened(at, opened)) if at == shared().open => match opened {
                     Ok(hz) => {
-                        (failed, said) = (0, BTreeSet::new());
+                        steady = Some(Instant::now());
                         if let Some(held) = open.as_mut() {
                             held.rate = Some(hz);
                             cut = Some(Cut {
@@ -641,14 +646,21 @@ pub fn run(reader: BufReader<UnixStream>, reply: &Value) {
                         );
                     }
                 },
-                // the open output stopped by itself: failed, so closed and opened again a poll on
+                // the open output stopped by itself: failed, so closed and opened again a poll on,
+                // doubled per failure in a row as a refused open's
                 Ok(Heard::Closed(at)) if open.is_some() && at == shared().open => {
                     let name = open.as_ref().map(|held| held.name.clone());
                     say(
                         &mut said,
                         format!("{:?} failed; opening it again", name.unwrap_or_default()),
                     );
-                    (broken, retry) = (true, Instant::now().checked_add(poll));
+                    let backoff = poll.saturating_mul(2u32.saturating_pow(failed.min(6)));
+                    (broken, failed, retry, steady) = (
+                        true,
+                        failed.saturating_add(1),
+                        Instant::now().checked_add(backoff),
+                        None,
+                    );
                 }
                 Ok(Heard::Outputs(listed)) => outputs = listed,
                 Ok(Heard::Closed(..) | Heard::Opened(..)) | Err(_) => {}
@@ -688,7 +700,7 @@ pub fn run(reader: BufReader<UnixStream>, reply: &Value) {
             }
             if closing {
                 // a closed output ends the run under way and starts the track's grid afresh
-                (open, broken, cut) = (None, false, None);
+                (open, broken, cut, steady) = (None, false, None, None);
                 if let Some(given) = play.as_mut() {
                     given.at = untaken.map_or(given.at, |queued| queued.1);
                     reports.extend(given.report(true));
