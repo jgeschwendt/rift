@@ -60,7 +60,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    link::stand("endpoint", || {
+    link::stand("endpoint", &mut || {
         let endpoint = Endpoint::new(&mut prob, &mut score, bar, ceiling.saturating_mul(1000));
         turns::session(&link::socket(), track, endpoint)
     })

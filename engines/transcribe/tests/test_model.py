@@ -19,15 +19,21 @@ MODEL = os.environ.get("TRANSCRIBE_MODEL", "")
     reason="skipped: set TRANSCRIBE_MODEL to Moonshine v2 Medium Streaming's directory",
 )
 def test_fixture() -> None:
-    """Pocket TTS saying "Please turn on the kitchen lights.", fed as 20 ms frames, finalized at
-    the turn's end (2.496 s, the endpoint's on the same fixture): those words, in order.
+    """Pocket TTS saying "Please turn on the kitchen lights.", fed as 20 ms frames with the
+    endpoint's voice and turn on the same fixture (0.832 s to 2.496 s), the lines where they come
+    live: those words, in order.
     """
     from transcribe import moonshine  # noqa: PLC0415 -- the runtime, only where the model is
 
     pcm = np.fromfile(FIXTURE, "<i2").astype(np.float32) / 32768
     words = Words(moonshine.Moonshine(MODEL), terms(None), None)
+    lines = {48: (True, 832_000), 140: (False, 2_496_000)}
+    final = []
     for at in range(len(pcm) // 320):
         words.frame(at * 20_000, pcm[at * 320 : at * 320 + 320])
-    (final,) = words.turn(2_496_000)
+        if at in lines:
+            words.voiced(*lines[at])
+        final += words.turn(2_496_000) if at == 140 else []
+    (final,) = final
     said = " ".join(word["text"] for word in final["words"]).lower()
     assert "turn on the kitchen lights" in said, said

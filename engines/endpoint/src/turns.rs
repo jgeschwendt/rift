@@ -2,8 +2,8 @@
 //! voice, a score of the turn so far at each voice's close deciding the turn, and one
 //! connection's frames in and reports out (docs/protocol.html#engines).
 
-use std::io;
 use std::path::Path;
+use std::{io, iter};
 
 use link::{Conn, RATE, samples};
 use serde_json::{Value, json};
@@ -14,6 +14,11 @@ pub const WINDOW: usize = 512;
 pub const CONTEXT: usize = 128_000;
 /// A window's span in µs.
 const SPAN: u64 = 32_000;
+/// The hello's client.
+const CLIENT: &str = "endpoint/0.1.0";
+/// Logged events read back on connect for the turn the last engine held: a held turn's voices
+/// lie within its ceiling, far inside this many.
+const LOOK: u64 = 256;
 /// A window at or over this opens a voice (Silero's own onset).
 const ONSET: f32 = 0.5;
 /// Windows under this count toward a close: Silero's hysteresis, its onset less 0.15.
@@ -209,6 +214,30 @@ impl<'model, P: Prob, S: Score> Endpoint<'model, P, S> {
             voice: None,
         }
     }
+
+    /// Rebuilds the turn the last engine held as it left, from `events`, the track's logged voices
+    /// and turns in order: a voice on after the last turn starts the turn under way, and a voice
+    /// off after it holds it from there, the ceiling closing it as usual.
+    #[inline]
+    pub fn resume<I: Iterator<Item = Value>>(&mut self, events: I) {
+        for event in events {
+            match (
+                event["kind"].as_str(),
+                &event["on"],
+                event["start"].as_u64(),
+            ) {
+                (Some("turn"), _, _) => (self.turn, self.held) = (None, None),
+                (Some("voice"), &Value::Bool(true), Some(start)) => {
+                    let _: &mut u64 = self.turn.get_or_insert(start);
+                    self.held = None;
+                }
+                (Some("voice"), &Value::Bool(false), Some(end)) if self.turn.is_some() => {
+                    self.held = Some((end, end));
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 /// One connection to `sock` as the turn engine of `track`: its frames from its kind's `through`
@@ -228,7 +257,18 @@ pub fn session<P: Prob, S: Score>(
     mut endpoint: Endpoint<'_, P, S>,
 ) -> io::Result<()> {
     let request = json!({"from": "through", "kind": "turn", "name": "endpoint", "op": "engine", "track": track});
-    let (mut conn, _) = Conn::open(sock, "endpoint/0.1.0", &request)?;
+    let (mut conn, reply) = Conn::open(sock, CLIENT, &request)?;
+    // the turn the last engine held, from the log's last events before this one's own
+    let seq = reply["seq"].as_u64().unwrap_or_default();
+    let after = json!({"boot": conn.hello()["boot"], "seq": seq.saturating_sub(LOOK)});
+    let (mut feed, _) = Conn::open(sock, CLIENT, &json!({"after": after, "op": "feed"}))?;
+    endpoint.resume(
+        iter::from_fn(|| feed.line().ok())
+            .take_while(|line| line["seq"].as_u64() < Some(seq))
+            .map(|line| line["e"].clone())
+            .filter(|event| event["track"] == track),
+    );
+    feed.shutdown();
     loop {
         let line = conn.line()?;
         // a report's reply: only a refusal is news
@@ -464,6 +504,15 @@ mod tests {
             "resumed by the daemon"
         );
         conn.send(&json!({"ok": true, "seq": 1u8, "through": 7u8}))?;
+        // nothing logged before its own engine event: nothing held
+        let (mut feed, asked) = fake.accept()?;
+        assert_eq!(
+            asked,
+            json!({"after": {"boot": 1u8, "seq": 0u8}, "op": "feed"}),
+            "the log read back"
+        );
+        feed.send(&json!({"ok": true}))?;
+        feed.send(&json!({"e": {"kind": "engine", "track": "ear-desk"}, "seq": 1u8}))?;
         let mut lines = Vec::new();
         for (time, pcm) in frames(1_000_000, &[(1.0f32, 16), (0.0f32, 13)]) {
             conn.send(&json!({"pcm": hex(&pcm), "t": time}))?;
@@ -485,6 +534,79 @@ mod tests {
             engine.join().unwrap_or_default(),
             ["the connection ended", r#"{"code":"taken","ok":false}"#],
             "each session's end"
+        );
+        Ok(())
+    }
+
+    /// A reconnect while a turn was held: the log's last voices rebuild it, and the ceiling of
+    /// silence after it closes it from its first voice's start to its last voice's end; another
+    /// track's voices and an earlier turn change nothing.
+    #[test]
+    fn resumed() -> io::Result<()> {
+        let fake = Fake::new("endpoint-resumed")?;
+        let sock = fake.sock.clone();
+        let engine = thread::spawn(move || {
+            let (mut prob, mut score) = (Loud::default(), Scripted::default());
+            let endpoint = Endpoint::new(&mut prob, &mut score, 0.5f32, 1_000_000);
+            session(&sock, "ear-desk", endpoint)
+                .err()
+                .map(|cause| cause.to_string())
+        });
+        let (mut conn, _) = fake.accept()?;
+        conn.send(&json!({"ok": true, "seq": 300u16, "through": 1_500_000u32}))?;
+        let (mut feed, asked) = fake.accept()?;
+        assert_eq!(
+            asked["after"],
+            json!({"boot": 1u8, "seq": 44u8}),
+            "256 events back"
+        );
+        feed.send(&json!({"ok": true}))?;
+        let event = |seq: u16, event: Value| json!({"e": event, "seq": seq});
+        for line in [
+            event(
+                294,
+                json!({"end": 100_000u32, "kind": "words", "start": 0u8, "track": "ear-desk"}),
+            ),
+            event(
+                295,
+                json!({"kind": "voice", "on": true, "start": 100_000u32, "track": "ear-desk"}),
+            ),
+            event(
+                296,
+                json!({"end": 300_000u32, "kind": "turn", "start": 100_000u32, "track": "ear-desk"}),
+            ),
+            event(
+                297,
+                json!({"kind": "voice", "on": true, "start": 1_000_000u32, "track": "ear-desk"}),
+            ),
+            event(
+                298,
+                json!({"kind": "voice", "on": true, "start": 1_200_000u32, "track": "ear-hall"}),
+            ),
+            event(
+                299,
+                json!({"kind": "voice", "on": false, "start": 1_500_000u32, "track": "ear-desk"}),
+            ),
+            event(
+                300,
+                json!({"kind": "engine", "on": true, "track": "ear-desk"}),
+            ),
+        ] {
+            feed.send(&line)?;
+        }
+        for (time, pcm) in frames(1_500_000, &[(0.0f32, 60)]) {
+            conn.send(&json!({"pcm": hex(&pcm), "t": time}))?;
+        }
+        assert_eq!(
+            conn.line()?,
+            json!({"end": 1_500_000u32, "op": "turn", "start": 1_000_000u32}),
+            "the held turn closed by the ceiling"
+        );
+        drop((conn, feed));
+        assert_eq!(
+            engine.join().ok().flatten().as_deref(),
+            Some("the connection ended"),
+            "its end"
         );
         Ok(())
     }

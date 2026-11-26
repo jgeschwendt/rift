@@ -7,7 +7,7 @@
 use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
 use link::{Conn, hex};
@@ -28,6 +28,30 @@ pub trait Voice {
         text: &str,
         give: &mut dyn FnMut(&[f32]) -> io::Result<bool>,
     ) -> io::Result<()>;
+}
+
+/// What the reader tells the speaking as it reads, ahead of the lines it queues.
+#[derive(Debug, Default)]
+struct Heard {
+    /// The highest say a hush has named.
+    hushed: AtomicU64,
+    /// The say whose play is open, and a handle on that play to shut it at its hush, so a give
+    /// waiting on its reply ends at once.
+    playing: Mutex<Option<(u64, Conn)>>,
+}
+
+impl Heard {
+    /// A hush of `num`: said, and its play, if open, shut.
+    fn hush(&self, num: u64) {
+        let _prior = self.hushed.fetch_max(num, Ordering::Relaxed);
+        if let Ok(held) = self.playing.lock()
+            && let Some(play) = (held.as_ref())
+                .filter(|playing| playing.0 <= num)
+                .map(|playing| &playing.1)
+        {
+            play.shutdown();
+        }
+    }
 }
 
 /// A say under way.
@@ -52,11 +76,16 @@ struct Say {
 
 impl Say {
     /// Gives `chunk` to the play, opening it first; whether to go on.
-    fn give(&mut self, chunk: &[f32], hushed: &AtomicU64, request: &Value, sock: &Path) -> bool {
-        self.over |= hushed.load(Ordering::Relaxed) >= self.num;
+    fn give(&mut self, chunk: &[f32], heard: &Heard, request: &Value, sock: &Path) -> bool {
+        self.over |= heard.hushed.load(Ordering::Relaxed) >= self.num;
         if self.play.is_none() && !self.over {
-            match Conn::open(sock, CLIENT, request) {
-                Ok((play, _)) => self.play = Some(play),
+            match Conn::open(sock, CLIENT, request).and_then(|(play, _)| Ok((play.twin()?, play))) {
+                Ok((handle, play)) => {
+                    if let Ok(mut held) = heard.playing.lock() {
+                        *held = Some((self.num, handle));
+                    }
+                    self.play = Some(play);
+                }
                 Err(cause) => {
                     eprintln!("read-aloud: say {}: {cause}", self.num);
                     self.over = true;
@@ -85,8 +114,8 @@ impl Say {
 
 /// One engine connection's speaking.
 struct Speaker<'run> {
-    /// The highest say a hush has named, seen by the reader as it comes.
-    hushed: &'run AtomicU64,
+    /// What the reader saw ahead: the hushes.
+    heard: &'run Heard,
     /// The say under way.
     say: Option<Say>,
     /// The daemon's socket, for the plays.
@@ -100,18 +129,18 @@ struct Speaker<'run> {
 }
 
 impl Speaker<'_> {
-    /// Takes one line the daemon sent: a report's reply, a say's text, its end or a hush.
+    /// Takes one line the daemon sent: a report's reply, a say's text, its end or a hush; any
+    /// other, the protocol grown since, ignored.
     fn line(&mut self, line: &Value) -> io::Result<()> {
-        if line["ok"].is_boolean() {
-            if line["ok"] != true {
-                eprintln!("read-aloud: refused: {line}");
-            }
-            return Ok(());
+        if line["ok"] == false {
+            eprintln!("read-aloud: refused: {line}");
         }
-        let num = ["end", "hush", "say"]
+        let Some(num) = ["end", "hush", "say"]
             .iter()
             .find_map(|key| line[key].as_u64())
-            .unwrap_or_default();
+        else {
+            return Ok(());
+        };
         let mut say = self.say.take().filter(|say| say.num == num).unwrap_or(Say {
             num,
             ..Say::default()
@@ -152,8 +181,8 @@ impl Speaker<'_> {
             if clause.is_empty() {
                 continue;
             }
-            let (hushed, sock) = (self.hushed, self.sock);
-            let mut give = |chunk: &[f32]| Ok(say.give(chunk, hushed, &request, sock));
+            let (heard, sock) = (self.heard, self.sock);
+            let mut give = |chunk: &[f32]| Ok(say.give(chunk, heard, &request, sock));
             self.voice.speak(&clause, &mut give)?;
             if !say.over && say.given > say.marked {
                 say.marked = say.given;
@@ -196,27 +225,28 @@ pub fn session(sock: &Path, track: &str, voice: &mut dyn Voice) -> io::Result<()
     let request = json!({"kind": "speech", "name": "read-aloud", "op": "engine", "track": track});
     let (mut conn, _) = Conn::open(sock, CLIENT, &request)?;
     let write = conn.twin()?;
-    let hushed = Arc::new(AtomicU64::new(0));
-    let (lines, heard) = mpsc::channel();
-    let hearing = Arc::clone(&hushed);
+    let heard = Arc::new(Heard::default());
+    // a line ahead at most: the engine reads only as it speaks, so the daemon's pacing of a
+    // client's text holds
+    let (lines, queued) = mpsc::sync_channel(1);
+    let hearing = Arc::clone(&heard);
     let reader = thread::spawn(move || -> io::Result<()> {
         loop {
             let line = conn.line()?;
-            // a hush is seen at once, so a clause being made stops at its next chunk
-            let _prior =
-                hearing.fetch_max(line["hush"].as_u64().unwrap_or_default(), Ordering::Relaxed);
+            // a hush is seen as it is read, so a clause being made stops at its next chunk
+            hearing.hush(line["hush"].as_u64().unwrap_or_default());
             lines.send(line).map_err(io::Error::other)?;
         }
     });
     let mut speaker = Speaker {
-        hushed: &hushed,
+        heard: &heard,
         say: None,
         sock,
         track,
         voice,
         write,
     };
-    let worked = heard.iter().try_for_each(|line| speaker.line(&line));
+    let worked = queued.iter().try_for_each(|line| speaker.line(&line));
     speaker.write.shutdown();
     worked?;
     reader.join().unwrap_or(Ok(()))
@@ -310,6 +340,8 @@ mod tests {
             "the engine request"
         );
         conn.send(&json!({"ok": true, "seq": 1u8}))?;
+        // a line of none of its kinds, the protocol grown since: ignored, never a say 0
+        conn.send(&json!({"news": true, "text": "Spoken by none. "}))?;
         conn.send(&json!({"say": 1u8, "text": "Hello there. -. How"}))?;
         let (mut play, tagged) = fake.accept()?;
         assert_eq!(
@@ -370,6 +402,22 @@ mod tests {
             conn.line()?,
             json!({"op": "done", "say": 5u8}),
             "hushed: nothing sounded"
+        );
+        // say 6, hushed mid-clause while its gives are answered: its play shut at once, no
+        // give after the hush and no mark
+        conn.send(&json!({"say": 6u8, "text": "A long clause here. "}))?;
+        let (mut hushed, _) = fake.accept()?;
+        hushed.send(&json!({"ok": true, "play": 6u8, "seq": 4u8}))?;
+        assert_eq!(plays(&mut hushed, 1, false)?, 8192, "one give answered");
+        drop(hushed.line()?);
+        conn.send(&json!({"hush": 6u8}))?;
+        assert!(hushed.line().is_err(), "the play shut, nothing more given");
+        conn.send(&json!({"say": 7u8, "text": " "}))?;
+        conn.send(&json!({"end": 7u8}))?;
+        assert_eq!(
+            conn.line()?,
+            json!({"op": "done", "say": 7u8}),
+            "no mark for say 6"
         );
         drop(conn);
         assert_eq!(

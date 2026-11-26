@@ -32,7 +32,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    link::stand("read-aloud", || {
+    link::stand("read-aloud", &mut || {
         speak::session(&link::socket(), track, &mut voice)
     })
 }

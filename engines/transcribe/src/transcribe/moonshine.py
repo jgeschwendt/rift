@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from moonshine_voice import ModelArch, Transcriber, get_model_for_language
+from moonshine_voice import ModelArch, Transcriber
 
 if TYPE_CHECKING:
     import numpy as np
@@ -52,11 +52,9 @@ class Stream:
 class Moonshine:
     """The model, loaded once and shared by every stream."""
 
-    def __init__(self, path: str | None) -> None:
-        """Loads the model in `path`, else moonshine-voice's own, fetched into its cache."""
-        arch = ModelArch.MEDIUM_STREAMING
-        path = path or get_model_for_language("en", arch)[0]
-        self.transcriber = Transcriber(path, arch)
+    def __init__(self, path: str) -> None:
+        """Loads the model in `path`; nothing is fetched at run time."""
+        self.transcriber = Transcriber(path, ModelArch.MEDIUM_STREAMING)
 
     def stream(self) -> Stream:
         """A fresh stream."""

@@ -29,11 +29,12 @@ pub mod fake {
         pub fn accept(&self) -> io::Result<(Conn, Value)> {
             let (write, _) = self.listener.accept()?;
             let mut conn = Conn {
+                hello: Value::Null,
                 read: BufReader::new(write.try_clone()?),
                 write,
             };
             drop(conn.line()?);
-            conn.send(&json!({"ok": true, "proto": 1u8}))?;
+            conn.send(&json!({"boot": 1u8, "ok": true, "proto": 1u8}))?;
             let request = conn.line()?;
             Ok((conn, request))
         }
@@ -71,6 +72,8 @@ pub const RATE: u64 = 16_000;
 /// One connection to the daemon, past its hello.
 #[derive(Debug)]
 pub struct Conn {
+    /// The hello's reply: the daemon's boot, version and state.
+    hello: Value,
     /// Its read side, a line at a time.
     read: BufReader<UnixStream>,
     /// Its write side.
@@ -78,6 +81,13 @@ pub struct Conn {
 }
 
 impl Conn {
+    /// The hello's reply.
+    #[inline]
+    #[must_use]
+    pub const fn hello(&self) -> &Value {
+        &self.hello
+    }
+
     /// The next line read, as JSON; the connection's end an error.
     #[inline]
     pub fn line(&mut self) -> io::Result<Value> {
@@ -97,6 +107,7 @@ impl Conn {
     pub fn open(sock: &Path, client: &str, request: &Value) -> io::Result<(Self, Value)> {
         let write = UnixStream::connect(sock)?;
         let mut conn = Self {
+            hello: Value::Null,
             read: BufReader::new(write.try_clone()?),
             write,
         };
@@ -109,6 +120,10 @@ impl Conn {
             reply = conn.line()?;
             if reply["ok"] != true {
                 return Err(io::Error::other(reply.to_string()));
+            }
+            // the hello's reply kept, the request's returned
+            if conn.hello.is_null() {
+                conn.hello = reply.clone();
             }
         }
         Ok((conn, reply))
@@ -131,6 +146,7 @@ impl Conn {
     #[inline]
     pub fn twin(&self) -> io::Result<Self> {
         Ok(Self {
+            hello: self.hello.clone(),
             read: BufReader::new(self.write.try_clone()?),
             write: self.write.try_clone()?,
         })
@@ -223,10 +239,18 @@ pub fn socket() -> PathBuf {
 /// and exit 0; `session` runs again forever, each end waited out `$RIFT_POLL_MS` (default 1000)
 /// ms; its failure is one stderr line, said once until another cause or a session's clean end.
 #[inline]
-pub fn stand<F: FnMut() -> io::Result<()>>(name: &str, mut session: F) -> ! {
+pub fn stand(name: &str, session: &mut dyn FnMut() -> io::Result<()>) -> ! {
     let named = name.to_owned();
-    drop(Signals::new([SIGHUP, SIGINT, SIGTERM]).map(|mut signals| {
-        thread::spawn(move || signals.forever().next().map(|signal| stop(&named, signal)))
+    // an engine that cannot be stopped cleanly does not stand
+    let stops = [SIGHUP, SIGINT, SIGTERM];
+    let mut caught = Signals::new(stops).unwrap_or_else(|why| quit(&format!("{name}: {why}"), 1));
+    drop(thread::spawn(move || {
+        let said = caught
+            .forever()
+            .next()
+            .and_then(signal_name)
+            .unwrap_or_default();
+        quit(&format!("{named}: stopped by {said}"), 0)
     }));
     let poll = env::var("RIFT_POLL_MS")
         .ok()
@@ -246,17 +270,15 @@ pub fn stand<F: FnMut() -> io::Result<()>>(name: &str, mut session: F) -> ! {
     }
 }
 
-/// A stop signal's end: one stderr line, exit 0. A function of its own, so its lines keep their
-/// count in a coverage profile the exit writes.
+/// An engine's end: `line` on stderr, then `code`. A function of its own, so its lines keep
+/// their count in a coverage profile the exit writes.
 #[expect(
     clippy::exit,
-    clippy::single_call_fn,
-    reason = "the stop signal's exit 0, as rift's devices; a function of its own for coverage"
+    reason = "a stop signal's exit 0, as rift's devices, or a failed start's 1"
 )]
-fn stop(name: &str, signal: i32) -> ! {
-    let said = signal_name(signal).unwrap_or_default();
-    drop(writeln!(io::stderr(), "{name}: stopped by {said}"));
-    process::exit(0)
+fn quit(line: &str, code: i32) -> ! {
+    drop(writeln!(io::stderr(), "{line}"));
+    process::exit(code)
 }
 
 #[cfg(test)]
@@ -266,7 +288,7 @@ fn stop(name: &str, signal: i32) -> ! {
 )]
 mod tests {
     use std::process::Command;
-    use std::{env, io, thread};
+    use std::{env, fs, io, iter, thread};
 
     use serde_json::json;
     use signal_hook::consts::SIGTERM;
@@ -358,7 +380,8 @@ mod tests {
             conn.shutdown();
             let refused = Conn::open(&sock, "test", &json!({"op": "x"})).err();
             Ok(format!(
-                "{reply} {}",
+                "{} {reply} {}",
+                conn.hello()["boot"],
                 refused.map(|cause| cause.to_string()).unwrap_or_default()
             ))
         });
@@ -378,8 +401,8 @@ mod tests {
         other.send(&json!({"code": "taken", "ok": false}))?;
         assert_eq!(
             client.join().ok().transpose()?.unwrap_or_default(),
-            r#"{"ok":true,"seq":1} {"code":"taken","ok":false}"#,
-            "the reply, then the refusal"
+            r#"1 {"ok":true,"seq":1} {"code":"taken","ok":false}"#,
+            "the hello's boot, the reply, then the refusal"
         );
         Ok(())
     }
@@ -390,7 +413,7 @@ mod tests {
     fn standing() -> io::Result<()> {
         if env::var_os("LINK_STAND").is_some() {
             let mut tries = 0u8;
-            stand("probe", || {
+            stand("probe", &mut || {
                 tries = tries.saturating_add(1);
                 if tries == 3 {
                     drop(raise(SIGTERM));
@@ -413,6 +436,37 @@ mod tests {
                 Some(0i32)
             ),
             "one line per cause, then the stop"
+        );
+        Ok(())
+    }
+
+    /// `stand` unable to arm its stop signals (its child here out of file descriptors): one
+    /// line and exit 1, never standing unstoppable.
+    #[test]
+    fn refusing() -> io::Result<()> {
+        if env::var_os("LINK_REFUSE").is_some() {
+            let mut held: Vec<fs::File> = iter::repeat_with(|| fs::File::open("/dev/null"))
+                .map_while(Result::ok)
+                .collect();
+            // one descriptor left: too few for the signals' socket pair, enough for the exit
+            drop(held.pop());
+            let mut session = || Ok(());
+            session()?;
+            stand("probe", &mut session);
+        }
+        let out = Command::new("/bin/sh")
+            .args([
+                "-c",
+                r#"ulimit -n 64 && exec "$0" --exact tests::refusing --nocapture"#,
+            ])
+            .arg(env::current_exe()?)
+            .env("LINK_REFUSE", "1")
+            .output()?;
+        let said = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert_eq!(
+            (said.lines().last(), out.status.code()),
+            (Some("probe: Too many open files (os error 24)"), Some(1i32)),
+            "one line, exit 1"
         );
         Ok(())
     }

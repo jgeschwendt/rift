@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 import json
 import os
 import signal
@@ -23,36 +24,44 @@ if TYPE_CHECKING:
 
 
 class Stub:
-    """A stream whose hypothesis is a script keyed by the samples fed so far."""
+    """A stream that hears a level as a word: each run of one nonzero sample value fed is a line,
+    `w<level in hundredths>`, timed by where it lies in what was fed.
+    """
 
-    def __init__(self, script: dict[int, list[tuple[str, float, float]]]) -> None:
-        """Hypotheses by samples fed: the latest key at or under what was fed."""
-        self.script, self.fed = script, []
+    def __init__(self) -> None:
+        """Nothing fed."""
+        self.fed: list[np.ndarray] = []
 
     def add(self, pcm: np.ndarray) -> None:
         """Keeps what is fed."""
-        self.fed.append(len(pcm))
+        self.fed.append(pcm)
 
     def lines(self) -> list[tuple[str, float, float]]:
-        """The scripted hypothesis."""
-        fed = sum(self.fed)
-        return self.script[max(key for key in self.script if key <= fed)]
+        """Each run of one nonzero level, as a line."""
+        audio = np.concatenate([np.zeros(0, np.float32), *self.fed])
+        edges = np.flatnonzero(np.diff(np.concatenate([[0], audio, [0]])))
+        runs = itertools.pairwise(edges)
+        return [
+            (f"w{round(audio[low] * 100)}", low / 16_000, high / 16_000)
+            for low, high in runs
+            if audio[low]
+        ]
 
     def stop(self) -> list[tuple[str, float, float]]:
-        """The scripted final."""
+        """The lines, as final."""
         return self.lines()
 
 
 class Model:
-    """Streams from one script, each kept."""
+    """Stub streams, each kept."""
 
-    def __init__(self, script: dict[int, list[tuple[str, float, float]]]) -> None:
-        """Every stream reads `script`."""
-        self.script, self.streams = script, []
+    def __init__(self) -> None:
+        """None made yet."""
+        self.streams: list[Stub] = []
 
     def stream(self) -> Stub:
         """A fresh stub stream."""
-        self.streams.append(Stub(self.script))
+        self.streams.append(Stub())
         return self.streams[-1]
 
 
@@ -66,12 +75,30 @@ def same(text: str) -> str:
     return text
 
 
-SCRIPT = {
-    0: [],
-    5_120: [("hello there", 0.0, 0.4)],
-    10_240: [("hello there", 0.0, 0.4)],
-    15_360: [("hello there", 0.0, 0.4), ("again", 0.3, 0.6), ("late", 2.0, 2.5)],
-}
+def run(words: Words, events: list[tuple]) -> list[dict]:
+    """Every report of `events` in order: `(t, level, count)` frames from `t` µs, `("on"|"off",
+    t)` voice lines, `("turn", end)` turn lines.
+    """
+    said = []
+    for event in events:
+        match event:
+            case ("on" | "off", start):
+                words.voiced(event[0] == "on", start)
+            case ("turn", end):
+                said += words.turn(end)
+            case (start, level, count):
+                for at in range(count):
+                    said += words.frame(start + at * 20_000, frame(level))
+    return said
+
+
+def finals(said: list[dict]) -> list[list[tuple[str, int, int]]]:
+    """Each final's words as text and times."""
+    return [
+        [(word["text"], word["start"], word["end"]) for word in report["words"]]
+        for report in said
+        if report["op"] == "words"
+    ]
 
 
 def test_terms(tmp_path: Path) -> None:
@@ -90,53 +117,120 @@ def test_samples() -> None:
     assert samples("0000ff7f0080").tolist() == [0.0, 32767 / 32768, -1.0]
 
 
-def test_partials() -> None:
-    """A pass each 320 ms of audio fed: a partial when the hypothesis changed, none when empty or
-    the same; audio before `start` never fed.
-    """
-    model = Model({**SCRIPT, 15_360: []})
-    words = Words(model, same, 10_000)
-    said = [report for at in range(64) for report in words.frame(at * 20_000, frame())]
-    assert said == [
-        {
-            "end": 340_000,
-            "op": "partial",
-            "start": 10_000,
-            "words": [
-                {"end": 210_000, "start": 10_000, "text": "hello"},
-                {"end": 340_000, "start": 210_000, "text": "there"},
-            ],
-        }
-    ]
-    assert model.streams[0].fed[0] == 160
+def test_quiet() -> None:
+    """No voice line: nothing fed, nothing said, and no more held than the buffer."""
+    model = Model()
+    words = Words(model, same, None)
+    assert run(words, [(0, 0.05, 2_000), ("turn", 30_000_000)]) == []
+    assert (model.streams, len(words.kept)) == ([], 1_500)
 
 
-def test_turns() -> None:
-    """The final at a turn line: words inside the span, rising across overlapping lines, none
-    starting past the end; the next utterance fed what was kept past the end; a turn already
-    done, with nothing fed, or with no words heard, gives nothing.
+def test_utterance() -> None:
+    """A voice's stream from its start less the pre-roll, fed behind the newest frame to the
+    voice's end, finished at the turn over its audio alone; a partial once while it changed.
     """
-    model = Model(SCRIPT)
-    words = Words(model, str.upper, None)
-    assert words.turn(100) == []
-    for at in range(50):
-        words.frame(at * 20_000, frame())
-    assert words.turn(800_000) == [
-        {
-            "end": 800_000,
-            "op": "words",
-            "start": 0,
-            "words": [
-                {"end": 200_000, "start": 0, "text": "HELLO"},
-                {"end": 400_000, "start": 200_000, "text": "THERE"},
-                {"end": 600_000, "start": 400_000, "text": "AGAIN"},
-            ],
-        }
+    model = Model()
+    words = Words(model, str.upper, 500_000)
+    said = run(
+        words,
+        [
+            (0, 0.0, 50),
+            (1_000_000, 0.05, 6),
+            ("on", 1_000_000),
+            (1_120_000, 0.05, 44),
+            (2_000_000, 0.0, 13),
+            ("off", 2_000_000),
+            (2_260_000, 0.0, 6),
+            ("turn", 2_000_000),
+        ],
+    )
+    assert [report["op"] for report in said] == ["partial", "words"]
+    assert said[-1] == {
+        "end": 2_000_000,
+        "op": "words",
+        "start": 750_000,
+        "words": [{"end": 2_000_000, "start": 1_000_000, "text": "W5"}],
+    }
+    assert sum(map(len, model.streams[0].fed)) == 20_000, "1.25 s: the pre-roll and the voice"
+
+
+def test_held() -> None:
+    """A turn held across two voices is one stream and one final, its pause included."""
+    model = Model()
+    said = run(
+        Words(model, same, None),
+        [
+            ("on", 1_000_000),
+            (1_000_000, 0.05, 25),
+            ("off", 1_500_000),
+            (1_500_000, 0.0, 25),
+            ("on", 2_000_000),
+            (2_000_000, 0.06, 25),
+            ("off", 2_500_000),
+            (2_500_000, 0.0, 15),
+            ("turn", 2_500_000),
+        ],
+    )
+    assert len(model.streams) == 1
+    assert finals(said) == [
+        [("w5", 1_000_000, 1_500_000), ("w6", 2_000_000, 2_500_000)],
     ]
-    assert sum(model.streams[1].fed) == 1_000_000 * 16 // 1000 - 800_000 * 16 // 1000
-    # a turn that heard no words logs nothing, and the next starts after it
-    assert (words.turn(900_000), words.start) == ([], 900_000)
-    assert words.turn(700_000) == []
+
+
+def test_late_turn() -> None:
+    """A turn line after the next voice began: the final decoded afresh over audio to its end
+    alone, the next stream from there, no word in both finals.
+    """
+    model = Model()
+    said = run(
+        Words(model, same, None),
+        [
+            ("on", 1_000_000),
+            (1_000_000, 0.05, 50),
+            ("off", 2_000_000),
+            (2_000_000, 0.0, 25),
+            ("on", 2_500_000),
+            (2_500_000, 0.07, 50),
+            ("turn", 2_000_000),
+            ("off", 3_500_000),
+            (3_500_000, 0.0, 15),
+            ("turn", 3_500_000),
+        ],
+    )
+    assert finals(said) == [[("w5", 1_000_000, 2_000_000)], [("w7", 2_500_000, 3_500_000)]]
+    assert len(model.streams) == 3, "the held stream, its fresh decode, the next"
+
+
+def test_hole() -> None:
+    """Words after a hole carry the times their audio was heard, not the stream's."""
+    said = run(
+        Words(Model(), same, None),
+        [
+            ("on", 1_000_000),
+            (1_000_000, 0.05, 25),
+            (2_000_000, 0.06, 25),
+            ("off", 2_500_000),
+            (2_500_000, 0.0, 15),
+            ("turn", 2_500_000),
+        ],
+    )
+    assert finals(said) == [[("w5", 1_000_000, 1_500_000), ("w6", 2_000_000, 2_500_000)]]
+
+
+def test_cap(capsys: pytest.CaptureFixture) -> None:
+    """A voice that never ends: finished at each 20 s by the engine's own rule, said once, each
+    final from the last one's end; a turn already passed, or with no stream, says nothing.
+    """
+    words = Words(Model(), same, None)
+    said = run(words, [("on", 0), (0, 0.05, 2_100), ("turn", 100)])
+    stops = [report["end"] for report in said if report["op"] == "words"]
+    starts = [report["start"] for report in said if report["op"] == "words"]
+    assert (stops, starts) == ([20_000_000, 40_000_000], [0, 20_000_000])
+    assert capsys.readouterr().err.count("finished there") == 1
+    assert Words(Model(), same, None).turn(5) == []
+    # a line heard past the end it is finished at gives no word
+    words.heard = [(0, 0)]
+    assert words._timed([("late", 1.0, 2.0)], 500_000) == []
 
 
 def serve(sock: socket.socket) -> tuple[socket.socket, object, dict]:
@@ -165,52 +259,55 @@ def daemon() -> Iterator[tuple[str, socket.socket]]:
         sock.close()
 
 
-def test_sessions(daemon: tuple[str, socket.socket], capsys: pytest.CaptureFixture) -> None:
-    """A session: `"from":"through"`, its words from the reply's through, frames and turn lines
-    read, partials and finals sent, a refusal said, the end an error; a refused connect too.
+def test_sessions(
+    daemon: tuple[str, socket.socket],
+    capsys: pytest.CaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A session from 30 s back, finals from the reply's through, voice and turn lines acted
+    on, a refusal said, the end an error; `gone` connects live; another refusal ends it.
     """
     path, sock = daemon
+    monkeypatch.setattr(transcribe.time, "time_ns", lambda: 40_000_000_000)
     ends = []
 
-    def run() -> None:
-        for _ in range(2):
+    def runs() -> None:
+        for _ in range(3):
             try:
-                session(path, "ear-desk", Model(SCRIPT), same)
+                session(path, "ear-desk", Model(), same)
             except ConnectionError as cause:
                 ends.append(str(cause))
 
-    thread = threading.Thread(target=run)
+    thread = threading.Thread(target=runs)
     thread.start()
     conn, lines, request = serve(sock)
     assert request == {
-        "from": "through",
+        "from": 10_000_000,
         "kind": "words",
         "name": "transcribe",
         "op": "engine",
         "track": "ear-desk",
     }
     send(conn, {"ok": True, "seq": 1, "through": 0})
+    send(conn, {"voice": {"on": True, "start": 0}})
+    hexed = "cd0c" * 320
     for at in range(16):
-        send(conn, {"pcm": "0000" * 320, "t": at * 20_000})
-    assert json.loads(lines.readline())["op"] == "partial"
-    send(conn, {"ok": True})
-    send(conn, {"turn": {"end": 300_000, "start": 0}})
-    assert json.loads(lines.readline())["op"] == "words"
-    send(conn, {"ok": True, "seq": 2})
-    for at in range(16):
-        send(conn, {"pcm": "0000" * 320, "t": 320_000 + at * 20_000})
-    assert json.loads(lines.readline())["op"] == "partial"
-    send(conn, {"ok": True})
-    send(conn, {"turn": {"end": 640_000, "start": 300_000}})
-    assert json.loads(lines.readline())["end"] == 640_000
+        send(conn, {"pcm": hexed, "t": at * 20_000})
+    send(conn, {"voice": {"on": False, "start": 320_000}})
+    send(conn, {"turn": {"end": 320_000, "start": 0}})
+    assert json.loads(lines.readline())["words"][0]["text"] == "w10"
     send(conn, {"code": "bad_request", "ok": False})
-    send(conn, {"turn": {"end": 640_000, "start": 300_000}})
     conn.shutdown(socket.SHUT_RDWR)
     conn, lines, request = serve(sock)
-    assert request["from"] == "through"
+    send(conn, {"code": "gone", "ok": False})
+    conn, lines, request = serve(sock)
+    assert request["from"] is None
+    send(conn, {"ok": True, "seq": 2, "through": None})
+    conn.shutdown(socket.SHUT_RDWR)
+    conn, lines, request = serve(sock)
     send(conn, {"code": "taken", "ok": False})
     thread.join()
-    assert ends == ["the connection ended", '{"code":"taken","ok":false}']
+    assert ends == ["the connection ended"] * 2 + ['{"code":"taken","ok":false}']
     assert "transcribe: refused:" in capsys.readouterr().err
 
 
@@ -232,7 +329,7 @@ def test_stand(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -
     causes = iter([OSError("down"), OSError("down"), None, OSError("down"), ValueError("bad")])
     waits = []
 
-    def session() -> None:
+    def failing() -> None:
         cause = next(causes)
         if cause:
             raise cause
@@ -245,7 +342,7 @@ def test_stand(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -
     monkeypatch.setattr(transcribe.time, "sleep", wait)
     monkeypatch.setenv("RIFT_POLL_MS", "1")
     with pytest.raises(SystemExit) as stopped:
-        stand(session)
+        stand(failing)
     assert stopped.value.code == 0
     assert capsys.readouterr().err.splitlines() == [
         "transcribe: down",
@@ -258,13 +355,15 @@ def test_stand(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -
 
 
 def test_main(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
-    """No track: usage, 2; else the model loaded from --model and the engine stood."""
-    assert main([]) == 2
-    assert capsys.readouterr().err.startswith("usage: transcribe <track>")
+    """No track or no model: usage, 2; else the model loaded from --model and the engine stood;
+    anything escaping, one line and 1.
+    """
+    assert (main([]), main(["ear-desk"])) == (2, 2)
+    assert capsys.readouterr().err.startswith("usage: transcribe <track> --model <dir>")
     from transcribe import moonshine  # noqa: PLC0415 -- the runtime, imported as main does
 
     loaded = []
-    monkeypatch.setattr(moonshine, "Moonshine", lambda path: loaded.append(path) or Model(SCRIPT))
+    monkeypatch.setattr(moonshine, "Moonshine", lambda path: loaded.append(path) or Model())
     monkeypatch.setenv("RIFT_ROOT", "/nonexistent")
     stood = []
 
@@ -277,3 +376,11 @@ def test_main(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) ->
     monkeypatch.setattr(sys, "argv", ["transcribe", "ear-desk", "--model", "m"])
     assert main() == 0
     assert (loaded, stood) == (["m"], [1])
+
+    def broken(_: object) -> None:
+        message = "no model here"
+        raise RuntimeError(message)
+
+    monkeypatch.setattr(moonshine, "Moonshine", broken)
+    assert main(["ear-desk", "--model", "m"]) == 1
+    assert capsys.readouterr().err == "transcribe: no model here\n"
