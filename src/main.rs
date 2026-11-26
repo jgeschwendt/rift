@@ -1945,7 +1945,11 @@ fn main() -> ExitCode {
             // since macOS keys a bare program's microphone grant by its path (observed
             // 2026-11-26 · tccd prompting anew for each `hotswap/rift/<version>/rift`)
             let fixed = home.join(".local/libexec/rift/rift");
-            let (label, ear) = ("dev.gigantic.rift", "dev.gigantic.rift.ear");
+            let (label, ear, mouth) = (
+                "dev.gigantic.rift",
+                "dev.gigantic.rift.ear",
+                "dev.gigantic.rift.mouth",
+            );
             // an agent's plist: `program` run with `said`, `keep` its KeepAlive, `err` its stderr
             let sheet = |name: &str, program: &Path, said: &str, keep: &str, err: &str| {
                 format!(
@@ -1980,6 +1984,7 @@ fn main() -> ExitCode {
             };
             let path = home.join(format!("Library/LaunchAgents/{label}.plist"));
             let heard = path.with_file_name(format!("{ear}.plist"));
+            let voiced = path.with_file_name(format!("{mouth}.plist"));
             let install = || -> io::Result<()> {
                 // a tool call past `$RIFT_SIGN_MS` is killed, since a keychain asking at the
                 // screen, or a launchctl that never answers, would hold setup forever
@@ -2028,22 +2033,31 @@ fn main() -> ExitCode {
                     "<dict><key>SuccessfulExit</key><false/></dict>",
                     "serve.err",
                 );
-                let standing = |mac: &str| {
+                // a standing device's: the ear's, and the mouth's beside it, on the one fixed copy
+                let standing = |job: &str, kind: &str, flag: &str, mac: &str| {
                     sheet(
-                        ear,
+                        job,
                         &fixed,
                         &format!(
-                            "<string>device</string><string>ear</string><string>{mac}</string><string>--mic</string>"
+                            "<string>device</string><string>{kind}</string><string>{mac}</string><string>{flag}</string>"
                         ),
                         "<true/>",
-                        "ear.err",
+                        &format!("{kind}.err"),
                     )
                 };
-                // with no host name (off macOS, no scutil) there is no ear: the daemon's alone
+                // with no host name (off macOS, no scutil) there is no ear and no mouth: the
+                // daemon's alone
                 if words.contains(&"--print") {
                     print!(
                         "{plist}{}",
-                        named().map_or_else(|_| String::new(), |mac| standing(&mac))
+                        named().map_or_else(
+                            |_| String::new(),
+                            |mac| format!(
+                                "{}{}",
+                                standing(ear, "ear", "--mic", &mac),
+                                standing(mouth, "mouth", "--speaker", &mac)
+                            )
+                        )
                     );
                     return Ok(());
                 }
@@ -2149,10 +2163,10 @@ fn main() -> ExitCode {
                         unload(&agent.1)?;
                         gone(&agent.0);
                     }
-                    unload(ear)?;
-                    gone(&heard);
-                    unload(label)?;
-                    gone(&path);
+                    for (job, file) in [(ear, &heard), (mouth, &voiced), (label, &path)] {
+                        unload(job)?;
+                        gone(file);
+                    }
                     gone(&exe);
                     gone(&fixed);
                     drop(fixed.parent().map(fs::remove_dir));
@@ -2166,7 +2180,10 @@ fn main() -> ExitCode {
                 let swap =
                     loaded(label)? && fs::read_to_string(&path).is_ok_and(|held| held == plist);
                 let mac = named()?;
-                let listened = standing(&mac);
+                let (listened, spoken) = (
+                    standing(ear, "ear", "--mic", &mac),
+                    standing(mouth, "mouth", "--speaker", &mac),
+                );
                 for agent in &older {
                     unload(&agent.1)?;
                     if let Some(from) = agent.2.as_ref().map(PathBuf::from)
@@ -2304,7 +2321,7 @@ security import "$1/identity.p12" -k "$3" -P "$2" -T /usr/bin/codesign"#,
                     println!("installed {} as {}", target.display(), fixed.display());
                 }
                 path.parent().map_or(Ok(()), fs::create_dir_all)?;
-                for (file, text) in [(&path, &plist), (&heard, &listened)] {
+                for (file, text) in [(&path, &plist), (&heard, &listened), (&voiced, &spoken)] {
                     let staged = file.with_extension("plist.new");
                     fs::write(&staged, text)?;
                     fs::rename(&staged, file)?;
@@ -2370,8 +2387,9 @@ security import "$1/identity.p12" -k "$3" -P "$2" -T /usr/bin/codesign"#,
                         root.join(err).display()
                     )))
                 };
-                // the ear out first, so the new daemon lists only the ear loaded after it
+                // the ear and the mouth out first, so the new daemon lists only what loads after it
                 unload(ear)?;
+                unload(mouth)?;
                 // the same plist loaded and the release not re-signed: a swap is one kickstart;
                 // else it is loaded afresh, since launchd refused a kickstart onto a changed
                 // signature (AGENTS.md, observed 2026-11-25)
@@ -2379,32 +2397,46 @@ security import "$1/identity.p12" -k "$3" -P "$2" -T /usr/bin/codesign"#,
                 up(label, &path, "serve.err", swap && !signed, &|health| {
                     Some(&health["pid"]) != before.as_ref()
                 })?;
-                // the ear only once the daemon is up: whatever fails there leaves it serving. One
-                // disabled in launchd is written, never loaded: the way to opt out
-                if String::from_utf8_lossy(&call(&["print-disabled", &gui])?.stdout)
-                    .contains(&format!("\"{ear}\" => disabled"))
-                {
-                    println!(
-                        "{ear} is disabled, so written and not loaded; launchctl enable {gui}/{ear} stands it"
-                    );
-                    return Ok(());
-                }
-                let track = json!(format!("ear-{mac}"));
-                let listed = |health: &Value| {
-                    health["devices"]
-                        .as_array()
-                        .is_some_and(|held| held.contains(&track))
+                // the ear and the mouth only once the daemon is up: whatever fails there leaves it
+                // serving, each tried whatever the other's outcome. One disabled in launchd is
+                // written, never loaded: the way to opt out
+                let disabled =
+                    String::from_utf8_lossy(&call(&["print-disabled", &gui])?.stdout).into_owned();
+                let stand = |job: &str, kind: &str, file: &Path| -> io::Result<()> {
+                    if disabled.contains(&format!("\"{job}\" => disabled")) {
+                        println!(
+                            "{job} is disabled, so written and not loaded; launchctl enable {gui}/{job} stands it"
+                        );
+                        return Ok(());
+                    }
+                    let track = json!(format!("{kind}-{mac}"));
+                    let listed = |health: &Value| {
+                        health["devices"]
+                            .as_array()
+                            .is_some_and(|held| held.contains(&track))
+                    };
+                    // a device already holding the track (a hand-run one): the standing one is
+                    // loaded to take it over once that one leaves, and there is no readiness to
+                    // wait for
+                    if serving().is_some_and(|health| listed(&health)) {
+                        must(&["bootstrap", &gui, &file.to_string_lossy()])?;
+                        println!(
+                            "{kind}-{mac} is held by another device; {job} takes it over once it leaves"
+                        );
+                        return Ok(());
+                    }
+                    up(job, file, &format!("{kind}.err"), false, &listed)
                 };
-                // a device already holding the track (a hand-run ear): the standing one is loaded
-                // to take it over once that one leaves, and there is no readiness to wait for
-                if serving().is_some_and(|health| listed(&health)) {
-                    must(&["bootstrap", &gui, &heard.to_string_lossy()])?;
-                    println!(
-                        "ear-{mac} is held by another device; {ear} takes it over once it leaves"
-                    );
-                    return Ok(());
+                let failed: Vec<String> =
+                    [stand(ear, "ear", &heard), stand(mouth, "mouth", &voiced)]
+                        .into_iter()
+                        .filter_map(|stood| stood.err().map(|cause| cause.to_string()))
+                        .collect();
+                if failed.is_empty() {
+                    Ok(())
+                } else {
+                    Err(io::Error::other(failed.join("\nrift setup: ")))
                 }
-                up(ear, &heard, "ear.err", false, &listed)
             };
             install().map_or_else(
                 |cause| {
