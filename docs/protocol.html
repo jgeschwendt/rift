@@ -502,7 +502,7 @@
   <header>
     <h2 class="h2">Engines</h2>
     <p class="docs-note">Served as far as <a href="index.html#engines">the slices</a> built: the
-      connection, words and turn. An engine is a client that does one kind of work
+      connection, words, turn and echo, its clean track aside. An engine is a client that does one kind of work
       on one track and reports results, which the daemon checks and logs as events
       (<a href="index.html#engines">the design</a>). Every op, field, event and code here is
       additive: <code class="code">proto</code> stays 1, and nothing above changes meaning.</p>
@@ -528,7 +528,10 @@
       it read off what it was given, on the daemon's clock. A report naming a time past the end of
       the last frame it was given, or starting before the latest time its kind of report names on
       that track (logged, any boot: a partial's the last final's end), is
-      <code class="code">bad_request</code> and logs nothing.</li>
+      <code class="code">bad_request</code> and logs nothing. A mask alone may end past what was
+      heard, since a run's echo is known as it sounds; it starts no earlier than the engine's
+      ruling, which starts where the track ended as it connected, so no mask reaches a frame
+      already passed on.</li>
     <li><strong>What a turn or words engine reads.</strong> Its track's frames,
       <code class="code">{"pcm":"…","t":1764000000000000}</code> as a reader's, from
       <code class="code">from</code>: replayed from disk, then live, one gapless, duplicate-free
@@ -545,8 +548,8 @@
       each run as its mouth reports it, on the daemon's clock
       (<code class="code">{"from":0,"play":3,"samples":960,"start":…,"track":"mouth-desk"}</code>),
       and its end (<code class="code">{"played":3,"track":"mouth-desk"}</code>). It reports
-      <code class="code">mask</code> and <code class="code">ruled</code>, and may stream a clean
-      track (below). One 1024 frames behind its ruling is dropped. With none connected, or once one
+      <code class="code">mask</code> and <code class="code">ruled</code>, and later may stream a
+      clean track (below; not yet served). One 1024 frames behind its ruling is dropped. With none connected, or once one
       leaves, frames go on unruled at once: the stage fails open, and the
       <code class="code">engine</code> events record where.</li>
     <li><strong>What a speech engine reads.</strong> Its mouth's says:

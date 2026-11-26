@@ -25,11 +25,12 @@ hold those lines and nothing else.
 | path | what |
 | --- | --- |
 | `.github/workflows/release.yaml` | a GitHub Release per merge to main, `YYYY.M.N`, `aarch64-apple-darwin` and `x86_64-unknown-linux-gnu`, signed by packslip |
-| `src/main.rs` | the binary: `serve` (its plays included), the clients `status`, `quiet`, `ears`, `keep`, `feed`, `listen`, `read`, `play`, `hush`, the file-fed `device`, then `setup` (its signing included), `upgrade`, `version` |
+| `src/main.rs` | the binary: `serve` (its plays and engines included), the clients `status`, `quiet`, `ears`, `keep`, `feed`, `listen`, `read`, `play`, `hush`, the file-fed `device`, then `setup` (its signing included), `upgrade`, `version` |
 | `src/ear.rs` | macOS: `device ear <name> --mic`, its loop, the Bluetooth rule (`pick`), the 16 kHz converter, and `Fake`, the suite's microphones under `$RIFT_MIC` |
 | `src/mic.rs` | macOS: the cpal lines and coreaudio-rs's transport and built-in lookups alone, exempt from coverage |
 | `src/mouth.rs` | macOS: `device mouth <name> --speaker`, its loop, the given-rate interpolator, the track's cutter, and `Fake`, the suite's outputs under `$RIFT_SPEAKER` |
 | `src/speaker.rs` | macOS: the cpal output lines alone, exempt from coverage |
+| `src/tail.rs` | `engine run tail <ear>`, the reference echo engine |
 | `build.rs` | the build identity: `$RIFT_VERSION` (the release workflow's), else the crate version; then the short commit, `-dirty` over uncommitted work, `unknown` outside git; on macOS the Info.plist linked in |
 | `tests/rift.rs` | the end-to-end suite: the built binary over temp roots via `RIFT_ROOT`, stub `launchctl`, `curl`, `security`, `openssl`, `codesign` and `scutil` planted on `PATH` and a temp `HOME` (also `HOTSWAP_TEST_HOME`) hotswap's layout is laid out in, a copy of the build its release, for `setup` and `upgrade`; `$RIFT_MIC`'s fake inputs for `--mic` and `$RIFT_SPEAKER`'s fake outputs for `--speaker`; a `Daemon` guard kills every process it holds, so one whose lines must count toward coverage ends by itself instead (a daemon by `shutdown` or a drain waited out, a file-fed device with its daemon, a standing one by a stop signal): a killed process writes no profile; `Started` kills what the `launchctl` stub started (its pids under `loaded/` and in `holder`, each checked to be this build), whose `bootout` and `kickstart` wait for the process to exit as launchd's do, so a new daemon never meets the old one's lock; every command run to its end goes through `bounded`, killed and named past 60 s |
 | `docs/index.html` | the design page: what rift is today and what it will be |
