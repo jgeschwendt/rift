@@ -9,28 +9,29 @@ holds what those pages do not: the commands, the map and how each verb behaves i
 
 ```sh
 mise run check     # the gate: fmt, clippy -D warnings, the end-to-end suite at 100 % line coverage
-mise run cover     # the suite under llvm-cov alone, naming any line it misses; src/mic.rs exempt
+mise run cover     # the suite under llvm-cov alone, naming any line it misses; mic.rs, speaker.rs exempt
 mise run dist      # this host's release archive, the next YYYY.M.N stamped, to dist/ (unsigned)
 mise run install   # a dev build to ~/.local/bin/rift-next, beside the release; setup never wires it
 ```
 
 The gate runs in hk's pre-push (`hk install --mise` once per clone) and in CI. `Cargo.toml`'s
 `[lints]` tables are kept by hand, held by no gate; each `allow` carries its reason. Coverage
-exempts `src/mic.rs` alone (`--ignore-filename-regex` in `mise.toml` and `ci.yaml`, kept alike):
-its lines open a real microphone, which no test may, so it holds those lines and nothing else
-(designed: `src/speaker.rs` beside it, for the output).
+exempts `src/mic.rs` and `src/speaker.rs` alone (`--ignore-filename-regex` in `mise.toml` and
+`ci.yaml`, kept alike): their lines open a real microphone or output, which no test may, so they
+hold those lines and nothing else.
 
 ## Map
 
 | path | what |
 | --- | --- |
 | `.github/workflows/release.yaml` | a GitHub Release per merge to main, `YYYY.M.N`, `aarch64-apple-darwin` and `x86_64-unknown-linux-gnu`, signed by packslip |
-| `src/main.rs` | the binary: `serve`, the clients `status`, `quiet`, `ears`, `keep`, `feed`, `listen`, `read`, the file-fed `device`, then `setup` (its signing included), `upgrade`, `version` |
+| `src/main.rs` | the binary: `serve` (its plays included), the clients `status`, `quiet`, `ears`, `keep`, `feed`, `listen`, `read`, `play`, `hush`, the file-fed `device`, then `setup` (its signing included), `upgrade`, `version` |
 | `src/ear.rs` | macOS: `device ear <name> --mic`, its loop, the Bluetooth rule (`pick`), the 16 kHz converter, and `Fake`, the suite's microphones under `$RIFT_MIC` |
 | `src/mic.rs` | macOS: the cpal lines and coreaudio-rs's transport and built-in lookups alone, exempt from coverage |
-| `src/mouth.rs`, `src/speaker.rs` | designed, not yet built: the mouth and its cpal output lines ([below](#plays-and-the-mouth-designed-not-yet-built)) |
+| `src/mouth.rs` | macOS: `device mouth <name> --speaker`, its loop, the given-rate interpolator, the track's cutter, and `Fake`, the suite's outputs under `$RIFT_SPEAKER` |
+| `src/speaker.rs` | macOS: the cpal output lines alone, exempt from coverage |
 | `build.rs` | the build identity: `$RIFT_VERSION` (the release workflow's), else the crate version; then the short commit, `-dirty` over uncommitted work, `unknown` outside git; on macOS the Info.plist linked in |
-| `tests/rift.rs` | the end-to-end suite: the built binary over temp roots via `RIFT_ROOT`, stub `launchctl`, `curl`, `security`, `openssl`, `codesign` and `scutil` planted on `PATH` and a temp `HOME` (also `HOTSWAP_TEST_HOME`) hotswap's layout is laid out in, a copy of the build its release, for `setup` and `upgrade`; `$RIFT_MIC`'s fake inputs for `--mic`; a `Daemon` guard kills every process it holds, so one whose lines must count toward coverage ends by itself instead (a daemon by `shutdown`, a file-fed device with its daemon, a `--mic` one by a stop signal): a killed process writes no profile; `Started` kills what the `launchctl` stub started (its pids under `loaded/` and in `holder`, each checked to be this build), whose `bootout` and `kickstart` wait for the process to exit as launchd's do, so a new daemon never meets the old one's lock; every command run to its end goes through `bounded`, killed and named past 60 s |
+| `tests/rift.rs` | the end-to-end suite: the built binary over temp roots via `RIFT_ROOT`, stub `launchctl`, `curl`, `security`, `openssl`, `codesign` and `scutil` planted on `PATH` and a temp `HOME` (also `HOTSWAP_TEST_HOME`) hotswap's layout is laid out in, a copy of the build its release, for `setup` and `upgrade`; `$RIFT_MIC`'s fake inputs for `--mic` and `$RIFT_SPEAKER`'s fake outputs for `--speaker`; a `Daemon` guard kills every process it holds, so one whose lines must count toward coverage ends by itself instead (a daemon by `shutdown` or a drain waited out, a file-fed device with its daemon, a standing one by a stop signal): a killed process writes no profile; `Started` kills what the `launchctl` stub started (its pids under `loaded/` and in `holder`, each checked to be this build), whose `bootout` and `kickstart` wait for the process to exit as launchd's do, so a new daemon never meets the old one's lock; every command run to its end goes through `bounded`, killed and named past 60 s |
 | `docs/index.html` | the design page: what rift is today and what it will be |
 | `docs/protocol.html` | the wire contract, protocol 1 |
 
@@ -43,18 +44,20 @@ boot drains; a socket path over 103 bytes, a `run/` not this user's or reachable
 or a held lock is one stderr line, a `refused` log line and exit 1. Otherwise it creates the root
 and `run/` 0700 when absent, holds an exclusive `flock` on `run/serve.lock` for life, cuts a torn
 last line off the log and derives its state from it, binds `run/serve.new`, writes
-`run/serve.pid`, appends the `boot` event, closes out the segments a kill left open, renames the
+`run/serve.pid`, appends the `boot` event, ends the plays a kill left open (`played` `lost`), closes
+out the segments a kill left open, renames the
 socket over `run/rift.sock`, logs its start and prints its health line on stdout: ready.
 
-SIGTERM, SIGINT and SIGHUP take the shutdown path: stop accepting, close the open segments, append
-`stop`, end the feeds, let open connections ask `health` inside `$RIFT_DRAIN_MS`, cut them, remove
+SIGTERM, SIGINT and SIGHUP take the shutdown path: stop accepting, hush each open play in turn
+inside `$RIFT_DRAIN_MS` (one whose mouth has not answered by then ended at its last report, each
+`played` `stop`), close the open segments, append `stop`, end the feeds, let open connections ask `health` inside `$RIFT_DRAIN_MS`, cut them, remove
 `serve.pid` and the socket while the pid file still holds its pid, log the exit, exit 0.
 
 ### The clients and `rift device`
 
 Each prints the daemon's reply (a feed, a listen and a read, in its place, each line after it until
-the stream ends), exit 0 on `"ok":true`; `down` and `unknown` exit 1, but a `--mic` device's
-(below). A daemon of another protocol is
+the stream ends; a play, its last line), exit 0 on `"ok":true` (a play, on `"reason":"end"`);
+`down` and `unknown` exit 1, but a standing device's (below). A daemon of another protocol is
 one stderr line naming both and the fix (`rift setup`), exit 1; another version, the same line
 beside the reply. `rift device`, as `docs/index.html#cli` has it, answers the reply's ping before its
 first frame, so the daemon never refuses it `unsynced`. With `--mic` (`src/ear.rs`) one channel
@@ -76,21 +79,24 @@ before the first ends it on SIGTERM, SIGINT or SIGHUP with one stderr line (writ
 `eprintln!`, so a closed stderr cannot panic it) and `exit(0)`, which still writes the coverage
 profile.
 
-### Plays and the mouth (designed, not yet built)
+### Plays and the mouth
 
-The design is `docs/index.html#mouth`, the wire `docs/protocol.html#plays`. `src/mouth.rs`
-(macOS): `device mouth <name> --speaker`, its loop on one channel as the ear's (the reader thread's
-lines, pings answered there; the output listings, on a thread every poll; each open's outcome and
-the callback's reports, tagged with the open's number), the given-rate converter, the queue, the
-stamping, hush, the default's following, and `Fake`, the suite's outputs under `$RIFT_SPEAKER`.
-`src/speaker.rs`: the cpal output lines alone, the callback handing each buffer to a fill function
-in `mouth.rs`; the coverage regex in `mise.toml` and `ci.yaml` becomes `src/(mic|speaker)\.rs$`.
-The daemon holds no audio: per mouth track at most one open play, its `given` and the mouth's last
-`sound`, a give's reply withheld (the connection waiting on room, the play's end, or its giver
-leaving, never on a read) while `given` less taken reaches `$RIFT_AHEAD_MS`; a hush waits 1 s for
-`done`, then cuts the mouth. The drain hushes every play and logs each `played` before `stop`; the
-boot derives the next `play` from the log and logs `played` `lost` for each `play` left without
-one. `rift play` and `rift hush` are clients as above; `play`'s stop signal closes its connection.
+The design is `docs/index.html#mouth`, the wire `docs/protocol.html#plays`. The daemon holds no
+audio: `Live.plays` holds per mouth track at most one open `Play` (its `given`, the mouth's run
+under way, whether it was ended or hushed), `Live.ended` each mouth's last play's last line. A
+give is passed under the topic `<track>>`, a playing device's queue of its own beside `ears`, so a
+full one is dropped by `fan` as a slow feed is; its reply waits on `ROOM`, the one `Condvar` every
+change to a play wakes, while `given` less taken reaches `$RIFT_AHEAD_MS`, so a giver is seen to
+leave only once that wait ends. `quell` hushes and waits for `done` up to `PATIENCE` (1 s), then
+cuts the mouth and ends the play at its last report; the drain runs it per play inside its budget.
+`finish` logs the run under way and `played`, closes the mouth's open segment, keeps the last line
+and shuts the giver's read side, so a giver blocked on a read wakes to write it. `src/mouth.rs`'s
+loop is the ear's shape: the reader thread's lines (the reply first, pings answered there), the
+output listings on a thread every poll, each open's outcome tagged with its number; the output's
+callback fills under one mutex with the loop (`Shared`), a closed open's callback left silent. A
+standing `--speaker` device stands, strikes, rotates `mouth.err` and stops as `--mic` does; a
+device reply without `"plays":true` is struck as a refusal. `rift play` gives 16384 bytes at a
+time, its stop signal arming as a standing device's but exit 1.
 
 ### `rift setup`
 
@@ -101,9 +107,11 @@ as after `shutdown`, stays down), `RunAtLoad`, `ThrottleInterval` 10,
 `dev.gigantic.rift.ear`: the same but `ProgramArguments` `~/.local/libexec/rift/rift device ear
 <host> --mic` (the signed release's copy at one path every release shares, since the microphone's
 grant is keyed by the program's path; the daemon opens no microphone and stays on the link),
-`KeepAlive` true, `StandardErrorPath` `<root>/ear.err`; `<host>` is `scutil --get
+`KeepAlive` true, `StandardErrorPath` `<root>/ear.err`; and the standing mouth's,
+`dev.gigantic.rift.mouth`, the ear's but `device mouth <host> --speaker` and `<root>/mouth.err`
+(an output asks no grant; one program serves both). `<host>` is `scutil --get
 LocalHostName` (resolved from `PATH`, under `$RIFT_SIGN_MS`) lowercased, asked only by `--print`
-and an install: `setup --print` prints both and writes nothing, the daemon's alone when there is no
+and an install: `setup --print` prints the three and writes nothing, the daemon's alone when there is no
 name (no `scutil`, off macOS); an install refuses one that is no track name (unset, or past
 `well`) in one line, exit 1, right after the `launchctl` check, before anything is written;
 `--remove` asks for none. `setup`, `launchctl` resolved from `PATH` and killed past
@@ -165,9 +173,9 @@ printed:
    full segments, then a restart, its one hole, and a 300 ms freeze with none);
 5. the signed release copied to the ear's fixed path, `~/.local/libexec/rift/rift`, by temp +
    rename unless it is already there byte for byte (`installed <release> as <path>`), so a
-   running ear keeps the file it mapped and a rerun changes nothing; then both plists by temp +
-   rename (`wrote <path>`);
-6. the ear booted out when loaded, before the daemon is touched;
+   running ear keeps the file it mapped and a rerun changes nothing; then the three plists by temp
+   + rename (`wrote <path>`);
+6. the ear, then the mouth, booted out when loaded, before the daemon is touched;
 7. the same daemon plist already loaded and the release not re-signed this run: `kickstart -k`,
    the swap; else the reload: booted out when loaded, then `bootstrap`;
 8. health polled every 100 ms until a daemon answers ready (after a swap, not the one it
@@ -183,13 +191,20 @@ printed:
    step 8 for it with `ear-<host>` among `devices` as ready and `<root>/ear.err` named. A device
    that connects between that check and the ear's own connect still passes for it; the standing
    ear, refused `taken`, says so in `ear.err` and takes over once that one leaves. Its failure is
-   the line, exit 1, the daemon serving; a daemon failure before it leaves the ear unloaded.
+   the line, exit 1, the daemon serving; a daemon failure before it leaves the ear unloaded;
+10. the mouth by step 9's rules, `mouth-<host>` and `<root>/mouth.err` for the ear's, one
+   `print-disabled` serving both, whatever the ear's outcome: each failure its own line, exit 1
+   once both are tried.
 
-Designed, not yet built: `dev.gigantic.rift.mouth`, the ear's plist but `device mouth <host>
---speaker` and `<root>/mouth.err`, written in step 5 with the others, booted out in step 6 with the
-ear, and after step 9 taken through step 9's rules with `mouth-<host>` (its own disabled, held and
-ready lines), whatever the ear's outcome; either's failure exits 1 after both are tried.
-`--print` prints it, `--remove` boots it out and removes it.
+The upgrade from a release without the mouth runs this setup; each failure leaves (a hotswap
+rollback then runs the older setup, which knows nothing of the mouth): before step 5, nothing of
+the mouth; from step 5, its plist written, and from step 6 the old ear booted out, so a daemon
+failure leaves ear and mouth unloaded with their plists in place, which launchd loads at the next
+login; after step 8, the daemon serving and the mouth loaded or named. A mouth plist the older
+release then finds is left loaded and unmanaged, as the ear's is below, and its program, the
+fixed copy, is the older release again, which reads `--speaker` as a file it cannot open and
+exits 1, respawned every `ThrottleInterval`, a line into `mouth.err` each time, uncapped, until
+a setup of this release or `launchctl bootout` by hand.
 
 Observed (observed 2026-11-25 · `/usr/bin/log show`, since zsh shadows `log`): the first upgrade
 onto a signing release re-signed it, then `kickstart -k`; launchd refused the spawn (`Launch
@@ -209,7 +224,7 @@ hand.
 After each bootout `launchctl print` is polled every 100 ms until it fails, at most
 `$RIFT_BOOTOUT_MS`: `<label> still loaded <ms> ms after its bootout`, exit 1. `setup --remove`
 first has hotswap forget the layout, its record and the upgrade agent (refused while a swap runs),
-then boots out every earlier install, `dev.gigantic.rift.ear` and `dev.gigantic.rift`, removes their plists,
+then boots out every earlier install, `dev.gigantic.rift.ear`, `dev.gigantic.rift.mouth` and `dev.gigantic.rift`, removes their plists,
 `~/.local/bin/rift`, the ear's copy and its `~/.local/libexec/rift/`, the keychain and its password as files (never `security delete-keychain`,
 which may ask to unlock it), and leaves the root alone. Idempotent.
 

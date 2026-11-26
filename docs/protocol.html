@@ -43,9 +43,7 @@
   <p class="lead docs-lead">Between the rift daemon (<code class="code">dev.gigantic.rift</code>)
     and its clients: the <code class="code">rift</code> command line and any program on its socket.
     Clients are written against this page; a change here breaks them unless it is
-    <a href="#events">additive</a>. What rift is: <a href="index.html">the design</a>. What is
-    marked <em>designed</em> is not built yet: today's daemon answers its ops
-    <code class="code">unknown_op</code>.</p>
+    <a href="#events">additive</a>. What rift is: <a href="index.html">the design</a>.</p>
   <nav class="row docs-toc" aria-label="sections">
     <a class="pill" href="#transport">transport</a>
     <a class="pill" href="#framing">framing</a>
@@ -127,23 +125,23 @@
     <table data-table>
       <thead><tr><th>op</th><th>request</th><th>reply</th></tr></thead>
       <tbody>
-        <tr><td class="table-mono">device</td><td class="table-mono">{"kind":"ear","name":"desk","op":"device"}<br />{"kind":"mouth","name":"desk","op":"device","plays":true}</td><td><code class="code">{"ears":true,"ok":true,"ping":1764000000000000,"track":"ear-desk"}</code>, then the connection is that track's <a href="#devices">device</a>; <em>designed</em>: <code class="code">plays</code>, a mouth's alone, makes it one that <a href="#plays">plays</a>, and its reply carries <code class="code">"plays":true</code></td></tr>
-        <tr><td class="table-mono">done</td><td class="table-mono">{"op":"done","play":3}</td><td><em>designed</em>, a playing mouth's: nothing more of the play will sound; none</td></tr>
+        <tr><td class="table-mono">device</td><td class="table-mono">{"kind":"ear","name":"desk","op":"device"}<br />{"kind":"mouth","name":"desk","op":"device","plays":true}</td><td><code class="code">{"ears":true,"ok":true,"ping":1764000000000000,"track":"ear-desk"}</code>, then the connection is that track's <a href="#devices">device</a>; <code class="code">plays</code>, a mouth's alone, makes it one that <a href="#plays">plays</a>, and its reply carries <code class="code">"plays":true</code></td></tr>
+        <tr><td class="table-mono">done</td><td class="table-mono">{"op":"done","play":3}</td><td>a playing mouth's: nothing more of the play will sound or be sent; none</td></tr>
         <tr><td class="table-mono">ears</td><td class="table-mono">{"on":true,"op":"ears"}</td><td>as <code class="code">quiet</code>, for <a href="#stream">the ears</a></td></tr>
-        <tr><td class="table-mono">end</td><td class="table-mono">{"op":"end"}</td><td><em>designed</em>, a giver's: <code class="code">{"ok":true}</code>; nothing more is given, and what was plays out</td></tr>
+        <tr><td class="table-mono">end</td><td class="table-mono">{"op":"end"}</td><td>a giver's: <code class="code">{"ok":true}</code>; nothing more is given, and what was plays out</td></tr>
         <tr><td class="table-mono">feed</td><td class="table-mono">{"after":null,"op":"feed"}<br />{"after":{"boot":7,"seq":12},"op":"feed"}</td><td><code class="code">{"ok":true,"reset":false}</code>, then the connection is a <a href="#feed">feed</a>; <code class="code">after</code> is required</td></tr>
         <tr><td class="table-mono">frame</td><td class="table-mono">{"op":"frame","pcm":"…","t":81234567}<br />{"mic":"MacBook Pro Microphone","op":"frame","pcm":"…","t":81234567}</td><td>a device's: <code class="code">{"ok":true,"t":1764000000020000}</code>, the frame's time on its track, perhaps with a <code class="code">ping</code>; <code class="code">mic</code>, optional, names the <a href="#devices">microphone</a> it was heard on</td></tr>
-        <tr><td class="table-mono">give</td><td class="table-mono">{"op":"give","pcm":"…"}</td><td><em>designed</em>, a giver's: <code class="code">{"given":4800,"ok":true}</code>, the play's samples given so far, withheld while its mouth holds <code class="code">$RIFT_AHEAD_MS</code> or more unplayed (<a href="#plays">plays</a>)</td></tr>
-        <tr><td class="table-mono">health</td><td class="table-mono">{"op":"health"}</td><td>the hello reply's fields, plus <code class="code">"quiet":false</code>, <code class="code">"seq":12</code> (the last event's <code class="code">seq</code> in this boot), and the stream's <code class="code">"archive":null</code>, <code class="code">"devices":["ear-desk"]</code> (the live tracks), <code class="code">"ears":true</code> and <code class="code">"window":600</code>; <em>designed</em>: <code class="code">"playing":{"mouth-desk":3}</code>, each open play by its mouth</td></tr>
-        <tr><td class="table-mono">hush</td><td class="table-mono">{"op":"hush","track":"mouth-desk"}</td><td><em>designed</em>: the mouth's play ended at once, then its <code class="code">played</code> fields, <code class="code">{"dropped":8400,"given":38400,"ok":true,"play":4,"played":30000,"reason":"hush","seq":45}</code>; with no play open, <code class="code">{"ok":true,"play":null}</code></td></tr>
+        <tr><td class="table-mono">give</td><td class="table-mono">{"op":"give","pcm":"…"}</td><td>a giver's: <code class="code">{"given":4800,"ok":true}</code>, the play's samples given so far, withheld while its mouth holds <code class="code">$RIFT_AHEAD_MS</code> or more unplayed (<a href="#plays">plays</a>)</td></tr>
+        <tr><td class="table-mono">health</td><td class="table-mono">{"op":"health"}</td><td>the hello reply's fields, plus <code class="code">"quiet":false</code>, <code class="code">"seq":12</code> (the last event's <code class="code">seq</code> in this boot), and the stream's <code class="code">"archive":null</code>, <code class="code">"devices":["ear-desk"]</code> (the live tracks), <code class="code">"ears":true</code>, <code class="code">"playing":{"mouth-desk":3}</code> (each open play by its mouth) and <code class="code">"window":600</code></td></tr>
+        <tr><td class="table-mono">hush</td><td class="table-mono">{"op":"hush","track":"mouth-desk"}</td><td>the mouth's play ended at once, then its <code class="code">played</code> fields, <code class="code">{"dropped":8400,"given":38400,"ok":true,"play":4,"played":30000,"reason":"hush","seq":45,"track":"mouth-desk"}</code>; with no play open, <code class="code">{"ok":true,"play":null}</code></td></tr>
         <tr><td class="table-mono">keep</td><td class="table-mono">{"archive":"/Volumes/a/rift","op":"keep","window":600}</td><td><code class="code">{"ok":true,"seq":14}</code>: the <a href="#audio">window</a> in seconds and the archive, an absolute directory or <code class="code">null</code>; then a sweep, which the reply does not wait for</td></tr>
         <tr><td class="table-mono">listen</td><td class="table-mono">{"op":"listen","track":"ear-desk"}</td><td><code class="code">{"ok":true}</code>, then the connection follows the track <a href="#readers">live</a></td></tr>
-        <tr><td class="table-mono">play</td><td class="table-mono">{"op":"play","rate":24000,"track":"mouth-desk"}</td><td><em>designed</em>: <code class="code">{"ok":true,"play":3,"seq":40}</code>, then the connection is that play's <a href="#plays">giver</a>; <code class="code">rate</code> is the given audio's, 8000 to 48000 Hz</td></tr>
+        <tr><td class="table-mono">play</td><td class="table-mono">{"op":"play","rate":24000,"track":"mouth-desk"}</td><td><code class="code">{"ok":true,"play":3,"seq":40}</code>, then the connection is that play's <a href="#plays">giver</a>; <code class="code">rate</code> is the given audio's, 8000 to 48000 Hz</td></tr>
         <tr><td class="table-mono">pong</td><td class="table-mono">{"op":"pong","ping":1764000000000000,"t":81234000}</td><td>a device's answer to a <a href="#devices">ping</a>; none</td></tr>
         <tr><td class="table-mono">quiet</td><td class="table-mono">{"on":true,"op":"quiet"}</td><td><code class="code">{"changed":true,"ok":true,"seq":13}</code>; the value it already has appends nothing and answers <code class="code">"changed":false</code> with the current <code class="code">seq</code></td></tr>
         <tr><td class="table-mono">read</td><td class="table-mono">{"from":1764000000000000,"op":"read","to":1764000010000000,"track":"ear-desk"}</td><td><code class="code">{"ok":true}</code>, then <a href="#readers">the range</a>, then end of stream</td></tr>
         <tr><td class="table-mono">shutdown</td><td class="table-mono">{"op":"shutdown"}</td><td><code class="code">{"ok":true}</code>, then the daemon drains and exits 0; the agent does not respawn it</td></tr>
-        <tr><td class="table-mono">sound</td><td class="table-mono">{"from":0,"op":"sound","play":3,"samples":9600,"t":81234567}</td><td><em>designed</em>, a playing mouth's: the run so far of the play's samples its output took back to back; none</td></tr>
+        <tr><td class="table-mono">sound</td><td class="table-mono">{"from":0,"op":"sound","play":3,"samples":9600,"t":81234567}</td><td>a playing mouth's: the run so far of the play's samples its output took back to back; none</td></tr>
       </tbody>
     </table>
   </div>
@@ -154,21 +152,21 @@
     <table data-table>
       <thead><tr><th>code</th><th>when</th></tr></thead>
       <tbody>
-        <tr><td class="table-mono">absent</td><td><em>designed</em>: a <code class="code">play</code> for a mouth no playing device streams (none connected, or a file-fed one)</td></tr>
+        <tr><td class="table-mono">absent</td><td>a <code class="code">play</code> for a mouth no playing device streams (none connected, or a file-fed one)</td></tr>
         <tr><td class="table-mono">ahead</td><td>a frame half a frame or more before its track's end: the device's clock runs fast, and the frame was dropped</td></tr>
-        <tr><td class="table-mono">bad_frame</td><td><code class="code">pcm</code> is not 640 bytes as hex, or <code class="code">mic</code> (<em>designed</em>: or <code class="code">speaker</code>) is neither a string nor null; <em>designed</em>: a give's <code class="code">pcm</code> is not 2 to 16384 bytes, whole samples, as hex</td></tr>
-        <tr><td class="table-mono">bad_request</td><td>not JSON, not an object, a missing or mistyped field; a kind, name or track not of <a href="#stream">the form</a>; <code class="code">frame</code> or <code class="code">pong</code> off a device, <code class="code">device</code>, <code class="code">feed</code>, <code class="code">listen</code> or <code class="code">read</code> on one; a <code class="code">read</code> whose <code class="code">from</code> is not before its <code class="code">to</code>; <em>designed</em>: <code class="code">plays</code> on an ear, a <code class="code">play</code> or <code class="code">hush</code> naming an ear's track or a rate out of range, <code class="code">give</code> or <code class="code">end</code> off a play's connection and any other op on one, <code class="code">sound</code> or <code class="code">done</code> off a playing mouth</td></tr>
-        <tr><td class="table-mono">busy</td><td><em>designed</em>: a <code class="code">play</code> for a mouth that has one open; nothing changed</td></tr>
+        <tr><td class="table-mono">bad_frame</td><td><code class="code">pcm</code> is not 640 bytes as hex, or <code class="code">mic</code> (a mouth's: <code class="code">speaker</code>) is neither a string nor null; a give's <code class="code">pcm</code> is not 2 to 16384 bytes, whole samples, as hex</td></tr>
+        <tr><td class="table-mono">bad_request</td><td>not JSON, not an object, a missing or mistyped field; a kind, name or track not of <a href="#stream">the form</a>; <code class="code">frame</code> or <code class="code">pong</code> off a device, <code class="code">device</code>, <code class="code">feed</code>, <code class="code">listen</code> or <code class="code">read</code> on one; a <code class="code">read</code> whose <code class="code">from</code> is not before its <code class="code">to</code>; <code class="code">plays</code> on an ear, a <code class="code">play</code> or <code class="code">hush</code> naming an ear's track or a rate out of range, <code class="code">play</code> or <code class="code">hush</code> on a device, <code class="code">give</code> or <code class="code">end</code> off a play's connection or once its play is over, a second <code class="code">end</code>, any other op on a play's connection, <code class="code">sound</code> or <code class="code">done</code> off a playing mouth</td></tr>
+        <tr><td class="table-mono">busy</td><td>a <code class="code">play</code> for a mouth that has one open; nothing changed</td></tr>
         <tr><td class="table-mono">closed</td><td>a frame while the ears are closed; it was not taken</td></tr>
         <tr><td class="table-mono">gone</td><td>a <code class="code">read</code> from before now less the window</td></tr>
         <tr><td class="table-mono">io</td><td>a write to the log or a segment failed; the request took no effect, though a segment it closed on the way stays closed, logged, so a retry repeats nothing</td></tr>
         <tr><td class="table-mono">proto</td><td>the hello's protocol is not the daemon's</td></tr>
-        <tr><td class="table-mono">quiet</td><td><em>designed</em>: a <code class="code">play</code> while quiet is on</td></tr>
+        <tr><td class="table-mono">quiet</td><td>a <code class="code">play</code> while quiet is on</td></tr>
         <tr><td class="table-mono">stopping</td><td>a request other than <code class="code">health</code> while draining</td></tr>
         <tr><td class="table-mono">taken</td><td>a <code class="code">device</code> for a track another device is streaming</td></tr>
         <tr><td class="table-mono">too_long</td><td>the line is over the <a href="#framing">limit</a></td></tr>
         <tr><td class="table-mono">unknown_op</td><td>an op this protocol does not have, a second hello included</td></tr>
-        <tr><td class="table-mono">unsynced</td><td>a frame (<em>designed</em>: or a <code class="code">sound</code>) before its device's first <code class="code">pong</code>: it has no place on the timeline yet</td></tr>
+        <tr><td class="table-mono">unsynced</td><td>a frame or a <code class="code">sound</code> before its device's first <code class="code">pong</code>: it has no place on the timeline yet</td></tr>
       </tbody>
     </table>
   </div>
@@ -193,10 +191,10 @@
         <tr><td class="table-mono">ears</td><td class="table-mono">on</td><td>the ears opened or closed</td></tr>
         <tr><td class="table-mono">hole</td><td class="table-mono">[mic,] samples, start, track</td><td>a gap in a track's frames this boot, or another microphone, logged as the frame after it arrives</td></tr>
         <tr><td class="table-mono">keep</td><td class="table-mono">archive, window</td><td>the window or archive was set</td></tr>
-        <tr><td class="table-mono">play</td><td class="table-mono">play, rate, track</td><td><em>designed</em>: a play opened on the mouth <code class="code">track</code>; <code class="code">play</code> counts plays from 1 across every boot, never reused</td></tr>
-        <tr><td class="table-mono">played</td><td class="table-mono">dropped, given, play, played, reason, track</td><td><em>designed</em>: the play is over, its counts in its own samples at its <code class="code">rate</code>: <code class="code">given</code> = <code class="code">played</code> + <code class="code">dropped</code> (<a href="#plays">plays</a>)</td></tr>
-        <tr><td class="table-mono">quiet</td><td class="table-mono">on</td><td>the quiet setting changed: health's <code class="code">quiet</code> is <code class="code">on</code> from here; <em>designed</em>: on, every open play ends <code class="code">quiet</code> after it</td></tr>
-        <tr><td class="table-mono">sound</td><td class="table-mono">from, play, samples, start, track</td><td><em>designed</em>: one run of the play's samples, <code class="code">from</code> up to <code class="code">from</code> + <code class="code">samples</code>, that the output took back to back, the first sounding at <code class="code">start</code>; logged when the run ends, before the next run's and the <code class="code">played</code></td></tr>
+        <tr><td class="table-mono">play</td><td class="table-mono">play, rate, track</td><td>a play opened on the mouth <code class="code">track</code>; <code class="code">play</code> counts plays from 1 across every boot, never reused</td></tr>
+        <tr><td class="table-mono">played</td><td class="table-mono">dropped, given, play, played, reason, track</td><td>the play is over, its counts in its own samples at its <code class="code">rate</code>: <code class="code">given</code> = <code class="code">played</code> + <code class="code">dropped</code> (<a href="#plays">plays</a>); the next boot's for a play a kill left open has neither <code class="code">given</code> nor <code class="code">dropped</code></td></tr>
+        <tr><td class="table-mono">quiet</td><td class="table-mono">on</td><td>the quiet setting changed: health's <code class="code">quiet</code> is <code class="code">on</code> from here; on, every open play ends <code class="code">quiet</code> after it</td></tr>
+        <tr><td class="table-mono">sound</td><td class="table-mono">from, play, samples, start, track</td><td>one run of the play's samples, <code class="code">from</code> up to <code class="code">from</code> + <code class="code">samples</code>, that the output took back to back, the first sounding at <code class="code">start</code>; logged when the run ends, before the next run's and the <code class="code">played</code></td></tr>
         <tr><td class="table-mono">segment</td><td class="table-mono">[mic,] n, path, samples, start, track</td><td>a segment closed; <code class="code">path</code> is under the root, <code class="code">audio/&lt;boot&gt;/&lt;track&gt;/&lt;n&gt;.pcm</code></td></tr>
         <tr><td class="table-mono">stop</td><td class="table-mono">reason</td><td>the drain began: health's <code class="code">state</code> is <code class="code">stopping</code> from here, and nothing follows it in this boot; a killed boot has none</td></tr>
         <tr><td class="table-mono">track</td><td class="table-mono">[mic,] start, track</td><td>a track's first frame this boot</td></tr>
@@ -204,9 +202,8 @@
     </table>
   </div>
   <p class="docs-note"><code class="code">[mic,]</code>: the microphone the event's frames name, present only when
-    they name one, so a file-fed device's events are as they were. <em>Designed</em>: a mouth's frames
-    name the output they sounded on, <code class="code">speaker</code>, carried the same way and by the
-    same rule.</p>
+    they name one, so a file-fed device's events are as they were; a mouth's name the output they
+    sounded on, <code class="code">speaker</code>, carried the same way and by the same rule.</p>
   <p class="docs-note">Additive, so no <code class="code">proto</code> bump: a new kind, a new field on
     an event or a reply, a new op, a new error code. Clients ignore kinds and fields they do not know.</p>
 </section>
@@ -224,7 +221,7 @@
       <code class="code">quiet</code> and <code class="code">ears</code> (the last such event's
       <code class="code">on</code>, default <code class="code">false</code>), the window and archive (the
       last <code class="code">keep</code>, default 600 s and none), and the closed segments still under
-      <code class="code">audio/</code>; <em>designed</em>: the next <code class="code">play</code> (the
+      <code class="code">audio/</code>, the next <code class="code">play</code> (the
       log's last plus 1) and the plays a kill left open (<a href="#plays">plays</a>). A torn last line,
       left by a kill mid-write, is cut off.</li>
   </ul>
@@ -300,17 +297,15 @@
       the open segment and opens with a <code class="code">hole</code>, however short, zero samples
       included. The <code class="code">track</code>, <code class="code">hole</code> and
       <code class="code">segment</code> events carry it, and the archive's index with them; a segment
-      a kill left open takes the microphone of its track's last event of that boot.
-      <em>Designed</em>: a mouth's frame names its output, <code class="code">speaker</code>, under
-      the same rule.</li>
+      a kill left open takes the microphone of its track's last event of that boot. A mouth's frame
+      names its output, <code class="code">speaker</code>, under the same rule.</li>
   </ul>
 </section>
 
 <section class="docs-section" id="plays" data-component="plays">
   <header>
     <h2 class="h2">Plays</h2>
-    <p class="docs-note"><em>Designed, not yet built.</em> A client, the giver, gives audio to the
-      daemon for a mouth; the daemon passes it to the device streaming that mouth's track, which
+    <p class="docs-note">A client, the giver, gives audio to the daemon for a mouth; the daemon passes it to the device streaming that mouth's track, which
       plays it on its output (<a href="index.html#mouth">the mouth</a>). The daemon holds no audio:
       what waits, waits in the mouth.</p>
   </header>
@@ -327,21 +322,25 @@
       is withheld while the mouth holds <code class="code">$RIFT_AHEAD_MS</code> (default 200) or more
       of the play given and not yet taken by its output, so a giver faster than real time is paced by
       its replies and the mouth holds at most that plus one give; a giver that sends ahead of its
-      replies leaves the rest in the socket, not given.</li>
+      replies leaves the rest in the socket, not yet read. The daemon passes each give to the mouth
+      on the mouth's own queue; one full (a mouth not reading) is dropped as a slow feed is, and the
+      play ends <code class="code">mouth</code>.</li>
     <li><strong>The end.</strong> Every play ends in one line to its giver, the
       <code class="code">played</code> event's fields and <code class="code">seq</code>, with no
       <code class="code">ok</code>, then the end of stream:
-      <code class="code">{"dropped":0,"given":72000,"play":3,"played":72000,"reason":"end","seq":42}</code>.
-      A give whose reply was withheld is answered first. What the giver sent after the end was not
-      read, and is not in <code class="code">given</code>.</li>
+      <code class="code">{"dropped":0,"given":72000,"play":3,"played":72000,"reason":"end","seq":42,"track":"mouth-desk"}</code>.
+      A give whose reply was withheld is answered first; one read after the end is refused
+      <code class="code">bad_request</code> and is not in <code class="code">given</code>. A giver that
+      leaves after <code class="code">end</code> leaves its play playing out, with no one to tell.</li>
     <li><strong>Reasons.</strong> <code class="code">end</code>: the giver sent
       <code class="code">end</code> and the mouth took all it was given.
       <code class="code">hush</code>: a <code class="code">hush</code> request.
       <code class="code">quiet</code>: quiet was set on. <code class="code">left</code>: the giver's
       connection ended before <code class="code">end</code>, which hushes the play.
-      <code class="code">mouth</code>: the mouth's connection ended, or it had not answered a hush
-      within 1 s and was cut. <code class="code">stop</code>: the daemon's drain.
-      <code class="code">lost</code>: a kill; the next boot's.</li>
+      <code class="code">mouth</code>: the mouth's connection ended, its queue was full, it said
+      <code class="code">done</code> unasked, or it had not answered a hush within 1 s and was cut.
+      <code class="code">stop</code>: the daemon's drain. <code class="code">lost</code>: a kill; the
+      next boot's.</li>
     <li><strong>Counts.</strong> Every count is in the play's own samples at its rate.
       <code class="code">played</code> is how many its mouth's output took, in order from the first,
       each sounding once that output's latency has passed; <code class="code">dropped</code> the rest
@@ -354,15 +353,16 @@
       ping offset and not capped at now: it may lie up to the output's latency after the event's
       <code class="code">t</code>.</li>
     <li><strong>A hush.</strong> The daemon tells the mouth, which drops everything the play has
-      queued at once, and answers with its last <code class="code">sound</code>, then
-      <code class="code">done</code>; then the <code class="code">sound</code> and
-      <code class="code">played</code> events, the hush's reply and the giver's line. What the output
-      took before the hush still sounds and is counted played. A mouth that has not answered in 1 s is
-      cut, and the play ends <code class="code">mouth</code> at its last report.</li>
+      queued at once and reports its last <code class="code">sound</code>, then, once the track's
+      frame holding the play's last sample has been sent, <code class="code">done</code>; then the
+      <code class="code">sound</code> and <code class="code">played</code> events, the mouth's open
+      segment closed, the hush's reply and the giver's line. What the output took before the hush
+      still sounds and is counted played. A mouth that has not answered in 1 s is cut, and the play
+      ends <code class="code">mouth</code> at its last report.</li>
   </ul>
   <p class="docs-note">On a feed, a play of 3 s at 24 kHz that ran to its end, then one hushed
     1.25 s in, its giver 350 ms ahead (the mouth's own track events, when the ears are open,
-    interleave):</p>
+    interleave, its segment closing at each <code class="code">played</code>):</p>
   <pre class="tree">{"boot":7,"e":{"kind":"play","play":3,"rate":24000,"track":"mouth-desk"},"seq":40,"t":"2026-11-22T18:10:00.004Z"}
 {"boot":7,"e":{"from":0,"kind":"sound","play":3,"samples":72000,"start":1764000000021000,"track":"mouth-desk"},"seq":41,"t":"2026-11-22T18:10:03.008Z"}
 {"boot":7,"e":{"dropped":0,"given":72000,"kind":"played","play":3,"played":72000,"reason":"end","track":"mouth-desk"},"seq":42,"t":"2026-11-22T18:10:03.008Z"}
@@ -375,23 +375,29 @@
       <code class="code">"plays":true</code>. It reads, beside replies, pings and notices of the ears,
       <code class="code">{"pcm":"…","play":3,"rate":24000}</code> (a give, passed on as given),
       <code class="code">{"end":3}</code> (play out what is queued, then <code class="code">done</code>)
-      and <code class="code">{"hush":3}</code> (drop it now, then <code class="code">done</code>). It
-      sends <code class="code">sound</code>, its play's current run (<code class="code">from</code>,
+      and <code class="code">{"hush":3}</code> (drop it now, then <code class="code">done</code>), the
+      plays' lines on a queue of their own beside its replies'. It sends
+      <code class="code">sound</code>, its play's current run (<code class="code">from</code>,
       <code class="code">samples</code> so far, <code class="code">t</code> the first sample's sounding
-      on its own clock), at most 20 ms of output apart and as each run ends; a new
-      <code class="code">from</code> starts the next run. <code class="code">sound</code> and
-      <code class="code">done</code> naming a play that is not open are ignored. A device without
+      on its own clock), every 20 ms of output and as each run ends; a new
+      <code class="code">from</code> starts the next run and logs the last. <code class="code">sound</code>
+      and <code class="code">done</code> naming a play that is not open are ignored; a
+      <code class="code">done</code> for one neither ended nor hushed ends it
+      <code class="code">mouth</code>. A device without
       <code class="code">plays</code>, the file-fed mouth among them, streams its track as before and
       is never given audio.</li>
     <li><strong>Its track.</strong> The mouth's frames are what its output took, at 16 kHz, cut on
       one 20 ms grid from the output's open and stamped from the output's callback plus the latency
       the system reports for it; a frame is sent once its last sample has sounded, so no frame is
-      ahead of now. Only a frame holding some of a play's samples is sent: silence between plays, and
-      a mouth run dry for a frame or more, sends nothing, a <a href="#audio">hole</a> logged at the
-      next play's first frame. While the ears are closed it sends none, as an ear; plays go on.</li>
-    <li><strong>Lost and re-derived.</strong> The drain hushes every open play inside
-      <code class="code">$RIFT_DRAIN_MS</code> and logs each <code class="code">played</code>
-      (<code class="code">stop</code>) before <code class="code">stop</code>. A kill leaves plays with a
+      ahead of now. Only a frame holding some of a play's samples is sent, the one holding its last
+      filled with silence as the play ends: silence between plays, and a mouth run dry for a frame or
+      more, sends nothing, a <a href="#audio">hole</a> logged at the next play's first frame. The
+      daemon closes the mouth's open segment as each play ends, so nothing of a mouth outlives the
+      window. While the ears are closed it sends none, as an ear; plays go on.</li>
+    <li><strong>Lost and re-derived.</strong> The drain hushes each open play in turn inside
+      <code class="code">$RIFT_DRAIN_MS</code>, one whose mouth has not answered by then ended at its
+      last report, and logs each <code class="code">played</code> (<code class="code">stop</code>)
+      before <code class="code">stop</code>. A kill leaves plays with a
       <code class="code">play</code> and no <code class="code">played</code>; the next boot logs one
       for each, <code class="code">"reason":"lost"</code>, <code class="code">played</code> the sum of
       its logged <code class="code">sound</code>s and no <code class="code">given</code> or
@@ -455,8 +461,8 @@
       <code class="code">ears</code>, <code class="code">keep</code>, <code class="code">listen</code> and
       <code class="code">read</code> are safe to retry; <code class="code">shutdown</code> and a
       <code class="code">frame</code> only when the request was provably not sent, since a frame sent
-      twice lands twice. <em>Designed</em>: <code class="code">hush</code> and
-      <code class="code">play</code> are safe to retry: a play opened on a connection that then
+      twice lands twice. <code class="code">hush</code> and <code class="code">play</code> are safe
+      to retry: a play opened on a connection that then
       ended is ended by it (<code class="code">left</code>), so a retry meets at most
       <code class="code">busy</code> until that is logged; a <code class="code">give</code> belongs to
       its connection and dies with it.</li>
