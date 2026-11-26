@@ -17,7 +17,8 @@ mise run install   # a dev build to ~/.local/bin/rift-next, beside the release; 
 The gate runs in hk's pre-push (`hk install --mise` once per clone) and in CI. `Cargo.toml`'s
 `[lints]` tables are kept by hand, held by no gate; each `allow` carries its reason. Coverage
 exempts `src/mic.rs` alone (`--ignore-filename-regex` in `mise.toml` and `ci.yaml`, kept alike):
-its lines open a real microphone, which no test may, so it holds those lines and nothing else.
+its lines open a real microphone, which no test may, so it holds those lines and nothing else
+(designed: `src/speaker.rs` beside it, for the output).
 
 ## Map
 
@@ -27,6 +28,7 @@ its lines open a real microphone, which no test may, so it holds those lines and
 | `src/main.rs` | the binary: `serve`, the clients `status`, `quiet`, `ears`, `keep`, `feed`, `listen`, `read`, the file-fed `device`, then `setup` (its signing included), `upgrade`, `version` |
 | `src/ear.rs` | macOS: `device ear <name> --mic`, its loop, the Bluetooth rule (`pick`), the 16 kHz converter, and `Fake`, the suite's microphones under `$RIFT_MIC` |
 | `src/mic.rs` | macOS: the cpal lines and coreaudio-rs's transport and built-in lookups alone, exempt from coverage |
+| `src/mouth.rs`, `src/speaker.rs` | designed, not yet built: the mouth and its cpal output lines ([below](#plays-and-the-mouth-designed-not-yet-built)) |
 | `build.rs` | the build identity: `$RIFT_VERSION` (the release workflow's), else the crate version; then the short commit, `-dirty` over uncommitted work, `unknown` outside git; on macOS the Info.plist linked in |
 | `tests/rift.rs` | the end-to-end suite: the built binary over temp roots via `RIFT_ROOT`, stub `launchctl`, `curl`, `security`, `openssl`, `codesign` and `scutil` planted on `PATH` and a temp `HOME` (also `HOTSWAP_TEST_HOME`) hotswap's layout is laid out in, a copy of the build its release, for `setup` and `upgrade`; `$RIFT_MIC`'s fake inputs for `--mic`; a `Daemon` guard kills every process it holds, so one whose lines must count toward coverage ends by itself instead (a daemon by `shutdown`, a file-fed device with its daemon, a `--mic` one by a stop signal): a killed process writes no profile; `Started` kills what the `launchctl` stub started (its pids under `loaded/` and in `holder`, each checked to be this build), whose `bootout` and `kickstart` wait for the process to exit as launchd's do, so a new daemon never meets the old one's lock; every command run to its end goes through `bounded`, killed and named past 60 s |
 | `docs/index.html` | the design page: what rift is today and what it will be |
@@ -73,6 +75,22 @@ polls. Each attempt first caps `<root>/ear.err` (`rotate`, the daemon's). A sign
 before the first ends it on SIGTERM, SIGINT or SIGHUP with one stderr line (written, never
 `eprintln!`, so a closed stderr cannot panic it) and `exit(0)`, which still writes the coverage
 profile.
+
+### Plays and the mouth (designed, not yet built)
+
+The design is `docs/index.html#mouth`, the wire `docs/protocol.html#plays`. `src/mouth.rs`
+(macOS): `device mouth <name> --speaker`, its loop on one channel as the ear's (the reader thread's
+lines, pings answered there; the output listings, on a thread every poll; each open's outcome and
+the callback's reports, tagged with the open's number), the given-rate converter, the queue, the
+stamping, hush, the default's following, and `Fake`, the suite's outputs under `$RIFT_SPEAKER`.
+`src/speaker.rs`: the cpal output lines alone, the callback handing each buffer to a fill function
+in `mouth.rs`; the coverage regex in `mise.toml` and `ci.yaml` becomes `src/(mic|speaker)\.rs$`.
+The daemon holds no audio: per mouth track at most one open play, its `given` and the mouth's last
+`sound`, a give's reply withheld (the connection waiting on room, the play's end, or its giver
+leaving, never on a read) while `given` less taken reaches `$RIFT_AHEAD_MS`; a hush waits 1 s for
+`done`, then cuts the mouth. The drain hushes every play and logs each `played` before `stop`; the
+boot derives the next `play` from the log and logs `played` `lost` for each `play` left without
+one. `rift play` and `rift hush` are clients as above; `play`'s stop signal closes its connection.
 
 ### `rift setup`
 
@@ -166,6 +184,12 @@ printed:
    that connects between that check and the ear's own connect still passes for it; the standing
    ear, refused `taken`, says so in `ear.err` and takes over once that one leaves. Its failure is
    the line, exit 1, the daemon serving; a daemon failure before it leaves the ear unloaded.
+
+Designed, not yet built: `dev.gigantic.rift.mouth`, the ear's plist but `device mouth <host>
+--speaker` and `<root>/mouth.err`, written in step 5 with the others, booted out in step 6 with the
+ear, and after step 9 taken through step 9's rules with `mouth-<host>` (its own disabled, held and
+ready lines), whatever the ear's outcome; either's failure exits 1 after both are tried.
+`--print` prints it, `--remove` boots it out and removes it.
 
 Observed (observed 2026-11-25 · `/usr/bin/log show`, since zsh shadows `log`): the first upgrade
 onto a signing release re-signed it, then `kickstart -k`; launchd refused the spawn (`Launch
