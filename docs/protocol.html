@@ -654,7 +654,7 @@
     <table data-table>
       <thead><tr><th>kind</th><th>fields</th><th>when</th></tr></thead>
       <tbody>
-        <tr><td class="table-mono">engine</td><td class="table-mono">name, on, stage, track</td><td>an engine connected (<code class="code">on</code>) or left, <code class="code">stage</code> its request's <code class="code">kind</code> (the event's own <code class="code">kind</code> is <code class="code">engine</code>); leaving, it ends any voice it left on, at a time not known</td></tr>
+        <tr><td class="table-mono">engine</td><td class="table-mono">name, on, stage, track</td><td>an engine connected (<code class="code">on</code>) or left, <code class="code">stage</code> its request's <code class="code">kind</code> (the event's own <code class="code">kind</code> is <code class="code">engine</code>); a turn engine leaving with its voice on has it logged off at the end of the last frame it was given, before this event, and a boot after a kill logs a voice left on off as it starts, so every voice on is followed by its off, live and in a replay</td></tr>
         <tr><td class="table-mono">mask</td><td class="table-mono">engine, on, start, track</td><td>an echo engine's mask of its ear going on or off</td></tr>
         <tr><td class="table-mono">play</td><td class="table-mono">[say,] play, rate, track</td><td>as above; <code class="code">say</code> when the play is a say's</td></tr>
         <tr><td class="table-mono">say</td><td class="table-mono">say, track</td><td>a say opened on the mouth <code class="code">track</code></td></tr>

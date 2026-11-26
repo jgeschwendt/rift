@@ -3033,7 +3033,7 @@ mod tests {
             &format!("{:?} {}", ordered(&live), json!(marks(&live))),
             &format!("{:?} {}", (true, all.clone()), json!(spoken)),
         )?;
-        // gone with its voice on: the voice, then its end
+        // gone with its voice on: the voice, its off at the end of what it was given, then its end
         same(
             &line_after(&mut turns, &voice(true, all[6]))?["ok"].to_string(),
             "true",
@@ -3041,35 +3041,40 @@ mod tests {
         drop(turns);
         until(|| Ok(kinds(&root, "engine", 1)?.contains(r#""on":false"#)))?;
         same(
-            &kinds(&root, "", 2)?,
+            &kinds(&root, "", 3)?,
             &format!(
-                "{}\n{}",
+                "{}\n{}\n{}",
                 json!({"engine": "turn", "kind": "voice", "on": true, "track": "ear-desk"}),
+                json!({"engine": "turn", "kind": "voice", "on": false, "track": "ear-desk"}),
                 json!({"kind": "engine", "name": "turn", "on": false, "stage": "turn", "track": "ear-desk"})
             ),
         )?;
+        let reached = all[9] + 20_000;
         same(
             &line_after(&mut greet(&root)?, &engine("turn", Value::Null))?["through"].to_string(),
-            &all[6].to_string(),
+            &reached.to_string(),
         )?;
         drop(words);
         // its end logged, so the next words engine is not refused `taken`
         until(|| unlisted(&root, "ear-desk", "words"))?;
-        // replayed, here and after a restart: the same lines in the same places, and the voice
-        // left on
+        // replayed, here and after a restart: the same lines in the same places, the voice left
+        // on paired with its off
         let replayed = || -> Result<Vec<Value>, Box<dyn Error>> {
             let mut again = greet(&root)?;
             drop(line_after(&mut again, &engine("words", json!(at(0))))?);
-            iter::repeat_with(|| line(&mut again)).take(14).collect()
+            iter::repeat_with(|| line(&mut again)).take(15).collect()
         };
         let once = replayed()?;
-        let left = json!({"voice": {"on": true, "start": all[6]}});
+        let left = [
+            json!({"voice": {"on": true, "start": all[6]}}),
+            json!({"voice": {"on": false, "start": reached}}),
+        ];
         same(
             &format!("{:?} {}", ordered(&once), json!(marks(&once))),
             &format!(
                 "{:?} {}",
                 (true, all),
-                json!([&spoken[..], &[left]].concat())
+                json!([&spoken[..], &left[..]].concat())
             ),
         )?;
         same(
@@ -3081,11 +3086,37 @@ mod tests {
         let (mut restarted, _) = serve(&root, &envs)?;
         let twice = replayed()?;
         same(&json!(twice).to_string(), &json!(once).to_string())?;
+        // a kill with a voice on: the next boot logs it off as it starts
+        let mut held = greet(&root)?;
+        drop(line_after(&mut held, &engine("turn", json!(at(0))))?);
+        for _ in 0u8..10 {
+            drop(line(&mut held)?);
+        }
+        same(
+            &line_after(&mut held, &voice(true, reached))?["ok"].to_string(),
+            "true",
+        )?;
+        restarted.0.kill()?;
+        same(&restarted.0.wait()?.success().to_string(), "false")?;
+        let (mut rebooted, _) = serve(&root, &envs)?;
+        let logged = events(&root)?;
+        let voices: Vec<&Value> = (logged.iter())
+            .map(|event| &event["e"])
+            .filter(|event| event["kind"] == "voice")
+            .collect();
+        same(
+            &json!(voices.iter().rev().take(2).collect::<Vec<_>>()).to_string(),
+            &json!([
+                voices.last().map(|off| json!({"engine": "turn", "kind": "voice", "on": false, "start": off["start"], "track": "ear-desk"})),
+                {"engine": "turn", "kind": "voice", "on": true, "start": reached, "track": "ear-desk"}
+            ])
+            .to_string(),
+        )?;
         same(
             &say(&mut greet(&root)?, r#"{"op":"shutdown"}"#)?,
             r#"{"ok":true}"#,
         )?;
-        same(&format!("{:?}", restarted.0.wait()?.code()), "Some(0)")
+        same(&format!("{:?}", rebooted.0.wait()?.code()), "Some(0)")
     }
 
     /// The echo stage, the suite as the echo engine, a words engine and the ear

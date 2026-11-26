@@ -497,7 +497,12 @@ impl Live {
             // an echo engine's mask left on goes off at its ruling: the frames held past it go on
             // unmasked, live and in a replay alike
             if let Some(echo) = engine.as_ref().filter(|held| slot.1 == "echo" && held.on) {
-                self.unmask(&slot.0, &echo.name, echo.ruled);
+                self.unmask(&slot.0, "mask", &echo.name, echo.ruled);
+            }
+            // a turn engine's voice left on goes off at the end of what it was given, so a
+            // replay pairs every on with an off
+            if let Some(turn) = engine.as_ref().filter(|held| slot.1 == "turn" && held.on) {
+                self.unmask(&slot.0, "voice", &turn.name, turn.given);
             }
             let name = engine.map(|held| held.name);
             drop(self.emit(&json!({"kind": "engine", "name": name, "on": false, "stage": slot.1, "track": slot.0})));
@@ -870,18 +875,24 @@ impl Live {
         self.fan(&format!("{track}>"), &format!("{line}\n"));
     }
 
-    /// Logs `track`'s open mask, `name`'s, off at `at`, or at its on when that is later: an echo
-    /// engine gone with its mask on, the drain's included, and a boot after a kill left one on.
-    fn unmask(&mut self, track: &str, name: &str, at: u64) {
-        let slot = (track.to_owned(), "mask".to_owned());
+    /// Logs `track`'s open mask or voice (`kind`), `name`'s, off at `at`, or at its on when that
+    /// is later: an echo engine gone with its mask on or a turn engine with its voice, the
+    /// drain's included, and a boot after a kill left one on; a voice's off told to the words
+    /// engine, so a voice line on is always followed by its off.
+    fn unmask(&mut self, track: &str, kind: &str, name: &str, at: u64) {
+        let slot = (track.to_owned(), kind.to_owned());
         let off = at.max(self.latest.get(&slot).copied().unwrap_or_default());
         drop(self.emit(
-            &json!({"engine": name, "kind": "mask", "on": false, "start": off, "track": track}),
+            &json!({"engine": name, "kind": kind, "on": false, "start": off, "track": track}),
         ));
         let _: Option<u64> = self.latest.insert(slot, off);
         let held = self.tracks.entry(track.to_owned()).or_default();
-        if let Some(open) = held.spans.entry("mask".to_owned()).or_default().last_mut() {
+        if let Some(open) = held.spans.entry(kind.to_owned()).or_default().last_mut() {
             open.1 = off;
+        }
+        if kind == "voice" {
+            let line = json!({"voice": {"on": false, "start": off}});
+            self.fan(&format!("{track} turn"), &format!("{line}\n"));
         }
     }
 
@@ -1749,12 +1760,16 @@ fn main() -> ExitCode {
                 for spoken in unsaid {
                     drop(guard.emit(&spoken)?);
                 }
-                // a mask a kill left on goes off as this boot starts, after every frame before
-                let masks: BTreeMap<&str, &Value> = of("mask")
-                    .map(|mask| (mask["track"].as_str().unwrap_or_default(), mask))
-                    .collect();
-                for (track, mask) in masks.into_iter().filter(|entry| entry.1["on"] == true) {
-                    guard.unmask(track, mask["engine"].as_str().unwrap_or_default(), now());
+                // a mask or a voice a kill left on goes off as this boot starts, after every
+                // frame before
+                for kind in ["mask", "voice"] {
+                    let latest: BTreeMap<&str, &Value> = of(kind)
+                        .map(|mark| (mark["track"].as_str().unwrap_or_default(), mark))
+                        .collect();
+                    for (track, mark) in latest.into_iter().filter(|entry| entry.1["on"] == true) {
+                        let name = mark["engine"].as_str().unwrap_or_default();
+                        guard.unmask(track, kind, name, now());
+                    }
                 }
                 // a segment a kill left open: cut to whole frames and closed with its event, its
                 // start where its track's last event of that boot ended
