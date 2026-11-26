@@ -51,3 +51,12 @@ echo "dist/rift-$target.tar.gz: rift $(target/release/rift version)"
 [tasks.install]
 description = "a dev build to ~/.local/bin/rift-next, beside the release"
 run = "cargo build --release && mkdir -p ~/.local/bin && install -m 755 target/release/rift ~/.local/bin/rift-next"
+
+[tasks.prove-engines]
+description = "the reference engines end to end: a throwaway daemon, the fixture, a fake output; needs every model (engines/README.md) and $TRANSCRIBE_MODEL"
+# out of target/: the build cache may sweep it mid-run
+run = [
+  "cargo build",
+  "cargo build --release --manifest-path engines/Cargo.toml",
+  "uv run --project engines/transcribe --locked python engines/prove.py target/debug/rift engines/target/release /tmp/rift-prove",
+]
