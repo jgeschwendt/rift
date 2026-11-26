@@ -61,7 +61,9 @@ reader thread's lines (the reply first), each ping answered there under the writ
 the line is passed on; the inputs, listed on a thread every poll, each listing carrying whether the
 default is Bluetooth and the built-in's name, so the loop decides the rule from the listing alone; each open's outcome and buffers,
 tagged with the open's number so a closed open's are dropped, each buffer with the clock as the
-callback handed it over, which alone may rebase its frames. The stream (`hold`) is built, held
+callback handed it over, which alone may rebase its frames: each frame is judged against that
+clock less every sample still pending, its own included, so one buffer carrying many frames late
+is no hole. The stream (`hold`) is built, held
 and dropped on a thread of its own, closed by dropping its stop sender; an open abandoned while it
 waits closes as soon as it returns. A `--mic` device stands: main loops on the attempt, whatever
 ends one (a connection ended, `down`, a refusal) waited out `$RIFT_POLL_MS` before the next. A

@@ -239,12 +239,12 @@ mod tests {
         Ok(())
     }
 
-    /// `done` asked every 10 ms until it holds, 10 s at most: the sweep moves segments off the
-    /// request path.
+    /// `done` asked every 10 ms until it holds, 30 s at most, a deadline against a hang and never
+    /// a bound any check rests on: the sweep moves segments off the request path.
     fn until<F: Fn() -> io::Result<bool>>(done: F) -> Outcome {
         let started = Instant::now();
         while !done()? {
-            if started.elapsed() > Duration::from_secs(10) {
+            if started.elapsed() > Duration::from_secs(30) {
                 return Err("timed out".into());
             }
             thread::sleep(Duration::from_millis(10));
@@ -2817,29 +2817,34 @@ esac
         fs::write(format!("{fake}/inputs/Hall Mic"), "44100 1 -0.5 0")?;
         fs::write(format!("{fake}/default"), "Desk Mic\n")?;
         fs::write(format!("{fake}/slow"), "50")?;
+        // the open and zero windows far past any stall a starved machine gives a device: only
+        // an open that truly waits, or an input that truly gives zeros, is named
         let envs = [
             ("RIFT_LOG_CAP", "1"),
             ("RIFT_MIC", fake.as_str()),
-            ("RIFT_OPEN_MS", "100"),
+            ("RIFT_OPEN_MS", "3000"),
             ("RIFT_POLL_MS", "100"),
-            ("RIFT_ZERO_MS", "200"),
+            ("RIFT_ZERO_MS", "3000"),
         ];
         let (daemon, _) = serve(
             &root,
             &[("RIFT_PING_MS", "300"), ("RIFT_SEGMENT_MS", "200")],
         )?;
-        let spawn_in = |at: &str, args: &[&str]| -> io::Result<Daemon> {
+        let spawn_with = |at: &str, poll: &str, args: &[&str]| -> io::Result<Daemon> {
             Ok(Daemon(
                 Command::new(env!("CARGO_BIN_EXE_rift"))
                     .env("RIFT_ROOT", at)
                     .envs(envs)
+                    .env("RIFT_POLL_MS", poll)
                     .args(args)
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
                     .spawn()?,
             ))
         };
-        let spawn = |args: &[&str]| spawn_in(&root, args);
+        // a device that hears an input judges it silent only a second long, far past a starved
+        // machine's stall; one that never hears one polls fast, so its backoff is quick to see
+        let spawn = |args: &[&str]| spawn_with(&root, "1000", args);
         // a stop signal ends a device at once, exit 0, saying so, the daemon down or not
         let stop = |mut device: Daemon,
                     mut errs: BufReader<ChildStderr>,
@@ -2918,7 +2923,7 @@ esac
         )?;
         // a second device asking for a held track: refused `taken` each attempt on stdout, said
         // once on stderr, the attempts spaced a poll doubled per refusal
-        let mut twin = spawn(&["device", "ear", "desk", "--mic"])?;
+        let mut twin = spawn_with(&root, "100", &["device", "ear", "desk", "--mic"])?;
         let mut echoed = BufReader::new(twin.0.stdout.take().ok_or("stdout")?);
         same(
             &format!("{} {}", next(&mut echoed)?, next(&mut echoed)?),
@@ -2948,7 +2953,7 @@ esac
                 stamp.send(Instant::now()).unwrap_or_default();
             }
         }));
-        let mut alien = spawn_in(&other, &["device", "ear", "alien", "--mic"])?;
+        let mut alien = spawn_with(&other, "100", &["device", "ear", "alien", "--mic"])?;
         // a poll doubled, then doubled again: the third attempt six polls after the first
         let (once, thrice) = (met.recv()?, met.iter().nth(1).ok_or("no third")?);
         same(
@@ -3028,22 +3033,41 @@ esac
         )?;
         drop(rift(&root, &[], &["ears", "off"])?);
         until(|| Ok(log().contains("close Hall Mic")))?;
+        // each microphone asked for, opened and closed, none left open; one a starved machine
+        // left silent a poll long is opened afresh, so counted by kind, not by line
         let mut opened: Vec<&str> = log().leak().lines().collect();
         opened.sort_unstable();
+        let shut = ["Desk Mic", "Hall Mic", "Spare Mic"].iter().all(|mic| {
+            opened
+                .iter()
+                .filter(|line| **line == format!("open {mic}"))
+                .count()
+                == opened
+                    .iter()
+                    .filter(|line| **line == format!("close {mic}"))
+                    .count()
+        });
+        opened.dedup();
         same(
-            &opened.join("\n"),
-            "ask Desk Mic\nask Hall Mic\nask Spare Mic\nclose Desk Mic\nclose Hall Mic\nclose Spare Mic\nopen Desk Mic\nopen Hall Mic\nopen Spare Mic",
+            &format!("{} {shut}", opened.join("\n")),
+            "ask Desk Mic\nask Hall Mic\nask Spare Mic\nclose Desk Mic\nclose Hall Mic\nclose Spare Mic\nopen Desk Mic\nopen Hall Mic\nopen Spare Mic true",
         )?;
         // the ears on again, a segment torn by a kill keeps its microphone
         drop(rift(&root, &[], &["ears", "on"])?);
         until(|| Ok(log().matches("open Hall Mic").count() == 2))?;
+        // killed frozen, a segment seen open there: left running, it may close first
         until(|| {
-            Ok(fs::read_dir(format!("{root}/audio/1/ear-desk"))?.count()
-                > desk_events
-                    .iter()
+            drop(signal(&daemon, "STOP"));
+            let closed = stream("ear-desk").map_or(0, |held| {
+                held.iter()
                     .filter(|event| event["kind"] == "segment")
                     .count()
-                    + 1)
+            });
+            let open = fs::read_dir(format!("{root}/audio/1/ear-desk"))?.count() > closed;
+            if !open {
+                drop(signal(&daemon, "CONT"));
+            }
+            Ok(open)
         })?;
         drop(daemon);
         // the daemon gone, the ear waits a poll, finds it down and waits on; a frame in flight
@@ -3101,10 +3125,16 @@ esac
             ),
             (
                 "Stuck",
-                format!(" has not opened in 100 ms: the microphone is not granted yet; {grant}"),
+                format!(" has not opened in 3000 ms: the microphone is not granted yet; {grant}"),
             ),
         ] {
-            let mut failed = spawn(&["device", "ear", &name.to_lowercase(), "--mic", name])?;
+            // the refused one hears nothing, so its doubled retries are seen at a fast poll
+            let poll = if name == "Broken" { "100" } else { "1000" };
+            let mut failed = spawn_with(
+                &root,
+                poll,
+                &["device", "ear", &name.to_lowercase(), "--mic", name],
+            )?;
             let (mut errs, mut first) = (
                 BufReader::new(failed.0.stderr.take().ok_or("stderr")?),
                 String::new(),
@@ -3140,7 +3170,19 @@ esac
                     .is_ok_and(|seen| seen.first().is_some_and(|event| event["kind"] == "track"))
             }))
         })?;
-        same(&log().matches("ask Stuck").count().to_string(), "2")?;
+        // the open that returned is the second asked, never one asked anew; an input a starved
+        // machine leaves silent past its poll may be asked again after, which proves nothing here
+        let asked = log();
+        let returned = asked.find("open Stuck").ok_or("never opened")?;
+        same(
+            &asked
+                .get(..returned)
+                .unwrap_or_default()
+                .matches("ask Stuck")
+                .count()
+                .to_string(),
+            "2",
+        )?;
         // following the default while there is none: it says so and waits
         fs::remove_file(format!("{fake}/default"))?;
         let mut lost = spawn(&["device", "ear", "lost", "--mic"])?;

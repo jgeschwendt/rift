@@ -403,14 +403,23 @@ pub fn run(reader: BufReader<UnixStream>, reply: &Value, pinned: Option<&str>) {
                         (failed, said) = (0, BTreeSet::new());
                         convert.feed(channel, &mut held.pcm);
                     }
-                    // stamped by the sample count from the first; over 100 ms off the clock as the
-                    // buffer was handed over (audio really missing) rebased: never this loop's
+                    // stamped by the sample count from the first; over 100 ms off the time the
+                    // frame was captured (audio really missing) rebased. That time is the
+                    // buffer's handover less every sample still pending, this frame's included,
+                    // so a buffer handed over late in one piece misses nothing; never this loop's
                     // clock, which a write held up by the daemon would turn into holes
                     while held.pcm.len() >= FRAME {
+                        let pending = u64::try_from(held.pcm.len()).unwrap_or_default();
                         let frame: Vec<u8> = held.pcm.drain(..FRAME).collect();
+                        // bytes to microseconds: two a sample, 62.5 microseconds each
                         let (stamp, clock) = (
                             held.sent.saturating_mul(20_000),
-                            when.saturating_sub(20_000),
+                            when.saturating_sub(
+                                pending
+                                    .saturating_mul(125)
+                                    .checked_div(4)
+                                    .unwrap_or_default(),
+                            ),
                         );
                         if clock.abs_diff(held.base.saturating_add(stamp)) > 100_000 {
                             held.base = clock.saturating_sub(stamp);
