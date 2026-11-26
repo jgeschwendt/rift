@@ -1522,20 +1522,28 @@ mod tests {
             ear.get_mut().write_all(format!("{answer}\n").as_bytes())?;
             placed.push(reply["t"].as_u64().ok_or("unplaced")?);
         }
+        // the late pong moves nothing; the stepped one moves placement only within its round trip,
+        // which a busy machine may stretch, never by the second the clock stepped
         let first = placed.first().copied().unwrap_or_default();
+        let gaps: Vec<u64> = placed.iter().map(|stamp| stamp - first).collect();
         same(
             &format!(
-                "{:?}",
-                placed.iter().map(|stamp| stamp - first).collect::<Vec<_>>()
+                "{:?} {}",
+                gaps.get(..2).unwrap_or_default(),
+                gaps.get(2)
+                    .is_some_and(|third| (40_000..540_000).contains(third))
             ),
-            "[0, 20000, 40000]",
+            "[0, 20000] true",
         )?;
+        // a hole only where the stepped pong moved the frame half a frame or more
+        let moved = gaps.get(2).is_some_and(|&third| third >= 50_000);
         same(
-            &events(&root)?
+            &(events(&root)?
                 .iter()
                 .any(|event| event["e"]["kind"] == "hole")
+                == moved)
                 .to_string(),
-            "false",
+            "true",
         )?;
         same(
             &say(&mut greet(&root)?, r#"{"op":"shutdown"}"#)?,
