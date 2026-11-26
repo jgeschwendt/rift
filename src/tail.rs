@@ -1,8 +1,9 @@
 //! `rift engine run tail <ear> [--tail-ms <ms>]`, the reference echo engine
 //! (docs/index.html#engines). A mask goes on at a play's first run and off once the ear is heard
-//! past the last run's end plus the tail, so a play sounding without a gap longer than the tail is
-//! two events. It rules up to the last frame heard while no play is open or a mask is on (a frame
-//! under a mask is masked whatever comes), and `GUARD` behind it while a play is open unmasked.
+//! past the last run's end plus the tail, `GUARD` more while a play is open, so a play sounding
+//! without a longer gap is two events. It rules up to the last frame heard while no play is open,
+//! up to the mask's planned off while one is on (the frames past it held for a run reported
+//! late), and `GUARD` behind it while a play is open unmasked.
 
 use crate::FORESIGHT;
 use serde_json::{Value, json};
@@ -51,16 +52,15 @@ pub fn run(mut reader: BufReader<UnixStream>, tail: u64) {
         if told["played"].is_u64() {
             let _: Option<u64> = open.remove(&at("played"));
         }
-        // the tail heard out, the mask goes off where it ends
-        if let Some(off) = planned.filter(|&off| heard >= off) {
+        // the tail heard out, `GUARD` more while a play may still report, the mask goes off
+        // where the tail ends
+        let wait = if open.is_empty() { 0 } else { GUARD };
+        if let Some(off) = planned.filter(|&off| heard >= off.saturating_add(wait)) {
             masked = off.max(masked);
             said.push(json!({"on": false, "op": "mask", "start": masked}));
             planned = None;
         }
-        let to = planned.map_or_else(
-            || heard.saturating_sub(if open.is_empty() { 0 } else { GUARD }),
-            |off| heard.min(off),
-        );
+        let to = planned.map_or_else(|| heard.saturating_sub(wait), |off| heard.min(off));
         if to > ruled {
             said.push(json!({"op": "ruled", "to": to}));
             ruled = to;

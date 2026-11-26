@@ -3326,17 +3326,18 @@ mod tests {
         );
         let mut printed = BufReader::new(tail.0.stdout.take().ok_or("stdout")?);
         same(&next(&mut printed)?, r#"{"ok":true,"seq":3}"#)?;
-        // the ear streaming in real time, a minute of it, ended by the daemon's drain
-        let file = format!("{root}/ear.pcm");
-        fs::write(&file, vec![0u8; 640 * 3000])?;
-        let mut ear = Daemon(
-            Command::new(env!("CARGO_BIN_EXE_rift"))
-                .env("RIFT_ROOT", &root)
-                .args(["device", "ear", "desk", &file])
-                .stdout(Stdio::null())
-                .spawn()?,
-        );
-        until(|| Ok(kinds(&root, "track", usize::MAX)?.contains("ear-desk")))?;
+        // the suite as the ear, every frame up to a time sent once now is past it: none while
+        // the play sounds, so what the tail decides rests on values alone
+        let (mut ear, hi) = device(&root, r#"{"kind":"ear","name":"desk","op":"device"}"#, 0)?;
+        let (base, mut sent) = (hi["ping"].as_u64().unwrap_or_default() - 1_000_000, 0u64);
+        let mut hear_to = |to: u64| -> Outcome {
+            until(|| Ok(now_us() > to))?;
+            let upto = (to - base).checked_div(20_000).unwrap_or_default();
+            drop(placed(&mut ear, base, sent..upto)?);
+            sent = sent.max(upto);
+            Ok(())
+        };
+        hear_to(now_us())?;
         let mut words = greet(&root)?;
         drop(say(
             &mut words,
@@ -3344,48 +3345,35 @@ mod tests {
         )?);
         let (_, last) = joined(giver(&root, "mouth-desk", 16_000, tone(16_000, 0.3)))?;
         same(&last["reason"].to_string(), r#""end""#)?;
-        // each kind's spans, a run's plus `reach`, a mask's from its on to its off, merged where
-        // they meet or overlap
-        let spans = |kind: &str, reach: u64| -> Result<Vec<(u64, u64)>, Box<dyn Error>> {
-            let held_events = events(&root)?;
-            let picked: Vec<&Value> = held_events
-                .iter()
-                .map(|event| &event["e"])
-                .filter(|event| event["kind"] == kind)
-                .collect();
-            let at = |event: &Value, key: &str| event[key].as_u64().unwrap_or_default();
-            let mut held: Vec<(u64, u64)> = if kind == "sound" {
-                (picked.iter())
-                    .map(|event| {
-                        let lasted = (at(event, "samples") * 1_000_000).checked_div(16_000);
-                        (
-                            at(event, "start"),
-                            at(event, "start") + lasted.unwrap_or_default() + reach,
-                        )
-                    })
-                    .collect()
-            } else {
-                (picked.chunks_exact(2))
-                    .filter_map(|pair| pair.first().zip(pair.last()))
-                    .map(|(on, off)| (at(on, "start"), at(off, "start")))
-                    .collect()
-            };
-            held.sort_unstable();
-            Ok(held
-                .into_iter()
-                .fold(Vec::new(), |mut merged: Vec<(u64, u64)>, (start, stop)| {
-                    match merged.last_mut() {
-                        Some(tip) if start <= tip.1 => tip.1 = tip.1.max(stop),
-                        _ => merged.push((start, stop)),
-                    }
-                    merged
-                }))
-        };
-        let runs = spans("sound", 100_000)?;
-        same(&(!runs.is_empty()).to_string(), "true")?;
-        until(|| {
-            Ok(spans("mask", 0).map_err(|cause| io::Error::other(cause.to_string()))? == runs)
-        })?;
+        // one mask, on at the first run's start, off at the last's end plus the tail once the
+        // ear is heard past it
+        let (mut first, mut stop) = (u64::MAX, 0u64);
+        for run in events(&root)?
+            .iter()
+            .filter(|event| event["e"]["kind"] == "sound")
+        {
+            let at = |key: &str| run["e"][key].as_u64().unwrap_or_default();
+            first = first.min(at("start"));
+            stop = stop.max(
+                at("start")
+                    + (at("samples") * 1_000_000)
+                        .checked_div(16_000)
+                        .unwrap_or_default(),
+            );
+        }
+        hear_to(stop + 400_000)?;
+        until(|| Ok(kinds(&root, "mask", usize::MAX)?.lines().count() == 2))?;
+        same(
+            &json!(
+                events(&root)?
+                    .iter()
+                    .filter(|event| event["e"]["kind"] == "mask")
+                    .map(|event| event["e"]["start"].clone())
+                    .collect::<Vec<_>>()
+            )
+            .to_string(),
+            &json!([first, stop + 100_000]).to_string(),
+        )?;
         // a play open and given nothing: the ear ruled on still, its frames passed on
         let mut idle = greet(&root)?;
         drop(say(
@@ -3393,6 +3381,7 @@ mod tests {
             r#"{"op":"play","rate":16000,"track":"mouth-desk"}"#,
         )?);
         let opened = now_us();
+        hear_to(opened + 500_000)?;
         while line(&mut words)?["t"]
             .as_u64()
             .is_none_or(|at| at <= opened)
@@ -3403,7 +3392,7 @@ mod tests {
                 .to_string(),
             "true",
         )?;
-        drop((idle, words));
+        drop((idle, words, ear));
         // the daemon gone, its connection ends
         same(
             &say(&mut greet(&root)?, r#"{"op":"shutdown"}"#)?,
@@ -3414,7 +3403,6 @@ mod tests {
             &format!("{} {:?}", next(&mut printed)?, tail.0.wait()?.code()),
             r#"{"code":"unknown","ok":false} Some(1)"#,
         )?;
-        same(&format!("{:?}", ear.0.wait()?.code()), "Some(1)")?;
         same(&signal(&mouth, "TERM")?, "")?;
         same(&format!("{:?}", mouth.0.wait()?.code()), "Some(0)")
     }
