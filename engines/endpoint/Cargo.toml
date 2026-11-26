@@ -1,0 +1,23 @@
+[package]
+categories = ["multimedia::audio"]
+description = "rift's reference turn engine: Silero VAD, then Smart Turn at each voice's close"
+edition.workspace = true
+keywords = ["rift", "vad", "turn"]
+license.workspace = true
+name = "endpoint"
+publish = false
+readme = "../README.md"
+repository.workspace = true
+version.workspace = true
+
+[dependencies]
+link.workspace = true
+ort.workspace = true
+rustfft.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+link = { workspace = true, features = ["fake"] }
+
+[lints]
+workspace = true
