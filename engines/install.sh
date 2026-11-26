@@ -25,7 +25,7 @@ hf kyutai/pocket-tts-without-voice-cloning tts_b6369a24.safetensors tokenizer.js
 # Moonshine as the locked moonshine-voice pins it (its manifest, each file's size and CRC32C)
 fetch='import sys; from pathlib import Path; from moonshine_voice import ModelArch, get_model_for_language as get
 print(get("en", ModelArch.MEDIUM_STREAMING, cache_root=Path(sys.argv[1]))[0])'
-model=${TRANSCRIBE_MODEL:-$("$prefix/transcribe/bin/python" -c "$fetch" "$prefix/models" 2>/dev/null)}
+model=${TRANSCRIBE_MODEL:-$("$prefix/transcribe/bin/python" -c "$fetch" "$prefix/models")}
 host=$(scutil --get LocalHostName 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)
 host=${host:-<name>}
 echo "rift engine add turn -- $prefix/endpoint ear-$host"

@@ -123,17 +123,20 @@ class Words:
         """A voice line: on opens a stream from `start` less the pre-roll unless one is open (a
         turn held across voices); off feeds it to `start`, the voice's end, and stops feeding.
         """
-        if on and self.stream is None:
+        # a voice at or before the last final's end, a replay's, opens nothing
+        if on and self.stream is None and start > self.floor:
             self._open(max(self.floor, start - PREROLL))
         elif self.stream is not None and not on:
             self._feed(start)
-        self.voice = start if on else None
+        self.voice = start if on and self.stream is not None else None
 
     def turn(self, end: int) -> list[dict]:
         """The final words to a turn's `end` over its audio alone, none when it holds no words;
         a voice still on opens the next stream from there.
         """
+        # a turn already finished, a replay's, drops whatever it held: nothing of it is due
         if self.stream is None or end <= self.floor:
+            self.stream = self.voice = None
             return []
         if self.fed > end + FRAME:
             self._open(self.begin)

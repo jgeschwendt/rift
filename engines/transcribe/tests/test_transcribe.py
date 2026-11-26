@@ -201,6 +201,34 @@ def test_late_turn() -> None:
     assert len(model.streams) == 3, "the held stream, its fresh decode, the next"
 
 
+def test_replayed() -> None:
+    """A reconnect replaying a voice and turn its last final already holds: neither opens nor
+    keeps a stream, so the fresh voice after it is one final from its own pre-roll, its words
+    alone.
+    """
+    model = Model()
+    said = run(
+        Words(model, same, 2_000_000),
+        [
+            ("on", 1_000_000),
+            (1_000_000, 0.05, 25),
+            ("off", 1_500_000),
+            (1_500_000, 0.0, 15),
+            ("turn", 1_500_000),
+            (1_800_000, 0.0, 60),
+            ("on", 3_000_000),
+            (3_000_000, 0.07, 25),
+            ("off", 3_500_000),
+            (3_500_000, 0.0, 15),
+            ("turn", 3_500_000),
+        ],
+    )
+    spans = [(report["start"], report["end"]) for report in said if report["op"] == "words"]
+    assert spans == [(2_750_000, 3_500_000)]
+    assert finals(said) == [[("w7", 3_000_000, 3_500_000)]]
+    assert len(model.streams) == 1, "the fresh voice's alone"
+
+
 def test_hole() -> None:
     """Words after a hole carry the times their audio was heard, not the stream's."""
     said = run(
@@ -222,7 +250,7 @@ def test_cap(capsys: pytest.CaptureFixture) -> None:
     final from the last one's end; a turn already passed, or with no stream, says nothing.
     """
     words = Words(Model(), same, None)
-    said = run(words, [("on", 0), (0, 0.05, 2_100), ("turn", 100)])
+    said = run(words, [("on", 1), (0, 0.05, 2_100), ("turn", 100)])
     stops = [report["end"] for report in said if report["op"] == "words"]
     starts = [report["start"] for report in said if report["op"] == "words"]
     assert (stops, starts) == ([20_000_000, 40_000_000], [0, 20_000_000])
@@ -289,12 +317,12 @@ def test_sessions(
         "track": "ear-desk",
     }
     send(conn, {"ok": True, "seq": 1, "through": 0})
-    send(conn, {"voice": {"on": True, "start": 0}})
+    send(conn, {"voice": {"on": True, "start": 20_000}})
     hexed = "cd0c" * 320
     for at in range(16):
-        send(conn, {"pcm": hexed, "t": at * 20_000})
-    send(conn, {"voice": {"on": False, "start": 320_000}})
-    send(conn, {"turn": {"end": 320_000, "start": 0}})
+        send(conn, {"pcm": hexed, "t": 20_000 + at * 20_000})
+    send(conn, {"voice": {"on": False, "start": 340_000}})
+    send(conn, {"turn": {"end": 340_000, "start": 20_000}})
     assert json.loads(lines.readline())["words"][0]["text"] == "w10"
     send(conn, {"code": "bad_request", "ok": False})
     conn.shutdown(socket.SHUT_RDWR)

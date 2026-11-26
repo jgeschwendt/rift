@@ -15,8 +15,12 @@ list, SHA-256 checked, linked statically), `ptts`, `xn`, `rustfft` (MIT/Apache-2
 runs: `transcribe` refuses to start without `--model <dir>`.
 
 Installed as rift's engine jobs: `mise run install-engines` builds and installs all three into
-`~/.local/libexec/rift/`, fetches the models (rerun to upgrade) and prints this machine's three
-lines, which you run:
+`~/.local/libexec/rift/` (Moonshine under its `models/`), fetches the models (rerun to upgrade)
+and prints this machine's three lines, which you run. Outside that directory it writes the Hugging
+Face cache (`~/.cache/huggingface/hub`, the other three models, which `endpoint` and `read-aloud`
+read there), uv's cache (`~/.cache/uv`) and uv's managed Python (`~/.local/share/uv/python`),
+which the `transcribe` venv links to; removing any of them breaks the engine that needs it until
+the task is rerun.
 
 ```sh
 rift engine add turn -- ~/.local/libexec/rift/endpoint ear-<host>

@@ -2,8 +2,9 @@
 //! voice, a score of the turn so far at each voice's close deciding the turn, and one
 //! connection's frames in and reports out (docs/protocol.html#engines).
 
+use std::io;
 use std::path::Path;
-use std::{io, iter};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use link::{Conn, RATE, samples};
 use serde_json::{Value, json};
@@ -16,9 +17,8 @@ pub const CONTEXT: usize = 128_000;
 const SPAN: u64 = 32_000;
 /// The hello's client.
 const CLIENT: &str = "endpoint/0.1.0";
-/// Logged events read back on connect for the turn the last engine held: a held turn's voices
-/// lie within its ceiling, far inside this many.
-const LOOK: u64 = 256;
+/// How far inside the window's edge a connect reads from, µs: clear of the sweep's next cut.
+const MARGIN: u64 = 2_000_000;
 /// A window at or over this opens a voice (Silero's own onset).
 const ONSET: f32 = 0.5;
 /// Windows under this count toward a close: Silero's hysteresis, its onset less 0.15.
@@ -70,12 +70,22 @@ pub struct Endpoint<'model, P, S> {
     carry: Vec<f32>,
     /// How long a turn held under the bar waits in silence before it is closed anyway.
     ceiling: u64,
+    /// A voice was under way at the first time heard: the turn it starts began before the
+    /// oldest audio held, and is dropped rather than reported short.
+    clipped: bool,
+    /// The first time heard: where a replay began.
+    first: Option<u64>,
+    /// The reply's `through`, none with nothing logged: a voice it covers is logged, and its
+    /// reports are dropped.
+    floor: Option<u64>,
     /// A turn held under the bar: its end and when it was held.
     held: Option<(u64, u64)>,
     /// Where the next frame is due: the end of the last, none before the first.
     next: Option<u64>,
     /// The speech model.
     prob: &'model mut P,
+    /// A voice dropped as logged is under way, so its off is dropped too.
+    quiet: bool,
     /// The turn model.
     score: &'model mut S,
     /// The audio since the last turn, its last [`CONTEXT`] samples.
@@ -129,7 +139,33 @@ impl<'model, P: Prob, S: Score> Endpoint<'model, P, S> {
             }
         }
         self.hear(time, pcm, &mut said)?;
-        Ok(said)
+        Ok(said
+            .into_iter()
+            .filter(|report| self.fresh(report))
+            .collect())
+    }
+
+    /// Whether `report` is news: a voice the floor covers (its on and its off) is logged
+    /// already; a turn begun with a voice under way at the oldest audio held would be short,
+    /// so it is dropped and said once.
+    fn fresh(&mut self, report: &Value) -> bool {
+        let start = report["start"].as_u64().unwrap_or_default();
+        match (report["op"].as_str(), &report["on"]) {
+            (Some("voice"), &Value::Bool(true)) if self.floor.is_some_and(|at| start <= at) => {
+                self.quiet = true;
+                false
+            }
+            (Some("voice"), &Value::Bool(false)) if self.quiet => {
+                self.quiet = false;
+                false
+            }
+            (Some("turn"), _) if self.clipped && self.first == Some(start) => {
+                eprintln!("endpoint: a turn begun before the oldest audio held is dropped");
+                self.clipped = false;
+                false
+            }
+            _ => true,
+        }
     }
 
     /// Hears `pcm` from `time` on, window by window.
@@ -137,6 +173,7 @@ impl<'model, P: Prob, S: Score> Endpoint<'model, P, S> {
         if self.carry.is_empty() {
             self.at = time;
         }
+        let _: &mut u64 = self.first.get_or_insert(time);
         self.next = Some(
             time.saturating_add(
                 (pcm.len() as u64)
@@ -154,6 +191,8 @@ impl<'model, P: Prob, S: Score> Endpoint<'model, P, S> {
             self.at = self.at.saturating_add(SPAN);
             match self.voice.as_mut() {
                 None if speech >= ONSET => {
+                    // a replay's oldest audio, a turn's middle when a voice is under way there
+                    self.clipped |= self.floor.is_some() && self.first == Some(start);
                     self.voice = Some(Voice {
                         last: self.at,
                         quiet: 0,
@@ -205,45 +244,26 @@ impl<'model, P: Prob, S: Score> Endpoint<'model, P, S> {
             bar,
             carry: Vec::with_capacity(WINDOW),
             ceiling,
+            clipped: false,
+            first: None,
+            floor: None,
             held: None,
             next: None,
             prob,
+            quiet: false,
             score,
             tail: Vec::with_capacity(CONTEXT),
             turn: None,
             voice: None,
         }
     }
-
-    /// Rebuilds the turn the last engine held as it left, from `events`, the track's logged voices
-    /// and turns in order: a voice on after the last turn starts the turn under way, and a voice
-    /// off after it holds it from there, the ceiling closing it as usual.
-    #[inline]
-    pub fn resume<I: Iterator<Item = Value>>(&mut self, events: I) {
-        for event in events {
-            match (
-                event["kind"].as_str(),
-                &event["on"],
-                event["start"].as_u64(),
-            ) {
-                (Some("turn"), _, _) => (self.turn, self.held) = (None, None),
-                (Some("voice"), &Value::Bool(true), Some(start)) => {
-                    let _: &mut u64 = self.turn.get_or_insert(start);
-                    self.held = None;
-                }
-                (Some("voice"), &Value::Bool(false), Some(end)) if self.turn.is_some() => {
-                    self.held = Some((end, end));
-                }
-                _ => {}
-            }
-        }
-    }
 }
 
-/// One connection to `sock` as the turn engine of `track`: its frames from its kind's `through`
-/// on the track (`"from":"through"`, live when none), so a fresh or reconnected engine resumes
-/// in one connection, through `endpoint`, each report sent and a refused one said; ends with the
-/// connection, an error.
+/// One connection to `sock` as the turn engine of `track`: its frames from the oldest audio the
+/// window holds, any boot (`"from":"through"` when that edge is gone meanwhile), heard again so
+/// a turn held as the last engine left is rebuilt whole, what the reply's `through` covers kept
+/// out of its reports, each report sent with its time as its `id` and a refusal of a new one
+/// said; ends with the connection, an error.
 #[cfg_attr(
     not(test),
     expect(
@@ -256,30 +276,52 @@ pub fn session<P: Prob, S: Score>(
     track: &str,
     mut endpoint: Endpoint<'_, P, S>,
 ) -> io::Result<()> {
-    let request = json!({"from": "through", "kind": "turn", "name": "endpoint", "op": "engine", "track": track});
-    let (mut conn, reply) = Conn::open(sock, CLIENT, &request)?;
-    // the turn the last engine held, from the log's last events before this one's own
-    let seq = reply["seq"].as_u64().unwrap_or_default();
-    let after = json!({"boot": conn.hello()["boot"], "seq": seq.saturating_sub(LOOK)});
-    let (mut feed, _) = Conn::open(sock, CLIENT, &json!({"after": after, "op": "feed"}))?;
-    endpoint.resume(
-        iter::from_fn(|| feed.line().ok())
-            .take_while(|line| line["seq"].as_u64() < Some(seq))
-            .map(|line| line["e"].clone())
-            .filter(|event| event["track"] == track),
-    );
-    feed.shutdown();
+    // from the oldest audio the window holds, any boot, so a turn held as the last engine left is
+    // heard again whole; this machine's clock is the daemon's
+    let (_, health) = Conn::open(sock, CLIENT, &json!({"op": "health"}))?;
+    let window = health["window"]
+        .as_u64()
+        .unwrap_or_default()
+        .saturating_mul(1_000_000);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros();
+    let back = (now as u64).saturating_sub(window).saturating_add(MARGIN);
+    let request =
+        json!({"from": back, "kind": "turn", "name": "endpoint", "op": "engine", "track": track});
+    let (mut conn, reply) = match Conn::open(sock, CLIENT, &request) {
+        // the window's edge swept meanwhile: from `through`, and a held turn is not rebuilt
+        Err(cause) if cause.to_string().contains(r#""gone""#) => {
+            eprintln!("endpoint: resumed from through; a turn held before it is not rebuilt");
+            Conn::open(
+                sock,
+                CLIENT,
+                &json!({"from": "through", "kind": "turn", "name": "endpoint", "op": "engine", "track": track}),
+            )?
+        }
+        other => other?,
+    };
+    endpoint.floor = reply["through"].as_u64();
     loop {
         let line = conn.line()?;
-        // a report's reply: only a refusal is news
+        // a report's reply: a refusal of one the floor covered is a logged one heard again
         if line["ok"].is_boolean() {
-            if line["ok"] != true {
+            let heard = line["id"]
+                .as_u64()
+                .zip(endpoint.floor)
+                .is_some_and(|(id, at)| id <= at);
+            if line["ok"] != true && !heard {
                 eprintln!("endpoint: refused: {line}");
             }
             continue;
         }
         let pcm = samples(line["pcm"].as_str().unwrap_or_default());
-        for report in endpoint.frame(line["t"].as_u64().unwrap_or_default(), &pcm)? {
+        for mut report in endpoint.frame(line["t"].as_u64().unwrap_or_default(), &pcm)? {
+            report["id"] = report["end"]
+                .as_u64()
+                .or_else(|| report["start"].as_u64())
+                .into();
             conn.send(&report)?;
         }
     }
@@ -468,6 +510,33 @@ mod tests {
         Ok(())
     }
 
+    /// A voice under way at the oldest audio heard: its voice reported, its turn, which began
+    /// before, dropped rather than reported short; the next voice's turn reported whole.
+    #[test]
+    fn clipped() -> io::Result<()> {
+        let runs = [(1.0f32, 25), (0.0, 25), (1.0, 25), (0.0, 25)];
+        let (mut prob, mut score) = (Loud::default(), Scripted::default());
+        let mut endpoint = Endpoint::new(&mut prob, &mut score, 0.5f32, 1_000_000);
+        // resumed: something was logged before the oldest audio replayed
+        endpoint.floor = Some(0);
+        let mut said = Vec::new();
+        for (time, pcm) in frames(5_000_000, &runs) {
+            said.extend(endpoint.frame(time, &pcm)?);
+        }
+        assert_eq!(
+            said,
+            [
+                json!({"on": true, "op": "voice", "start": 5_000_000u32}),
+                json!({"on": false, "op": "voice", "start": 5_512_000u32}),
+                json!({"on": true, "op": "voice", "start": 5_992_000u32}),
+                json!({"on": false, "op": "voice", "start": 6_504_000u32}),
+                json!({"end": 6_504_000u32, "op": "turn", "start": 5_992_000u32}),
+            ],
+            "the first turn dropped, the second whole"
+        );
+        Ok(())
+    }
+
     /// A blip shorter than a voice, one window loud, is no voice.
     #[test]
     fn blips() -> io::Result<()> {
@@ -476,8 +545,9 @@ mod tests {
         Ok(())
     }
 
-    /// A session: `"from":"through"` each time, frames read and reports sent, a refusal said,
-    /// the end an error.
+    /// A session: from the window's oldest audio after a health, frames read and reports sent
+    /// with their times as ids, a refusal said, the end an error; the window's edge gone, from
+    /// `through`.
     #[test]
     fn sessions() -> io::Result<()> {
         let fake = Fake::new("endpoint-sessions")?;
@@ -497,24 +567,17 @@ mod tests {
             }
             ends
         });
+        let (mut asked, health) = fake.accept()?;
+        assert_eq!(health, json!({"op": "health"}), "the window asked first");
+        asked.send(&json!({"ok": true, "window": 600u16}))?;
         let (mut conn, request) = fake.accept()?;
-        assert_eq!(
-            request,
-            json!({"from": "through", "kind": "turn", "name": "endpoint", "op": "engine", "track": "ear-desk"}),
-            "resumed by the daemon"
+        assert!(
+            request["from"].as_u64() > Some(1_700_000_000_000_000),
+            "a time 600 s back"
         );
         conn.send(&json!({"ok": true, "seq": 1u8, "through": 7u8}))?;
-        // nothing logged before its own engine event: nothing held
-        let (mut feed, asked) = fake.accept()?;
-        assert_eq!(
-            asked,
-            json!({"after": {"boot": 1u8, "seq": 0u8}, "op": "feed"}),
-            "the log read back"
-        );
-        feed.send(&json!({"ok": true}))?;
-        feed.send(&json!({"e": {"kind": "engine", "track": "ear-desk"}, "seq": 1u8}))?;
         let mut lines = Vec::new();
-        for (time, pcm) in frames(1_000_000, &[(1.0f32, 16), (0.0f32, 13)]) {
+        for (time, pcm) in frames(900_000, &[(0.0f32, 5), (1.0, 16), (0.0, 20)]) {
             conn.send(&json!({"pcm": hex(&pcm), "t": time}))?;
         }
         for reply in [
@@ -526,10 +589,23 @@ mod tests {
         }
         lines.push(conn.line()?);
         drop(conn);
+        let (mut windowed, _) = fake.accept()?;
+        windowed.send(&json!({"ok": true, "window": 600u16}))?;
+        let (mut gone, _) = fake.accept()?;
+        gone.send(&json!({"code": "gone", "ok": false}))?;
         let (mut again, second) = fake.accept()?;
-        assert_eq!(second["from"], "through", "resumed by the daemon again");
+        assert_eq!(second["from"], "through", "from through, the edge gone");
         again.send(&json!({"code": "taken", "ok": false}))?;
-        assert_eq!(lines.len(), 3, "voice on, off, the turn");
+        let ids: Vec<&Value> = lines.iter().map(|report| &report["id"]).collect();
+        assert_eq!(
+            ids,
+            [
+                &json!(996_000u32),
+                &json!(1_348_000u32),
+                &json!(1_348_000u32)
+            ],
+            "voice on, off, the turn"
+        );
         assert_eq!(
             engine.join().unwrap_or_default(),
             ["the connection ended", r#"{"code":"taken","ok":false}"#],
@@ -538,71 +614,46 @@ mod tests {
         Ok(())
     }
 
-    /// A reconnect while a turn was held: the log's last voices rebuild it, and the ceiling of
-    /// silence after it closes it from its first voice's start to its last voice's end; another
-    /// track's voices and an earlier turn change nothing.
+    /// A reconnect while a turn was held, however many events were logged since: the audio from
+    /// the window's oldest heard again rebuilds it whole, the voices `through` covers kept out,
+    /// and the ceiling of silence after it closes it; a logged turn heard again is sent for the
+    /// daemon to refuse, that refusal unsaid.
     #[test]
     fn resumed() -> io::Result<()> {
         let fake = Fake::new("endpoint-resumed")?;
         let sock = fake.sock.clone();
         let engine = thread::spawn(move || {
-            let (mut prob, mut score) = (Loud::default(), Scripted::default());
+            let mut prob = Loud::default();
+            let mut score = Scripted {
+                scores: vec![0.9f32, 0.2],
+                tails: Vec::new(),
+            };
             let endpoint = Endpoint::new(&mut prob, &mut score, 0.5f32, 1_000_000);
             session(&sock, "ear-desk", endpoint)
                 .err()
                 .map(|cause| cause.to_string())
         });
+        let (mut asked, _) = fake.accept()?;
+        asked.send(&json!({"ok": true, "window": 600u16}))?;
         let (mut conn, _) = fake.accept()?;
-        conn.send(&json!({"ok": true, "seq": 300u16, "through": 1_500_000u32}))?;
-        let (mut feed, asked) = fake.accept()?;
-        assert_eq!(
-            asked["after"],
-            json!({"boot": 1u8, "seq": 44u8}),
-            "256 events back"
-        );
-        feed.send(&json!({"ok": true}))?;
-        let event = |seq: u16, event: Value| json!({"e": event, "seq": seq});
-        for line in [
-            event(
-                294,
-                json!({"end": 100_000u32, "kind": "words", "start": 0u8, "track": "ear-desk"}),
-            ),
-            event(
-                295,
-                json!({"kind": "voice", "on": true, "start": 100_000u32, "track": "ear-desk"}),
-            ),
-            event(
-                296,
-                json!({"end": 300_000u32, "kind": "turn", "start": 100_000u32, "track": "ear-desk"}),
-            ),
-            event(
-                297,
-                json!({"kind": "voice", "on": true, "start": 1_000_000u32, "track": "ear-desk"}),
-            ),
-            event(
-                298,
-                json!({"kind": "voice", "on": true, "start": 1_200_000u32, "track": "ear-hall"}),
-            ),
-            event(
-                299,
-                json!({"kind": "voice", "on": false, "start": 1_500_000u32, "track": "ear-desk"}),
-            ),
-            event(
-                300,
-                json!({"kind": "engine", "on": true, "track": "ear-desk"}),
-            ),
-        ] {
-            feed.send(&line)?;
-        }
-        for (time, pcm) in frames(1_500_000, &[(0.0f32, 60)]) {
+        conn.send(&json!({"ok": true, "seq": 300u16, "through": 1_728_000u32}))?;
+        // replayed from long before: a logged turn, quiet, then the held turn's voice
+        let runs = [(0.0f32, 10), (1.0, 25), (0.0, 25), (1.0, 25), (0.0, 75)];
+        for (time, pcm) in frames(0, &runs) {
             conn.send(&json!({"pcm": hex(&pcm), "t": time}))?;
         }
         assert_eq!(
             conn.line()?,
-            json!({"end": 1_500_000u32, "op": "turn", "start": 1_000_000u32}),
-            "the held turn closed by the ceiling"
+            json!({"end": 704_000u32, "id": 704_000u32, "op": "turn", "start": 192_000u32}),
+            "the logged turn heard again, its voices dropped, the daemon to refuse it"
         );
-        drop((conn, feed));
+        conn.send(&json!({"code": "bad_request", "id": 704_000u32, "ok": false}))?;
+        assert_eq!(
+            conn.line()?,
+            json!({"end": 1_728_000u32, "id": 1_728_000u32, "op": "turn", "start": 1_184_000u32}),
+            "the held turn rebuilt whole, its voices logged already, closed by the ceiling"
+        );
+        drop(conn);
         assert_eq!(
             engine.join().ok().flatten().as_deref(),
             Some("the connection ended"),
