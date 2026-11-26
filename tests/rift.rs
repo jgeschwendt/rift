@@ -3729,7 +3729,8 @@ esac
         fs::write(format!("{fake}/outputs/Desk"), "48000 1 0")?;
         fs::write(format!("{fake}/default"), "Desk\n")?;
         fs::write(format!("{fake}/take"), "0")?;
-        let (mut daemon, _) = serve(&root, &[("RIFT_STALL_MS", "300")])?;
+        // two seconds: room for a starved mouth's next report, short enough to wait out
+        let (mut daemon, _) = serve(&root, &[("RIFT_STALL_MS", "2000")])?;
         let mut mouth = Daemon(
             Command::new(env!("CARGO_BIN_EXE_rift"))
                 .env("RIFT_ROOT", &root)
@@ -3774,8 +3775,8 @@ esac
             r#"{"op":"play","rate":16000,"track":"mouth-desk"}"#,
         )?);
         drop(say(&mut paused, &give(&tone(16_000, 0.1)))?);
-        // the time must pass for a stall to be possible: a sweep's second and the 300 ms over
-        thread::sleep(Duration::from_millis(1500));
+        // the time must pass for a stall to be possible: the stall time and a sweep's second over
+        thread::sleep(Duration::from_millis(3500));
         drop(say(&mut paused, &give(&tone(16_000, 0.1)))?);
         drop(say(&mut paused, r#"{"op":"end"}"#)?);
         let resumed = next(&mut paused)?;

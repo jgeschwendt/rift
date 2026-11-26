@@ -383,8 +383,8 @@
       full, a mouth not reading, is dropped as a slow feed is and its play ends. A play given nothing
       ends at once at its <code class="code">end</code> or its hush; a give after either is refused
       and the mouth ignores one for a play it has ended. A mouth that owes progress (a giver's pause
-      owes none) and reports none
-      for <code class="code">$RIFT_STALL_MS</code> (15 s) has its play ended
+      owes none) and reports none, counted from its last report, give or
+      <code class="code">end</code>, for <code class="code">$RIFT_STALL_MS</code> (15 s) has its play ended
       <code class="code">mouth</code> and its giver answered.</li>
     <li><strong>Stamping.</strong> From the output's callback: this device's clock in the callback
       plus the latency cpal reports for it (the I/O buffer plus CoreAudio's device latency and safety

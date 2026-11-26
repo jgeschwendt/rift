@@ -150,7 +150,8 @@ struct Play {
     given: u64,
     /// Its giver's connection key.
     giver: u64,
-    /// When its mouth last reported, or it opened: the stall rule's clock.
+    /// When its mouth last reported, or it was opened, given to or ended: the stall rule's clock,
+    /// so progress is owed only from the moment it is.
     heard: Instant,
     /// Why it is hushed, once the mouth is told.
     hushed: Option<&'static str>,
@@ -1512,7 +1513,9 @@ fn main() -> ExitCode {
                                     .unwrap_or_default();
                                 let (total, rate) =
                                     guard.plays.get_mut(&mouth).map_or((0, 0), |play| {
-                                        play.given = play.given.saturating_add(count);
+                                        // a give after a pause starts the clock afresh
+                                        (play.given, play.heard) =
+                                            (play.given.saturating_add(count), Instant::now());
                                         (play.given, play.rate)
                                     });
                                 let most = ahead
@@ -1548,7 +1551,7 @@ fn main() -> ExitCode {
                             {
                                 let (mouth, num) = giving.clone().unwrap_or_default();
                                 let empty = guard.plays.get_mut(&mouth).is_some_and(|play| {
-                                    play.end = true;
+                                    (play.end, play.heard) = (true, Instant::now());
                                     play.given == 0
                                 });
                                 guard.tell(&mouth, &json!({"end": num}));
