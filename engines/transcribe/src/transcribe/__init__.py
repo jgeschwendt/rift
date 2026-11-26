@@ -34,7 +34,7 @@ CLIENT = "transcribe/0.1.0"
 ENDED = "the connection ended"
 RATE = 16_000
 PASS = 5_120  # samples fed between partials: 320 ms
-KEEP = 500  # frames kept for the next utterance, 10 s: a turn line comes after its end's frame
+KEEP = 1_500  # frames kept past a turn's end for the next utterance, 30 s: its line comes late
 
 
 class Stream(Protocol):
@@ -179,45 +179,27 @@ class Conn:
         self.sock.close()
 
 
-class Engine:
-    """The words engine of one track, its `through` kept across connections."""
-
-    def __init__(self, track: str, model: Model, rewrite: Callable[[str], str]) -> None:
-        """The engine of `track`, live until a connection says how far its finals reach."""
-        self.track, self.model, self.rewrite = track, model, rewrite
-        self.through: int | None = None
-
-    def session(self, path: str) -> None:
-        """One connection: frames from `through` (live when none), each turn line's final sent,
-        each the daemon logs moving `through`; ends with the connection, an error. A `from` gone
-        from the window resumes live next time.
-        """
-        request = {"from": self.through, "kind": "words", "name": "transcribe", "op": "engine"}
-        try:
-            conn = Conn(path, {**request, "track": self.track})
-        except ConnectionError as cause:
-            self.through = None if '"gone"' in str(cause) else self.through
-            raise
-        self.through = conn.reply.get("through")
-        words, sent = Words(self.model, self.rewrite, self.through), deque()
-        try:
-            while line := conn.line():
-                if "ok" in line:
-                    # a report's reply, in the order the reports went
-                    end = sent.popleft()
-                    if line["ok"] is not True:
-                        print(f"transcribe: refused: {json.dumps(line)}", file=sys.stderr)
-                    elif end is not None:
-                        self.through = max(self.through or 0, end)
-                    continue
-                turn = line.get("turn")
-                reports = words.turn(turn["end"]) if turn else []
-                reports += [] if turn else words.frame(line["t"], samples(line["pcm"]))
-                for report in reports:
-                    sent.append(report["end"] if report["op"] == "words" else None)
-                    conn.send(report)
-        finally:
-            conn.close()
+def session(path: str, track: str, model: Model, rewrite: Callable[[str], str]) -> None:
+    """One connection as the words engine of `track`: frames from its kind's `through`
+    (`"from":"through"`, live when none), so a fresh or reconnected engine resumes in one
+    connection, each turn line's final sent from there and a refused report said; ends with the
+    connection, an error.
+    """
+    request = {"from": "through", "kind": "words", "name": "transcribe", "op": "engine"}
+    conn = Conn(path, {**request, "track": track})
+    words = Words(model, rewrite, conn.reply.get("through"))
+    try:
+        while line := conn.line():
+            # a report's reply: only a refusal is news
+            if line.get("ok") is False:
+                print(f"transcribe: refused: {json.dumps(line)}", file=sys.stderr)
+            turn = line.get("turn")
+            reports = words.turn(turn["end"]) if turn else []
+            reports += words.frame(line["t"], samples(line["pcm"])) if "pcm" in line else []
+            for report in reports:
+                conn.send(report)
+    finally:
+        conn.close()
 
 
 def socket_path() -> str:
@@ -266,6 +248,6 @@ def main(args: list[str] | None = None) -> int:
         return 2
     from . import moonshine  # noqa: PLC0415 -- the runtime loads only when run, never in tests
 
-    engine = Engine(args[0], moonshine.Moonshine(flag(args, "model")), terms(flag(args, "terms")))
-    stand(lambda: engine.session(socket_path()))
+    model, rewrite = moonshine.Moonshine(flag(args, "model")), terms(flag(args, "terms"))
+    stand(lambda: session(socket_path(), args[0], model, rewrite))
     return 0

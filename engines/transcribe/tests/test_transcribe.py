@@ -16,7 +16,7 @@ import numpy as np
 import pytest
 
 import transcribe
-from transcribe import Conn, Engine, Words, flag, main, samples, socket_path, stand, terms
+from transcribe import Conn, Words, flag, main, samples, session, socket_path, stand, terms
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -166,26 +166,24 @@ def daemon() -> Iterator[tuple[str, socket.socket]]:
 
 
 def test_sessions(daemon: tuple[str, socket.socket], capsys: pytest.CaptureFixture) -> None:
-    """A session: `from` its through, frames and turn lines read, partials and finals sent, a
-    final logged moving `through`, a refusal said, the end an error; `gone` resumes live.
+    """A session: `"from":"through"`, its words from the reply's through, frames and turn lines
+    read, partials and finals sent, a refusal said, the end an error; a refused connect too.
     """
     path, sock = daemon
-    engine = Engine("ear-desk", Model(SCRIPT), same)
-    engine.through = 5
     ends = []
 
     def run() -> None:
-        for _ in range(3):
+        for _ in range(2):
             try:
-                engine.session(path)
+                session(path, "ear-desk", Model(SCRIPT), same)
             except ConnectionError as cause:
-                ends.append((engine.through, str(cause)))
+                ends.append(str(cause))
 
     thread = threading.Thread(target=run)
     thread.start()
     conn, lines, request = serve(sock)
     assert request == {
-        "from": 5,
+        "from": "through",
         "kind": "words",
         "name": "transcribe",
         "op": "engine",
@@ -209,17 +207,10 @@ def test_sessions(daemon: tuple[str, socket.socket], capsys: pytest.CaptureFixtu
     send(conn, {"turn": {"end": 640_000, "start": 300_000}})
     conn.shutdown(socket.SHUT_RDWR)
     conn, lines, request = serve(sock)
-    assert request["from"] == 300_000
-    send(conn, {"code": "gone", "ok": False})
-    conn, lines, request = serve(sock)
-    assert request["from"] is None
-    conn.shutdown(socket.SHUT_RDWR)
+    assert request["from"] == "through"
+    send(conn, {"code": "taken", "ok": False})
     thread.join()
-    assert ends == [
-        (300_000, "the connection ended"),
-        (None, '{"code":"gone","ok":false}'),
-        (None, "the connection ended"),
-    ]
+    assert ends == ["the connection ended", '{"code":"taken","ok":false}']
     assert "transcribe: refused:" in capsys.readouterr().err
 
 

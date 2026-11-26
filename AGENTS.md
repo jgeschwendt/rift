@@ -21,7 +21,7 @@ downloads in `engines/README.md`) run as `engines/target/release/endpoint <ear t
 [--ceiling-ms 3000] [--silero <file>] [--smart-turn <file>]`, `engines/target/release/read-aloud
 <mouth track> [--voice alba] [--pocket <dir>]` and `uv run --project engines/transcribe transcribe
 <ear track> [--model <dir>] [--terms <file>]` (`--terms`: lines `Term` or `Term: heard, heard`,
-your own file, never committed). Each stands, reconnects from its `through` and stops on a signal
+your own file, never committed). Each stands, connects with `"from":"through"` so a start or reconnect resumes, and stops on a signal
 as a device does. Coverage exempts each engine's `main.rs`, `models.rs`, `pocket.rs` and
 `moonshine.py`: model and command-line lines alone, each model held instead by one test over
 `engines/fixtures/phrase.pcm` (Pocket TTS, `cargo run --release -p read-aloud --example fixture`)

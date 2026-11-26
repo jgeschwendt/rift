@@ -2,7 +2,6 @@
 //! voice, a score of the turn so far at each voice's close deciding the turn, and one
 //! connection's frames in and reports out (docs/protocol.html#engines).
 
-use std::collections::VecDeque;
 use std::io;
 use std::path::Path;
 
@@ -212,9 +211,10 @@ impl<'model, P: Prob, S: Score> Endpoint<'model, P, S> {
     }
 }
 
-/// One connection to `sock` as the turn engine of `track`: its frames from `through` (live when
-/// none) through `endpoint`, each report sent, each the daemon logs moving `through`; ends with
-/// the connection, an error. A `from` gone from the window resumes live next time.
+/// One connection to `sock` as the turn engine of `track`: its frames from its kind's `through`
+/// on the track (`"from":"through"`, live when none), so a fresh or reconnected engine resumes
+/// in one connection, through `endpoint`, each report sent and a refused one said; ends with the
+/// connection, an error.
 #[cfg_attr(
     not(test),
     expect(
@@ -225,37 +225,21 @@ impl<'model, P: Prob, S: Score> Endpoint<'model, P, S> {
 pub fn session<P: Prob, S: Score>(
     sock: &Path,
     track: &str,
-    through: &mut Option<u64>,
     mut endpoint: Endpoint<'_, P, S>,
 ) -> io::Result<()> {
-    let request = json!({"from": *through, "kind": "turn", "name": "endpoint", "op": "engine", "track": track});
-    let (mut conn, reply) = Conn::open(sock, "endpoint/0.1.0", &request).inspect_err(|cause| {
-        if cause.to_string().contains(r#""gone""#) {
-            *through = None;
-        }
-    })?;
-    *through = reply["through"].as_u64();
-    let mut sent = VecDeque::new();
+    let request = json!({"from": "through", "kind": "turn", "name": "endpoint", "op": "engine", "track": track});
+    let (mut conn, _) = Conn::open(sock, "endpoint/0.1.0", &request)?;
     loop {
         let line = conn.line()?;
-        // a report's reply, in the order the reports went
+        // a report's reply: only a refusal is news
         if line["ok"].is_boolean() {
-            let time = sent.pop_front();
-            if line["ok"] == true {
-                *through = (*through).max(time);
-            } else {
+            if line["ok"] != true {
                 eprintln!("endpoint: refused: {line}");
             }
             continue;
         }
         let pcm = samples(line["pcm"].as_str().unwrap_or_default());
         for report in endpoint.frame(line["t"].as_u64().unwrap_or_default(), &pcm)? {
-            sent.push_back(
-                report["end"]
-                    .as_u64()
-                    .or_else(|| report["start"].as_u64())
-                    .unwrap_or_default(),
-            );
             conn.send(&report)?;
         }
     }
@@ -452,34 +436,32 @@ mod tests {
         Ok(())
     }
 
-    /// A session: `from` its through, frames read and reports sent, each one logged moving
-    /// `through`, a refusal said and not moving it, the end an error; a `gone` from resumes live.
+    /// A session: `"from":"through"` each time, frames read and reports sent, a refusal said,
+    /// the end an error.
     #[test]
     fn sessions() -> io::Result<()> {
         let fake = Fake::new("endpoint-sessions")?;
         let sock = fake.sock.clone();
         let engine = thread::spawn(move || {
             let (mut prob, mut score) = (Loud::default(), Scripted::default());
-            let mut through = Some(5u64);
             let mut ends = Vec::new();
-            for _ in 0u8..3 {
+            for _ in 0u8..2 {
                 let endpoint = Endpoint::new(&mut prob, &mut score, 0.5f32, 1_000_000);
-                let ended = session(&sock, "ear-desk", &mut through, endpoint);
-                ends.push(format!(
-                    "{through:?} {}",
+                let ended = session(&sock, "ear-desk", endpoint);
+                ends.push(
                     ended
                         .err()
                         .map(|cause| cause.to_string())
-                        .unwrap_or_default()
-                ));
+                        .unwrap_or_default(),
+                );
             }
             ends
         });
         let (mut conn, request) = fake.accept()?;
         assert_eq!(
             request,
-            json!({"from": 5u8, "kind": "turn", "name": "endpoint", "op": "engine", "track": "ear-desk"}),
-            "from the through it held"
+            json!({"from": "through", "kind": "turn", "name": "endpoint", "op": "engine", "track": "ear-desk"}),
+            "resumed by the daemon"
         );
         conn.send(&json!({"ok": true, "seq": 1u8, "through": 7u8}))?;
         let mut lines = Vec::new();
@@ -496,22 +478,12 @@ mod tests {
         lines.push(conn.line()?);
         drop(conn);
         let (mut again, second) = fake.accept()?;
-        assert_eq!(
-            second["from"], 1_000_000u32,
-            "the voice logged; the voice's end refused"
-        );
-        again.send(&json!({"code": "gone", "ok": false}))?;
-        drop(again);
-        let (_, third) = fake.accept()?;
-        assert_eq!(third["from"], Value::Null, "live after gone");
+        assert_eq!(second["from"], "through", "resumed by the daemon again");
+        again.send(&json!({"code": "taken", "ok": false}))?;
         assert_eq!(lines.len(), 3, "voice on, off, the turn");
         assert_eq!(
             engine.join().unwrap_or_default(),
-            [
-                "Some(1000000) the connection ended",
-                r#"None {"code":"gone","ok":false}"#,
-                "None the connection ended",
-            ],
+            ["the connection ended", r#"{"code":"taken","ok":false}"#],
             "each session's end"
         );
         Ok(())
