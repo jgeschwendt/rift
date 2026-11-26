@@ -78,6 +78,8 @@ struct Engine {
     given: u64,
     /// Its name.
     name: String,
+    /// A turn engine's: whether its voice is on.
+    voice: bool,
 }
 
 /// What a connection does after its reply is written.
@@ -149,7 +151,7 @@ struct Live {
     /// The sweep's queue: each batch of segments leaving the window and the archive they move
     /// into, moved by a thread of its own, so no request waits on the archive's disk.
     sweeps: Sender<(Value, Vec<Value>)>,
-    /// Every track of this boot, by name.
+    /// Every track of this boot, and every one with turns in the window, by name.
     tracks: BTreeMap<String, Track>,
     /// The window in seconds: a closed segment that ended longer ago leaves `audio/`.
     window: u64,
@@ -192,6 +194,8 @@ struct Track {
     open: Option<(u64, u64, u64)>,
     /// Whether the device streaming it plays (docs/protocol.html#plays).
     plays: bool,
+    /// Its logged turns ending inside the window, any boot, rising: a words engine's replay.
+    turns: Vec<(u64, u64)>,
 }
 
 impl Live {
@@ -366,8 +370,14 @@ impl Live {
     }
 
     /// `track`'s frames on disk from `from` on, each segment read as the replay reaches it, and
-    /// where the last ends: a turn or words engine's replay, the live frames joined after it.
-    fn replay(&self, track: &str, from: u64) -> (Box<dyn Iterator<Item = String> + Send>, u64) {
+    /// where the last ends: a turn or words engine's replay, the live frames joined after it. A
+    /// words engine's carries each logged turn ending after `from`, after the frame holding its end.
+    fn replay(
+        &self,
+        track: &str,
+        from: u64,
+        words: bool,
+    ) -> (Box<dyn Iterator<Item = String> + Send>, u64) {
         let mut spans: Vec<(u64, u64, PathBuf)> = (self.segments(track).iter())
             .filter(|held| end(held) > from)
             .map(|held| {
@@ -384,15 +394,29 @@ impl Live {
             .map(|span| span.0.saturating_add(span.1.saturating_mul(20_000)))
             .max()
             .unwrap_or_default();
+        let mut turns: Vec<(u64, u64)> = (self.tracks.get(track).into_iter())
+            .flat_map(|held| held.turns.iter().copied())
+            .filter(|turn| words && turn.1 > from)
+            .collect();
         let frames = spans.into_iter().flat_map(move |(start, count, path)| {
             (fs::read(path).unwrap_or_default().chunks_exact(FRAME))
                 .take(usize::try_from(count).unwrap_or_default())
                 .zip((start..).step_by(20_000))
                 .filter(|&(_, at)| at.saturating_add(20_000) > from)
-                .map(|(pcm, at)| format!("{}\n", json!({"pcm": hex(pcm), "t": at})))
+                .map(|(pcm, at)| (at, format!("{}\n", json!({"pcm": hex(pcm), "t": at}))))
                 .collect::<Vec<_>>()
         });
-        (Box::new(frames), given)
+        // before each frame the turns that ended by its start, the rest after the last
+        let lines = frames.map(Some).chain([None]).flat_map(move |frame| {
+            let due = frame.as_ref().map_or(u64::MAX, |held| held.0);
+            (turns.extract_if(.., |turn| turn.1 <= due))
+                .map(|(start, stop)| {
+                    format!("{}\n", json!({"turn": {"end": stop, "start": start}}))
+                })
+                .chain(frame.map(|held| held.1))
+                .collect::<Vec<_>>()
+        });
+        (Box::new(lines), given)
     }
 
     /// `slot`'s engine's report, checked and acted on (docs/protocol.html#engines): its reply, else
@@ -400,15 +424,21 @@ impl Live {
     /// no later than the last frame the engine was given; words rise inside it.
     fn report(&mut self, slot: &(String, String), request: &Value) -> io::Result<Value> {
         let (track, op) = (&slot.0, request["op"].as_str().unwrap_or_default());
-        let (first, last) = (request["start"].as_u64(), request["end"].as_u64());
-        let (latest, (given, name)) = (
+        // a voice names one time, its start
+        let first = request["start"].as_u64();
+        let last = if op == "voice" {
+            first
+        } else {
+            request["end"].as_u64()
+        };
+        let (latest, (given, name, voice)) = (
             (self
                 .latest
                 .get(&(track.clone(), op.replace("partial", "words"))))
             .copied()
             .unwrap_or_default(),
             (self.engines.get(slot))
-                .map(|engine| (engine.given, engine.name.clone()))
+                .map(|engine| (engine.given, engine.name.clone(), engine.voice))
                 .unwrap_or_default(),
         );
         let timed = first
@@ -428,19 +458,42 @@ impl Live {
                 span.is_some()
             })
         });
-        let heard = json!({"end": last, "engine": name, "start": first, "track": track, "words": request["words"]});
+        // the fields its event carries, a partial's line the same but its kind
+        let mut event = json!({"engine": name, "kind": op, "track": track});
+        let fields: &[&str] = match op {
+            "partial" | "words" => &["end", "start", "words"],
+            "voice" => &["on", "start"],
+            _ => &["end", "start"],
+        };
+        for &field in fields {
+            event[field] = request[field].clone();
+        }
         match (slot.1.as_str(), op) {
             ("words", "partial") if timed && worded => {
-                self.fan(&format!("{track} partial"), &format!("{heard}\n"));
+                drop(event.as_object_mut().and_then(|held| held.remove("kind")));
+                self.fan(&format!("{track} partial"), &format!("{event}\n"));
                 Ok(json!({"ok": true}))
             }
-            ("words", "words") if timed && worded => {
-                let mut event = heard;
-                event["kind"] = op.into();
+            // voice on and off alternate from on
+            ("turn", "turn" | "voice") | ("words", "words")
+                if timed
+                    && (worded || slot.1 == "turn")
+                    && (op != "voice" || request["on"] == !voice) =>
+            {
                 drop(self.emit(&event)?);
-                let _: Option<u64> = self
-                    .latest
-                    .insert((track.clone(), op.to_owned()), last.unwrap_or_default());
+                let reached = last.unwrap_or_default();
+                let _: Option<u64> = self.latest.insert((track.clone(), op.to_owned()), reached);
+                if let Some(engine) = self.engines.get_mut(slot) {
+                    engine.voice ^= op == "voice";
+                }
+                // a turn's line to the words engine, after the frame holding its end
+                if op == "turn" {
+                    let begun = first.unwrap_or_default();
+                    let line = json!({"turn": {"end": reached, "start": begun}});
+                    self.fan(&format!("{track} turn"), &format!("{line}\n"));
+                    let held = self.tracks.entry(track.clone()).or_default();
+                    held.turns.push((begun, reached));
+                }
                 Ok(json!({"ok": true, "seq": self.seq}))
             }
             _ => Ok(error("bad_request")),
@@ -487,6 +540,9 @@ impl Live {
             .held
             .extract_if(.., |event| end(&event["e"]) < cutoff)
             .collect();
+        for track in self.tracks.values_mut() {
+            track.turns.retain(|turn| turn.1 >= cutoff);
+        }
         drop(self.sweeps.send((self.archive.clone(), due)));
     }
 
@@ -1212,7 +1268,14 @@ fn main() -> ExitCode {
                     stall: Duration::from_millis(setting("RIFT_STALL_MS", 15_000)),
                     state: "ready",
                     sweeps,
-                    tracks: BTreeMap::new(),
+                    // the logged turns, the sweep cutting those past the window
+                    tracks: of("turn").fold(BTreeMap::new(), |mut tracks, turn| {
+                        let at = |key: &str| turn[key].as_u64().unwrap_or_default();
+                        let track = turn["track"].as_str().unwrap_or_default().to_owned();
+                        let entry: &mut Track = tracks.entry(track).or_default();
+                        entry.turns.push((at("start"), at("end")));
+                        tracks
+                    }),
                     window: kept.map_or(600, |keep| keep["window"].as_u64().unwrap_or_default()),
                 })));
                 // the sweep's thread, off the lock: into the archive, its event appended to the
@@ -1541,6 +1604,7 @@ fn main() -> ExitCode {
                                         let (backlog, reach) = guard.replay(
                                             track,
                                             request["from"].as_u64().unwrap_or(u64::MAX),
+                                            kind == "words",
                                         );
                                         let mut reply = json!({"ok": true, "seq": guard.seq});
                                         if !request["id"].is_null() {
@@ -1557,17 +1621,24 @@ fn main() -> ExitCode {
                                             reply["through"] = latest(kind)
                                                 .max(latest(&kind.replace("turn", "voice")))
                                                 .into();
-                                            guard.feeds.push((
-                                                sender.clone(),
-                                                key,
-                                                format!("{track} heard"),
-                                            ));
+                                            // its frames; a words engine's also its turns
+                                            for topic in ["heard", "turn"]
+                                                .iter()
+                                                .take(if kind == "words" { 2 } else { 1 })
+                                            {
+                                                guard.feeds.push((
+                                                    sender.clone(),
+                                                    key,
+                                                    format!("{track} {topic}"),
+                                                ));
+                                            }
                                         }
                                         drop(guard.engines.insert(
                                             slot.clone(),
                                             Engine {
                                                 given: reach,
                                                 name: name.to_owned(),
+                                                voice: false,
                                             },
                                         ));
                                         (queue, engaged) = (Some(sender), Some(slot));

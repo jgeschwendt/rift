@@ -20,6 +20,7 @@ mod tests {
     use std::fs::{self, File, OpenOptions, Permissions};
     use std::io::{self, BufRead, BufReader, Write as _};
     use std::iter;
+    use std::ops::Range;
     use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _, symlink};
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::process::{Child, ChildStderr, Command, ExitStatus, Output, Stdio, id};
@@ -2798,6 +2799,177 @@ mod tests {
             r#"{"ok":true}"#,
         )?;
         same(&format!("{:?}", restarted.0.wait()?.code()), "Some(0)")
+    }
+
+    /// Whether every turn line in `lines` comes after the frame holding its end, and the frames'
+    /// `t`s, in the order read.
+    fn ordered(lines: &[Value]) -> (bool, Vec<u64>) {
+        let held = lines.iter().enumerate().all(|(index, got)| {
+            got.get("turn").is_none_or(|turn| {
+                lines.iter().take(index).any(|seen| {
+                    seen["t"].as_u64().is_some_and(|at| {
+                        turn["end"]
+                            .as_u64()
+                            .is_some_and(|stop| at < stop && stop <= at.saturating_add(20_000))
+                    })
+                })
+            })
+        });
+        (
+            held,
+            lines.iter().filter_map(|got| got["t"].as_u64()).collect(),
+        )
+    }
+
+    /// A turn engine and a words engine on one ear, the suite as both and as the ear
+    /// (docs/protocol.html#engines): voice on and off alternating from on, and a voice or turn out
+    /// of order or past the last frame given, refused; each turn line after the frame holding its
+    /// end, live, replayed and replayed after a restart, by the `t`s in the order read; a turn
+    /// engine leaving with its voice on, its `engine` event after the open `voice`; `through` the
+    /// latest of its voice and turns.
+    #[test]
+    fn turn() -> Outcome {
+        let root = temp("turn")?;
+        let envs = [("RIFT_PING_MS", "86400000"), ("RIFT_SEGMENT_MS", "100")];
+        let (mut daemon, _) = serve(&root, &envs)?;
+        drop(rift(&root, &[], &["ears", "on"])?);
+        let (mut ear, hi) = device(&root, r#"{"kind":"ear","name":"desk","op":"device"}"#, 0)?;
+        let base = hi["ping"].as_u64().unwrap_or_default() - 2_000_000;
+        let engine = |kind: &str, from: Value| {
+            json!({"from": from, "kind": kind, "name": kind, "op": "engine", "track": "ear-desk"})
+                .to_string()
+        };
+        let (mut turns, mut words) = (greet(&root)?, greet(&root)?);
+        same(
+            &format!(
+                "{} {}",
+                line_after(&mut turns, &engine("turn", Value::Null))?["through"],
+                line_after(&mut words, &engine("words", Value::Null))?["through"]
+            ),
+            "null null",
+        )?;
+        // five frames, the turn engine's reports on them, five more
+        let early = placed(&mut ear, base, 0..5)?;
+        for _ in &early {
+            drop(line(&mut turns)?);
+        }
+        let at = |index: usize| early.get(index).copied().unwrap_or_default();
+        let voice =
+            |on: bool, start: u64| json!({"on": on, "op": "voice", "start": start}).to_string();
+        let turn =
+            |start: u64, stop: u64| json!({"end": stop, "op": "turn", "start": start}).to_string();
+        let (closed, given) = (at(3) + 5000, at(4) + 20_000);
+        let mut verdicts = Vec::new();
+        for report in [
+            voice(false, at(1)),
+            voice(true, at(1)),
+            voice(true, at(2)),
+            voice(false, at(0)),
+            voice(false, given + 1),
+            json!({"on": 1u8, "op": "voice", "start": at(2)}).to_string(),
+            voice(false, closed),
+            turn(at(1), given + 1),
+            turn(at(2), at(1)),
+            turn(at(1), closed),
+            turn(at(1), closed + 1000),
+        ] {
+            let got = line_after(&mut turns, &report)?;
+            verdicts.push(got["code"].as_str().unwrap_or("ok").to_owned());
+        }
+        same(
+            &verdicts.join(" "),
+            "bad_request ok bad_request bad_request bad_request bad_request ok bad_request bad_request ok bad_request",
+        )?;
+        let all: Vec<u64> = early
+            .iter()
+            .copied()
+            .chain(placed(&mut ear, base, 5..10)?)
+            .collect();
+        // live: its frames, the turn line after the frame holding its end
+        let live: Vec<Value> = iter::repeat_with(|| line(&mut words))
+            .take(11)
+            .collect::<Result<_, _>>()?;
+        let turned = json!({"turn": {"end": closed, "start": at(1)}});
+        same(
+            &format!("{:?} {}", ordered(&live), live.contains(&turned)),
+            &format!("{:?} true", (true, all.clone())),
+        )?;
+        // gone with its voice on: the voice, then its end
+        same(
+            &line_after(&mut turns, &voice(true, all[6]))?["ok"].to_string(),
+            "true",
+        )?;
+        drop(turns);
+        until(|| Ok(kinds(&root, "engine", 1)?.contains(r#""on":false"#)))?;
+        same(
+            &kinds(&root, "", 2)?,
+            &format!(
+                "{}\n{}",
+                json!({"engine": "turn", "kind": "voice", "on": true, "track": "ear-desk"}),
+                json!({"kind": "engine", "name": "turn", "on": false, "stage": "turn", "track": "ear-desk"})
+            ),
+        )?;
+        same(
+            &line_after(&mut greet(&root)?, &engine("turn", Value::Null))?["through"].to_string(),
+            &all[6].to_string(),
+        )?;
+        drop(words);
+        // replayed, here and after a restart: the turn after the frame holding its end
+        let replayed = || -> Result<Vec<Value>, Box<dyn Error>> {
+            let mut again = greet(&root)?;
+            drop(line_after(&mut again, &engine("words", json!(at(0))))?);
+            iter::repeat_with(|| line(&mut again)).take(11).collect()
+        };
+        let once = replayed()?;
+        same(
+            &format!("{:?} {}", ordered(&once), once.contains(&turned)),
+            &format!("{:?} true", (true, all)),
+        )?;
+        same(
+            &say(&mut greet(&root)?, r#"{"op":"shutdown"}"#)?,
+            r#"{"ok":true}"#,
+        )?;
+        same(&format!("{:?}", daemon.0.wait()?.code()), "Some(0)")?;
+        drop(ear);
+        let (mut restarted, _) = serve(&root, &envs)?;
+        let twice = replayed()?;
+        same(&json!(twice).to_string(), &json!(once).to_string())?;
+        same(
+            &say(&mut greet(&root)?, r#"{"op":"shutdown"}"#)?,
+            r#"{"ok":true}"#,
+        )?;
+        same(&format!("{:?}", restarted.0.wait()?.code()), "Some(0)")
+    }
+
+    /// Frames `range` 20 ms apart from `base` on `ear`'s clock, each of its index's fill; where
+    /// each was placed.
+    fn placed(
+        ear: &mut BufReader<UnixStream>,
+        base: u64,
+        range: Range<u64>,
+    ) -> Result<Vec<u64>, Box<dyn Error>> {
+        range
+            .map(|index| {
+                Ok(frame(
+                    ear,
+                    base.saturating_add(index.saturating_mul(20_000)),
+                    u8::try_from(index)?,
+                )?["t"]
+                    .as_u64()
+                    .unwrap_or_default())
+            })
+            .collect()
+    }
+
+    /// `line` sent on `conn` and its reply parsed, the lines before it (an engine's frames) passed.
+    fn line_after(conn: &mut BufReader<UnixStream>, line: &str) -> Result<Value, Box<dyn Error>> {
+        send(conn, line)?;
+        loop {
+            let got: Value = serde_json::from_str(&next(conn)?)?;
+            if got.get("ok").is_some() {
+                return Ok(got);
+            }
+        }
     }
 
     /// The daemon's clock now, in microseconds since the epoch.
