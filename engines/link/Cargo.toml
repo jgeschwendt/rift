@@ -1,0 +1,22 @@
+[package]
+categories = ["multimedia::audio"]
+description = "What rift's Rust engines share: the socket, a connection's hello, the stream's PCM, standing"
+edition.workspace = true
+keywords = ["rift", "engine"]
+license.workspace = true
+name = "link"
+publish = false
+readme = "../README.md"
+repository.workspace = true
+version.workspace = true
+
+[features]
+# a daemon a test plays (`link::fake`), for the engines' suites
+fake = []
+
+[dependencies]
+serde_json.workspace = true
+signal-hook.workspace = true
+
+[lints]
+workspace = true

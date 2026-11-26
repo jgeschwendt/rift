@@ -13,6 +13,17 @@ run = [
   { task = "cover" },
 ]
 
+[tasks.check-engines]
+description = "the reference model engines' gate: fmt, lints, each engine's protocol logic at 100 % of lines against a stub model; a model's own test runs only where its weights are"
+dir = "{{config_root}}/engines"
+# main.rs, models.rs and pocket.rs hold the model and command-line lines alone, exempt, as each
+# model's own test runs only where its weights are
+run = [
+  "cargo fmt --check",
+  "cargo clippy --all-targets --locked -- -D warnings",
+  "cargo llvm-cov --locked --fail-under-lines 100 --ignore-filename-regex '/(main|models|pocket)\\.rs$' --show-missing-lines",
+]
+
 [tasks.cover]
 description = "the end-to-end suite under llvm-cov; anything under 100 % of lines fails, naming the lines"
 # src/mic.rs and src/speaker.rs alone are exempt: their lines open a real microphone or output,
