@@ -4329,16 +4329,16 @@ esac
         // stand-in daemon, a play of a positive level whose `end` waits until the mouth has run
         // dry, then one of a negative level; no positive sample comes after the first's `done`
         let split = format!("{root}/split");
-        let voice = format!("{split}/fake");
-        fs::create_dir_all(format!("{voice}/outputs"))?;
+        let faked = format!("{split}/fake");
+        fs::create_dir_all(format!("{faked}/outputs"))?;
         fs::create_dir_all(format!("{split}/run"))?;
-        fs::write(format!("{voice}/outputs/Desk"), "48000 1 0")?;
-        fs::write(format!("{voice}/default"), "Desk\n")?;
+        fs::write(format!("{faked}/outputs/Desk"), "48000 1 0")?;
+        fs::write(format!("{faked}/default"), "Desk\n")?;
         let stand_in = UnixListener::bind(format!("{split}/run/rift.sock"))?;
         let mut splitting = Daemon(
             Command::new(env!("CARGO_BIN_EXE_rift"))
                 .env("RIFT_ROOT", &split)
-                .env("RIFT_SPEAKER", &voice)
+                .env("RIFT_SPEAKER", &faked)
                 .args(["device", "mouth", "desk", "--speaker"])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -4388,7 +4388,7 @@ esac
         told.write_all(format!("{}\n", pcm(1, 0x4000)?).as_bytes())?;
         // dry: the level heard, then half a frame's worth of silence after it at 48 kHz
         until(|| {
-            let heard = taken(&voice, "Desk");
+            let heard = taken(&faked, "Desk");
             Ok(heard
                 .iter()
                 .rposition(|&sample| sample > 8192)
