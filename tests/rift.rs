@@ -15,7 +15,7 @@ mod tests {
     use std::env;
     use std::error::Error;
     use std::fs::{self, File, OpenOptions, Permissions};
-    use std::io::{self, BufRead as _, BufReader, Write as _};
+    use std::io::{self, BufRead, BufReader, Write as _};
     use std::iter;
     use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _, symlink};
     use std::os::unix::net::{UnixListener, UnixStream};
@@ -124,7 +124,7 @@ mod tests {
     }
 
     /// The next line on `conn`, its newline trimmed; empty at end of stream.
-    fn next(conn: &mut BufReader<UnixStream>) -> io::Result<String> {
+    fn next<R: BufRead>(conn: &mut R) -> io::Result<String> {
         let mut line = String::new();
         let _: usize = conn.read_line(&mut line)?;
         Ok(line.trim_end().to_owned())
@@ -533,9 +533,9 @@ mod tests {
             &format!(
                 "{} {}",
                 fs::read_to_string(format!("{root}/serve.err.1"))?,
-                fs::exists(format!("{root}/serve.err"))?
+                fs::metadata(format!("{root}/serve.err"))?.len()
             ),
-            "launchd's false",
+            "launchd's 0",
         )
     }
 
@@ -2051,7 +2051,9 @@ mod tests {
     }
 
     /// `setup --print` prints both plists on hotswap's link, the ear's track named by a stub
-    /// `scutil`, and writes nothing; a host name unset is refused; without `launchctl` nothing is
+    /// `scutil`, the daemon's alone with no `scutil`, and writes nothing; an install refuses a host
+    /// name unset, which `--remove` never asks for; an ear disabled is written, not loaded; a track
+    /// already held (`held`) has the ear loaded unwaited; without `launchctl` nothing is
     /// written; against a stub `launchctl` (`launchctl.log` its calls and, at each bootstrap, the
     /// root's mode when it is 0700; `loaded/` its jobs, each started as its plist's program; a
     /// bootout letting go one `print` later) over a HOME hotswap already laid out, it boots the
@@ -2140,16 +2142,15 @@ mod tests {
                 &[&["setup"], args].concat(),
             )
         };
+        // with no scutil (off macOS) the daemon's alone, as there is no ear
+        same(
+            &run("/usr/bin:/bin", &[], &["--print"])?,
+            &format!("0\n{}", plist(&data)),
+        )?;
         same(
             &run(&named, &[], &["--print"])?,
             &format!("0\n{}{}", plist(&data), ear(&data)),
         )?;
-        fs::write(format!("{root}/fail-scutil"), "")?;
-        same(
-            &run(&named, &[], &["--print"])?,
-            "1\nrift setup: scutil --get LocalHostName gave \"LocalHostName: not set\", no track name (1 to 64 letters, digits, - or _)\n",
-        )?;
-        fs::remove_file(format!("{root}/fail-scutil"))?;
         // no RIFT_ROOT: the default under HOME
         let out = Command::new(env!("CARGO_BIN_EXE_rift"))
             .env("HOME", &home)
@@ -2175,7 +2176,7 @@ mod tests {
             &format!("{}{}", plist(&data), ear(&data)),
         )?;
         same(
-            &run(&format!("{host}:/usr/bin"), &[], &[])?,
+            &run("/usr/bin", &[], &[])?,
             "1\nrift setup: launchctl: No such file or directory (os error 2) (setup installs launchd agents, macOS only; --print prints their plists)\n",
         )?;
         same(&fs::exists(&home)?.to_string(), "false")?;
@@ -2188,10 +2189,12 @@ mod tests {
 printf '%s\n' "$*" >> {root}/launchctl.log
 job=${{2##*/}}
 start() {{ [ -f {root}/dead ] && return; case $1 in *.ear.plist) [ -f {root}/deaf ] && return;; esac; RIFT_ROOT=$(sed -n 's|.*<key>RIFT_ROOT</key><string>\(.*\)</string>.*|\1|p' $1) RIFT_MIC={root}/fake RIFT_POLL_MS=100 {serve} $(sed -n 's|.*<array><string>[^<]*</string>\(.*\)</array>|\1|p' $1 | sed 's|<string>||g; s|</string>| |g') >/dev/null 2>&1 & echo $! > {root}/loaded/$(basename $1 .plist); }}
+hold() {{ until RIFT_ROOT=$1 {serve} status | grep -q ready; do sleep 0.05; done; RIFT_ROOT=$1 RIFT_MIC={root}/fake {serve} device ear test-mac --mic >/dev/null 2>&1 & echo $! > {root}/holder; until RIFT_ROOT=$1 {serve} status | grep -q ear-test-mac; do sleep 0.05; done; }}
 case $1 in
 print) [ -f {root}/loaded/$job.going ] && {{ rm {root}/loaded/$job.going; exit 0; }}; [ -f {root}/loaded/$job ] || exit 113;;
 bootout) kill $(cat {root}/loaded/$job) 2>/dev/null; [ -f {root}/stuck ] || mv {root}/loaded/$job {root}/loaded/$job.going;;
-bootstrap) case $3 in *.upgrade.plist) touch {root}/loaded/$(basename $3 .plist); exit;; esac; held=$(sed -n 's|.*<key>RIFT_ROOT</key><string>\(.*\)</string>.*|\1|p' $3); [ -n "$(find "$held" -maxdepth 0 -perm 700)" ] && echo root 0700 >> {root}/launchctl.log; [ -f {root}/fail ] && {{ echo 'Bootstrap failed: 5: Input/output error' >&2; exit 5; }}; start $3;;
+bootstrap) case $3 in *.upgrade.plist) touch {root}/loaded/$(basename $3 .plist); exit;; esac; held=$(sed -n 's|.*<key>RIFT_ROOT</key><string>\(.*\)</string>.*|\1|p' $3); [ -n "$(find "$held" -maxdepth 0 -perm 700)" ] && echo root 0700 >> {root}/launchctl.log; [ -f {root}/fail ] && {{ echo 'Bootstrap failed: 5: Input/output error' >&2; exit 5; }}; start $3; case $3 in *rift.plist) [ ! -f {root}/held ] || hold "$held";; esac;;
+print-disabled) [ -f {root}/disabled ] && echo '	"dev.gigantic.rift.ear" => disabled'; exit 0;;
 kickstart) kill $(cat {root}/loaded/${{3##*/}}); [ -f {root}/refuse ] && exit; {{ sleep 1; start {file}; }} >/dev/null 2>&1 &;;
 esac
 "#,
@@ -2284,7 +2287,8 @@ esac
         );
         let unheard = format!("print {earjob}\nprint {earjob}\n");
         let deafen = format!("print {earjob}\nbootout {earjob}\n{unheard}");
-        let hear = format!("{unheard}bootstrap {gui} {earfile}\nroot 0700\n");
+        let listen = format!("{unheard}bootstrap {gui} {earfile}\nroot 0700\n");
+        let hear = format!("print-disabled {gui}\n{listen}");
         let calls = || -> Result<String, Box<dyn Error>> {
             let log = fs::read_to_string(format!("{root}/launchctl.log"))?;
             fs::remove_file(format!("{root}/launchctl.log"))?;
@@ -2411,7 +2415,7 @@ esac
                 signs()?
             ),
             &format!(
-                "1\n{linked}{wrote}{muted}launchctl kickstart -k {job}\ndev.gigantic.rift not ready 0 ms after its load; loading it again\nlaunchctl bootout {job}\nlaunchctl bootstrap {gui} {file}\n{heard}dev.gigantic.rift.ear not ready 0 ms after its load; loading it again\n{heard}rift setup: dev.gigantic.rift.ear not ready 3000 ms after its load; see {data}/ear.err\nprint {job}\n{tended}{deafen}kickstart -k {job}\nprint {job}\nbootout {job}\nprint {job}\nprint {job}\nbootstrap {gui} {file}\nroot 0700\n{hear}{hear}{steady}"
+                "1\n{linked}{wrote}{muted}launchctl kickstart -k {job}\ndev.gigantic.rift not ready 0 ms after its load; loading it again\nlaunchctl bootout {job}\nlaunchctl bootstrap {gui} {file}\n{heard}dev.gigantic.rift.ear not ready 0 ms after its load; loading it again\n{heard}rift setup: dev.gigantic.rift.ear not ready 3000 ms after its load; see {data}/ear.err\nprint {job}\n{tended}{deafen}kickstart -k {job}\nprint {job}\nbootout {job}\nprint {job}\nprint {job}\nbootstrap {gui} {file}\nroot 0700\n{hear}{listen}{steady}"
             ),
         )?;
         same(&health()?["state"].to_string(), "\"ready\"")?;
@@ -2444,9 +2448,13 @@ esac
         )?;
         // a rebuilt release (its signature gone) under a locked keychain: unlocked, signed, then
         // loaded afresh rather than kickstarted
+        // and a hand-run ear already holding the track (`held`) once the new daemon is up: the
+        // standing ear loaded unwaited, to take the track over once that one leaves
         let hash = id(&data)?;
         fs::remove_file(format!("{root}/signature"))?;
-        fs::write(format!("{root}/locked"), "")?;
+        for marker in ["held", "locked"] {
+            fs::write(format!("{root}/{marker}"), "")?;
+        }
         same(
             &format!(
                 "{}{}{} {}",
@@ -2456,9 +2464,25 @@ esac
                 fs::exists(format!("{root}/locked"))?
             ),
             &format!(
-                "0\n{linked}signed {release} as dev.gigantic.rift by {hash}\n{wrote}{muted}launchctl bootout {job}\nlaunchctl bootstrap {gui} {file}\n{heard}print {job}\n{tended}{deafen}print {job}\nbootout {job}\nprint {job}\nprint {job}\nbootstrap {gui} {file}\nroot 0700\n{hear}{steady}codesign -f {release}.new\n false"
+                "0\n{linked}signed {release} as dev.gigantic.rift by {hash}\n{wrote}{muted}launchctl bootout {job}\nlaunchctl bootstrap {gui} {file}\n{heard}ear-test-mac is held by another device; dev.gigantic.rift.ear takes it over once it leaves\nprint {job}\n{tended}{deafen}print {job}\nbootout {job}\nprint {job}\nprint {job}\nbootstrap {gui} {file}\nroot 0700\nprint-disabled {gui}\nbootstrap {gui} {earfile}\nroot 0700\n{steady}codesign -f {release}.new\n false"
             ),
         )?;
+        fs::remove_file(format!("{root}/held"))?;
+        let holder = fs::read_to_string(format!("{root}/holder"))?;
+        same(
+            &String::from_utf8(Command::new("kill").arg(holder.trim()).output()?.stderr)?,
+            "",
+        )?;
+        until(|| {
+            Ok(health().is_ok_and(|listing| {
+                listing["devices"]
+                    .as_array()
+                    .is_some_and(|held| held.len() == 1)
+            }) && !Command::new("kill")
+                .args(["-0", holder.trim()])
+                .status()?
+                .success())
+        })?;
         // each failure is one line, exit 1, before the daemon is touched; a failed signing
         // leaves no copy behind
         let failed = |marker: &str, envs: &[(&str, &str)]| -> Result<String, Box<dyn Error>> {
@@ -2471,6 +2495,13 @@ esac
             &failed("fail-unlock-keychain", &[])?,
             &format!(
                 "1\n{linked}rift setup: security unlock-keychain: unlock-keychain failed\nprint {job}\n{tended}security unlock-keychain\n"
+            ),
+        )?;
+        // a Mac whose local host name is unset: refused before anything is written
+        same(
+            &failed("fail-scutil", &[])?,
+            &format!(
+                "1\nrift setup: scutil --get LocalHostName gave \"LocalHostName: not set\", no track name (1 to 64 letters, digits, - or _)\nprint {job}\n"
             ),
         )?;
         // a tool not on PATH, which holds only launchctl and what it and setup call before it
@@ -2568,15 +2599,19 @@ esac
                 &[&["setup"], args].concat(),
             )
         };
-        // its own keychain and identity, so the release is signed again
+        // its own keychain and identity, so the release is signed again; the ear disabled by the
+        // owner, its plist written and never loaded
+        fs::write(format!("{root}/disabled"), "")?;
         let moving = format!("{}{}{}", rerun(&[], &[])?, calls()?, signs()?);
+        fs::remove_file(format!("{root}/disabled"))?;
         same(
             &moving,
             &format!(
-                "0\n{linked}{}{wrote}{muted}launchctl bootout {job}\nlaunchctl bootstrap {gui} {file}\n{heard}print {job}\n{tended}{deafen}print {job}\nbootout {job}\nprint {job}\nprint {job}\nbootstrap {gui} {file}\nroot 0700\n{hear}{fresh}",
+                "0\n{linked}{}{wrote}{muted}launchctl bootout {job}\nlaunchctl bootstrap {gui} {file}\ndev.gigantic.rift.ear is disabled, so written and not loaded; launchctl enable {earjob} stands it\nprint {job}\n{tended}{deafen}print {job}\nbootout {job}\nprint {job}\nprint {job}\nbootstrap {gui} {file}\nroot 0700\nprint-disabled {gui}\n{fresh}",
                 made(&moved, &id(&moved)?)
             ),
         )?;
+        same(&fs::read_to_string(&earfile)?, &ear(&moved))?;
         // an earlier install, unloaded, beside a root that exists: retired, its root left alone
         plant(&old)?;
         fs::write(format!("{root}/fail"), "")?;
@@ -2584,7 +2619,7 @@ esac
         same(
             &format!("{}{}{}", run(&stubbed, &[], &[])?, calls()?, signs()?),
             &format!(
-                "1\nremoved {earlier}\n{linked}signed {release} as dev.gigantic.rift by {hash}\n{wrote}{muted}launchctl bootout {job}\nrift setup: launchctl bootstrap {gui} {file}: Bootstrap failed: 5: Input/output error\nprint {job}\nprint {former}\nprint {former}\n{tended}{deafen}print {job}\nbootout {job}\nprint {job}\nprint {job}\nbootstrap {gui} {file}\nroot 0700\n{steady}codesign -f {release}.new\n"
+                "1\nremoved {earlier}\n{linked}signed {release} as dev.gigantic.rift by {hash}\n{wrote}launchctl bootout {job}\nrift setup: launchctl bootstrap {gui} {file}: Bootstrap failed: 5: Input/output error\nprint {job}\nprint {former}\nprint {former}\n{tended}{unheard}print {job}\nbootout {job}\nprint {job}\nprint {job}\nbootstrap {gui} {file}\nroot 0700\n{steady}codesign -f {release}.new\n"
             ),
         )?;
         same(
@@ -2630,7 +2665,8 @@ esac
             fs::write(format!("{root}/loaded/{loaded}"), "")?;
         }
         plant(&old)?;
-        // the keychain and its password go as files, the root stays
+        // the keychain and its password go as files, the root stays; no host name is asked for
+        fs::write(format!("{root}/fail-scutil"), "")?;
         same(
             &format!("{}{}{}", rerun(&["--remove"], &[])?, calls()?, signs()?),
             &format!(
@@ -2667,7 +2703,9 @@ esac
     /// open and exact zeros are each said once and the device kept: the waited open returns when
     /// granted, the others are retried, a poll doubled per failure, until heard. A device outlives
     /// its daemon: it finds it down, waits, and connects again once it is back; SIGTERM, SIGINT
-    /// and SIGHUP each end one at once, exit 0, one stderr line, the daemon down or not. A
+    /// and SIGHUP each end one at once, exit 0, one stderr line, the daemon down or not; a refusal
+    /// (`taken`, another protocol) is said once on stderr, the attempts backing off; `ear.err` is
+    /// capped at an attempt. A
     /// Bluetooth default is followed only while there is no built-in input, then left for the
     /// built-in, each reason said once; a device pinned to it hears it.
     #[cfg(target_os = "macos")]
@@ -2681,6 +2719,7 @@ esac
         fs::write(format!("{fake}/default"), "Desk Mic\n")?;
         fs::write(format!("{fake}/slow"), "50")?;
         let envs = [
+            ("RIFT_LOG_CAP", "1"),
             ("RIFT_MIC", fake.as_str()),
             ("RIFT_OPEN_MS", "100"),
             ("RIFT_POLL_MS", "100"),
@@ -2690,10 +2729,10 @@ esac
             &root,
             &[("RIFT_PING_MS", "300"), ("RIFT_SEGMENT_MS", "200")],
         )?;
-        let spawn = |args: &[&str]| -> io::Result<Daemon> {
+        let spawn_in = |at: &str, args: &[&str]| -> io::Result<Daemon> {
             Ok(Daemon(
                 Command::new(env!("CARGO_BIN_EXE_rift"))
-                    .env("RIFT_ROOT", &root)
+                    .env("RIFT_ROOT", at)
                     .envs(envs)
                     .args(args)
                     .stdout(Stdio::piped())
@@ -2701,7 +2740,20 @@ esac
                     .spawn()?,
             ))
         };
+        let spawn = |args: &[&str]| spawn_in(&root, args);
+        // a stop signal ends a device at once, exit 0, saying so, the daemon down or not
+        let stop = |mut device: Daemon,
+                    mut errs: BufReader<ChildStderr>,
+                    name: &str|
+         -> Result<String, Box<dyn Error>> {
+            same(&signal(&device, name)?, "")?;
+            let mut rest = String::new();
+            let _: usize = io::Read::read_to_string(&mut errs, &mut rest)?;
+            Ok(format!("{:?} {rest}", device.0.wait()?.code()))
+        };
         let log = || fs::read_to_string(format!("{fake}/log")).unwrap_or_default();
+        // launchd's stderr for the standing ear, past the cap: emptied into `.1` at an attempt
+        fs::write(format!("{root}/ear.err"), "old")?;
         let stream = |track: &str| -> Result<Vec<Value>, Box<dyn Error>> {
             Ok(events(&root)?
                 .into_iter()
@@ -2756,6 +2808,61 @@ esac
                 opening[1]["samples"]
             ),
             "false 3200",
+        )?;
+        same(
+            &format!(
+                "{} {}",
+                fs::read_to_string(format!("{root}/ear.err.1"))?,
+                fs::metadata(format!("{root}/ear.err"))?.len()
+            ),
+            "old 0",
+        )?;
+        // a second device asking for a held track: refused `taken` each attempt on stdout, said
+        // once on stderr, the attempts spaced a poll doubled per refusal
+        let mut twin = spawn(&["device", "ear", "desk", "--mic"])?;
+        let mut echoed = BufReader::new(twin.0.stdout.take().ok_or("stdout")?);
+        same(
+            &format!("{} {}", next(&mut echoed)?, next(&mut echoed)?),
+            &format!("{} {}", code("taken"), code("taken")),
+        )?;
+        let twinned = BufReader::new(twin.0.stderr.take().ok_or("stderr")?);
+        same(
+            &stop(twin, twinned, "TERM")?,
+            &format!(
+                "Some(0) rift device: refused {}\nrift device: stopped by SIGTERM\n",
+                code("taken")
+            ),
+        )?;
+        // a daemon of another protocol: said once, the attempts backing off the same way
+        let other = format!("{root}/other");
+        fs::create_dir_all(format!("{other}/run"))?;
+        let (listener, (stamp, met)) = (
+            UnixListener::bind(format!("{other}/run/rift.sock"))?,
+            mpsc::channel(),
+        );
+        drop(thread::spawn(move || {
+            for dialed in listener.incoming().flatten() {
+                let mut conn = BufReader::new(dialed);
+                drop(next(&mut conn));
+                let reply = r#"{"code":"proto","ok":false,"proto":2,"version":"9-x"}"#;
+                drop(conn.get_mut().write_all(format!("{reply}\n").as_bytes()));
+                stamp.send(Instant::now()).unwrap_or_default();
+            }
+        }));
+        let mut alien = spawn_in(&other, &["device", "ear", "alien", "--mic"])?;
+        // a poll doubled, then doubled again: the third attempt six polls after the first
+        let (once, thrice) = (met.recv()?, met.iter().nth(1).ok_or("no third")?);
+        same(
+            &(thrice.duration_since(once) >= Duration::from_millis(600)).to_string(),
+            "true",
+        )?;
+        let strange = BufReader::new(alien.0.stderr.take().ok_or("stderr")?);
+        same(
+            &stop(alien, strange, "TERM")?,
+            &format!(
+                "Some(0) rift device: the daemon speaks protocol 2 (9-x), this client protocol 1 ({}); fix: rift setup, so both are one release\nrift device: stopped by SIGTERM\n",
+                version()?
+            ),
         )?;
         // the daemon frozen for 300 ms, three polls: the device's writes wait, its microphone
         // stays open, and the frames held up go on from the sample count, no hole and none ahead
@@ -2845,16 +2952,6 @@ esac
                     .count()
                     + 1)
         })?;
-        // a stop signal ends a device at once, exit 0, saying so, the daemon down or not
-        let stop = |mut device: Daemon,
-                    mut errs: BufReader<ChildStderr>,
-                    name: &str|
-         -> Result<String, Box<dyn Error>> {
-            same(&signal(&device, name)?, "")?;
-            let mut rest = String::new();
-            let _: usize = io::Read::read_to_string(&mut errs, &mut rest)?;
-            Ok(format!("{:?} {rest}", device.0.wait()?.code()))
-        };
         drop(daemon);
         // the daemon gone, the ear waits a poll, finds it down and waits on; a frame in flight
         // as the ears close is refused `closed`, as the protocol has it
@@ -2906,7 +3003,7 @@ esac
             (
                 "Silent",
                 format!(
-                    " gave no signal (nothing, or only exact zeros) after it opened: the microphone is not granted, or is muted; {grant}"
+                    " gave no signal (nothing, or only exact zeros) after it opened: the microphone is not granted, is muted, or is a closed lid's; {grant}"
                 ),
             ),
             (

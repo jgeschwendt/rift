@@ -16,7 +16,7 @@ impl Source for Mic {
     fn hold(&self, name: &str, ready: Ready, mut sound: Sound, stop: Receiver<()>) {
         let opened = || -> Result<_, Box<dyn Error>> {
             let device = (cpal::default_host().input_devices()?)
-                .find(|device| device.to_string() == name)
+                .find(|device| device.description().is_ok_and(|held| held.name() == name))
                 .ok_or("not among the inputs")?;
             let config = device.default_input_config()?.config();
             let stream = device.build_input_stream(
@@ -39,9 +39,9 @@ impl Source for Mic {
     }
 
     fn inputs(&self) -> Inputs {
-        let host = cpal::default_host();
-        let names: Vec<String> = (host.input_devices().into_iter().flatten())
-            .map(|device| device.to_string())
+        // names read fallibly: a device gone mid-listing is skipped, where its Display would panic
+        let names: Vec<String> = (cpal::default_host().input_devices().into_iter().flatten())
+            .filter_map(|device| Some(device.description().ok()?.name().to_owned()))
             .collect();
         // a device's `kAudioDevicePropertyTransportType`, the four letters of its constant
         let transport = |id| {
@@ -49,15 +49,16 @@ impl Source for Mic {
                 .unwrap_or_default()
                 .to_be_bytes()
         };
+        // the default read once: its name and its transport are one device's
+        let default = get_default_device_id(true);
         Inputs {
             built: (get_audio_device_ids().into_iter().flatten())
                 .filter(|&id| &transport(id) == b"bltn")
                 .filter_map(|id| get_device_name(id).ok())
                 .find(|name| names.contains(name)),
-            default: host.default_input_device().map(|device| device.to_string()),
+            default: default.and_then(|id| get_device_name(id).ok()),
             names,
-            wireless: get_default_device_id(true)
-                .is_some_and(|id| matches!(&transport(id), b"blue" | b"blea")),
+            wireless: default.is_some_and(|id| matches!(&transport(id), b"blue" | b"blea")),
         }
     }
 }

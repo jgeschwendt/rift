@@ -325,6 +325,18 @@ fn manifest() -> hotswap::Manifest {
     }
 }
 
+/// `file` copied to `<file>.1` and emptied once it holds `cap` bytes. Emptied, not renamed: a
+/// stderr launchd opened appends (observed 2026-11-25 · lsof's `AP` on two agents' stderr), so its
+/// writer goes on at the start, where after a rename it would write on into `.1`.
+fn rotate(file: &Path, cap: u64) {
+    if fs::metadata(file).is_ok_and(|meta| meta.len() >= cap) {
+        drop(
+            fs::copy(file, file.with_added_extension("1"))
+                .and_then(|_| OpenOptions::new().write(true).open(file)?.set_len(0)),
+        );
+    }
+}
+
 /// This host's clock in microseconds since the epoch: the daemon's, the stream's one timeline;
 /// a device's own.
 fn now() -> u64 {
@@ -457,8 +469,26 @@ fn main() -> ExitCode {
                 serde_json::from_str(&line).map_err(io::Error::other)
             };
             let poll = Duration::from_millis(setting("RIFT_POLL_MS", 1000));
-            // an ear stands: whatever ends an attempt, it waits a poll and connects again
+            // an ear stands: whatever ends an attempt, it waits a poll and connects again. Each
+            // refusal (a protocol mismatch, a refused hello or device) is said on stderr too, since
+            // launchd keeps no stdout: once a code until it connects, the wait doubled per refusal
+            // in a row, 64 polls at most, as a failed open's
+            let (refused, strikes) = (Cell::new(Value::Null), Cell::new(0u32));
+            let strike = |code: &Value| {
+                strikes.set(strikes.get().saturating_add(1));
+                mic && refused.replace(code.clone()) != *code
+            };
+            let tell = |line: &Value| {
+                println!("{line}");
+                if strike(&line["code"]) {
+                    eprintln!("rift device: refused {line}");
+                }
+            };
             loop {
+                // the standing ear's launchd stderr, capped as the daemon's is, at each attempt
+                if mic {
+                    rotate(&root.join("ear.err"), setting("RIFT_LOG_CAP", 1u64 << 20));
+                }
                 // set once the request may have left: a failure after it is an unknown outcome
                 let sent = Cell::new(false);
                 let talk = || -> io::Result<(Value, Value, BufReader<UnixStream>)> {
@@ -483,11 +513,13 @@ fn main() -> ExitCode {
                 };
                 let code = match talk() {
                     Ok((hello, _, _)) if hello["code"] == "proto" => {
-                        eprintln!(
-                            "rift {verb}: the daemon speaks protocol {} ({}), this client protocol {PROTO} ({VERSION}); fix: rift setup, so both are one release",
-                            hello["proto"],
-                            hello["version"].as_str().unwrap_or_default()
-                        );
+                        if !mic || strike(&hello["code"]) {
+                            eprintln!(
+                                "rift {verb}: the daemon speaks protocol {} ({}), this client protocol {PROTO} ({VERSION}); fix: rift setup, so both are one release",
+                                hello["proto"],
+                                hello["version"].as_str().unwrap_or_default()
+                            );
+                        }
                         ExitCode::FAILURE
                     }
                     Ok((hello, reply, mut reader)) if hello["ok"] == true => {
@@ -501,6 +533,8 @@ fn main() -> ExitCode {
                             println!("{reply}");
                             #[cfg(target_os = "macos")]
                             if mic {
+                                refused.set(Value::Null);
+                                strikes.set(0);
                                 ear::run(reader, &reply, words.get(4).copied());
                                 thread::sleep(poll);
                                 continue;
@@ -580,11 +614,11 @@ fn main() -> ExitCode {
                             );
                             return ExitCode::SUCCESS;
                         }
-                        println!("{reply}");
+                        tell(&reply);
                         ExitCode::from(u8::from(reply["ok"] != true))
                     }
-                    Ok((refused, _, _)) => {
-                        println!("{refused}");
+                    Ok((turned, _, _)) => {
+                        tell(&turned);
                         ExitCode::FAILURE
                     }
                     Err(_) => {
@@ -595,7 +629,7 @@ fn main() -> ExitCode {
                 if !mic {
                     break code;
                 }
-                thread::sleep(poll);
+                thread::sleep(poll.saturating_mul(2u32.saturating_pow(strikes.get().min(6))));
             }
         }
         (&["serve"], None) => {
@@ -609,9 +643,7 @@ fn main() -> ExitCode {
             let write = move |mut line: Value| {
                 line["at"] = utc(SystemTime::now()).into();
                 for file in [&log, &err] {
-                    if fs::metadata(file).is_ok_and(|meta| meta.len() >= cap) {
-                        drop(fs::rename(file, file.with_added_extension("1")));
-                    }
+                    rotate(file, cap);
                 }
                 drop(
                     OpenOptions::new()
@@ -1485,32 +1517,41 @@ fn main() -> ExitCode {
                 };
                 // the standing ear's track is this Mac's for good: its local host name, which
                 // Sharing sets and no network renames, lowercased
-                let host = ask("scutil", &["--get", "LocalHostName"])?;
-                let mac = String::from_utf8_lossy(&host.stdout)
-                    .trim()
-                    .to_ascii_lowercase();
-                if !host.status.success() || !well("ear", &mac) {
-                    return Err(io::Error::other(format!(
-                        "scutil --get LocalHostName gave {:?}, no track name (1 to 64 letters, digits, - or _)",
-                        String::from_utf8_lossy(&[host.stdout, host.stderr].concat()).trim()
-                    )));
-                }
+                let named = || -> io::Result<String> {
+                    let host = ask("scutil", &["--get", "LocalHostName"])?;
+                    let mac = String::from_utf8_lossy(&host.stdout)
+                        .trim()
+                        .to_ascii_lowercase();
+                    if !host.status.success() || !well("ear", &mac) {
+                        return Err(io::Error::other(format!(
+                            "scutil --get LocalHostName gave {:?}, no track name (1 to 64 letters, digits, - or _)",
+                            String::from_utf8_lossy(&[host.stdout, host.stderr].concat()).trim()
+                        )));
+                    }
+                    Ok(mac)
+                };
                 let plist = sheet(
                     label,
                     "<string>serve</string>",
                     "<dict><key>SuccessfulExit</key><false/></dict>",
                     "serve.err",
                 );
-                let standing = sheet(
-                    ear,
-                    &format!(
-                        "<string>device</string><string>ear</string><string>{mac}</string><string>--mic</string>"
-                    ),
-                    "<true/>",
-                    "ear.err",
-                );
+                let standing = |mac: &str| {
+                    sheet(
+                        ear,
+                        &format!(
+                            "<string>device</string><string>ear</string><string>{mac}</string><string>--mic</string>"
+                        ),
+                        "<true/>",
+                        "ear.err",
+                    )
+                };
+                // with no host name (off macOS, no scutil) there is no ear: the daemon's alone
                 if words.contains(&"--print") {
-                    print!("{plist}{standing}");
+                    print!(
+                        "{plist}{}",
+                        named().map_or_else(|_| String::new(), |mac| standing(&mac))
+                    );
                     return Ok(());
                 }
                 let uid = Command::new("id").arg("-u").output()?.stdout;
@@ -1627,6 +1668,8 @@ fn main() -> ExitCode {
                 // asked before anything is written: no launchctl (Linux) leaves nothing behind
                 let swap =
                     loaded(label)? && fs::read_to_string(&path).is_ok_and(|held| held == plist);
+                let mac = named()?;
+                let listened = standing(&mac);
                 for agent in &older {
                     unload(&agent.1)?;
                     if let Some(from) = agent.2.as_ref().map(PathBuf::from)
@@ -1755,7 +1798,7 @@ security import "$1/identity.p12" -k "$3" -P "$2" -T /usr/bin/codesign"#,
                     println!("signed {} as {label} by {hash}", target.display());
                 }
                 path.parent().map_or(Ok(()), fs::create_dir_all)?;
-                for (file, text) in [(&path, &plist), (&heard, &standing)] {
+                for (file, text) in [(&path, &plist), (&heard, &listened)] {
                     let staged = file.with_extension("plist.new");
                     fs::write(&staged, text)?;
                     fs::rename(&staged, file)?;
@@ -1830,13 +1873,32 @@ security import "$1/identity.p12" -k "$3" -P "$2" -T /usr/bin/codesign"#,
                 up(label, &path, "serve.err", swap && !signed, &|health| {
                     Some(&health["pid"]) != before.as_ref()
                 })?;
-                // the ear only once the daemon is up: whatever fails there leaves it serving
+                // the ear only once the daemon is up: whatever fails there leaves it serving. One
+                // the owner disabled is written, never loaded: the way to opt out
+                if String::from_utf8_lossy(&call(&["print-disabled", &gui])?.stdout)
+                    .contains(&format!("\"{ear}\" => disabled"))
+                {
+                    println!(
+                        "{ear} is disabled, so written and not loaded; launchctl enable {gui}/{ear} stands it"
+                    );
+                    return Ok(());
+                }
                 let track = json!(format!("ear-{mac}"));
-                up(ear, &heard, "ear.err", false, &|health| {
+                let listed = |health: &Value| {
                     health["devices"]
                         .as_array()
                         .is_some_and(|held| held.contains(&track))
-                })
+                };
+                // a device already holding the track (a hand-run ear): the standing one is loaded
+                // to take it over once that one leaves, and there is no readiness to wait for
+                if serving().is_some_and(|health| listed(&health)) {
+                    must(&["bootstrap", &gui, &heard.to_string_lossy()])?;
+                    println!(
+                        "ear-{mac} is held by another device; {ear} takes it over once it leaves"
+                    );
+                    return Ok(());
+                }
+                up(ear, &heard, "ear.err", false, &listed)
             };
             install().map_or_else(
                 |cause| {

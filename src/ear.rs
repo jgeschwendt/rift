@@ -441,7 +441,7 @@ pub fn run(reader: BufReader<UnixStream>, reply: &Value, pinned: Option<&str>) {
                             || !held.heard && held.since.elapsed() >= zeros) =>
                 {
                     let why = format!(
-                        "{:?} gave no signal (nothing, or only exact zeros) after it opened: the microphone is not granted, or is muted; {GRANT}",
+                        "{:?} gave no signal (nothing, or only exact zeros) after it opened: the microphone is not granted, is muted, or is a closed lid's; {GRANT}",
                         held.name
                     );
                     // a heard input fallen silent: closed, nothing said

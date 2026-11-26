@@ -255,7 +255,10 @@
     <li><strong>It stands.</strong> Nothing ends the device but a stop signal: a connection that
       ends (<code class="code">{"code":"unknown","ok":false}</code>) and a daemon that is down
       (<code class="code">{"code":"down","ok":false}</code>) or refuses it are each waited out a
-      poll, then it connects again, so it never spins; the microphone is closed meanwhile. SIGTERM,
+      poll, then it connects again, so it never spins; the microphone is closed meanwhile. A
+      refusal (another protocol, a track held: <code class="code">taken</code>) is also one stderr
+      line, said once per code until it connects, the wait doubled per refusal in a row to 64
+      polls. SIGTERM,
       SIGINT and SIGHUP end it at once wherever it waits, exit 0, one stderr line
       (<code class="code">rift device: stopped by SIGTERM</code>); the daemon closes its open
       segment as the connection goes.</li>
@@ -266,7 +269,9 @@
       renamed by a network) lowercased, so its track, <code class="code">ear-&lt;host&gt;</code>, is
       the Mac's for good; renaming the Mac starts a new track at the next setup. It follows the
       default input by the rule above, holds no microphone while the ears are off, and shows among the devices of
-      <code class="code">rift status</code>.</li>
+      <code class="code">rift status</code>. To opt out, <code class="code">launchctl disable
+      gui/$(id -u)/dev.gigantic.rift.ear</code>: setup then writes its plist and leaves it
+      unloaded.</li>
   </ul>
 </section>
 
@@ -302,8 +307,9 @@
       the release reloads the agent instead of kickstarting it, and any load not ready within
       <code class="code">$RIFT_RELOAD_MS</code> is reloaded once more before setup gives up. The ear's
       job is always loaded afresh: booted out before the daemon is touched, loaded once the new
-      daemon answers ready, and ready once that daemon lists it, so the ear it lists is the one just
-      loaded; a failure there is named and exits 1 with the daemon serving.</li>
+      daemon answers ready, and ready once that daemon lists its track. A track another device
+      already holds there is said in a line, the ear loaded to take it over once that one leaves,
+      with no wait; a failure is named and exits 1 with the daemon serving.</li>
     <li><strong>What <code class="code">--remove</code> deletes.</strong> The keychain and its
       password file, as files; the root is left. The next <code class="code">setup</code> makes a new
       certificate, so the microphone is asked for again.</li>
@@ -390,7 +396,7 @@
       <tbody>
         <tr><td class="table-mono">~/.local/state/rift</td><td>the state root, mode 0700; <code class="code">$RIFT_ROOT</code> overrides</td></tr>
         <tr><td class="table-mono">&lt;root&gt;/audio/&lt;boot&gt;/&lt;track&gt;/&lt;n&gt;.pcm</td><td>a segment's raw frames: the closed ones still in the window and each track's open one</td></tr>
-        <tr><td class="table-mono">&lt;root&gt;/ear.err</td><td>launchd's stderr for the standing ear: its waits, refusals and stop line</td></tr>
+        <tr><td class="table-mono">&lt;root&gt;/ear.err</td><td>launchd's stderr for the standing ear: its waits, refusals, Bluetooth and grant lines and stop line, capped at each attempt as <code class="code">serve.err</code> is</td></tr>
         <tr><td class="table-mono">&lt;root&gt;/events.ndjson</td><td>the event log, the durable state beside the audio</td></tr>
         <tr><td class="table-mono">&lt;root&gt;/rift.keychain-db, &lt;root&gt;/rift.keychain-pass</td><td>rift's own keychain, holding its code-signing identity, and its password (0600); <code class="code">setup</code> makes both, <code class="code">setup --remove</code> deletes both (<a href="#identity">identity</a>); <code class="code">identity.new/</code> beside them lives only while a certificate is made</td></tr>
         <tr><td class="table-mono">&lt;root&gt;/run/rift.sock</td><td>the socket, in <code class="code">run/</code> (0700) beside <code class="code">serve.lock</code> (the <code class="code">flock</code> that admits one instance), <code class="code">serve.pid</code> (a hint) and <code class="code">serve.log</code> (start, refused, accept, degraded, exit and panic lines)</td></tr>
@@ -415,7 +421,7 @@
       <tbody>
         <tr><td class="table-mono">RIFT_BOOTOUT_MS</td><td><code class="code">setup</code>'s wait for launchd to let go of a job after a bootout, default 30000</td></tr>
         <tr><td class="table-mono">RIFT_DRAIN_MS</td><td>the drain's budget for open connections before they are cut, default 1000 (launchd's <code class="code">ExitTimeOut</code> is 3 s)</td></tr>
-        <tr><td class="table-mono">RIFT_LOG_CAP</td><td>the size at which <code class="code">serve.log</code> and <code class="code">serve.err</code> each rotate to <code class="code">.1</code>, default 1 MiB</td></tr>
+        <tr><td class="table-mono">RIFT_LOG_CAP</td><td>the size at which <code class="code">serve.log</code>, <code class="code">serve.err</code> and <code class="code">ear.err</code> are each copied to <code class="code">.1</code> and emptied (emptied, not renamed, since launchd's writer appends on), default 1 MiB</td></tr>
         <tr><td class="table-mono">RIFT_MIC</td><td>the suite's fake microphones in place of the system's: a directory, its format in <code class="code">src/ear.rs</code></td></tr>
         <tr><td class="table-mono">RIFT_OPEN_MS</td><td>how long a microphone's open may wait before <code class="code">--mic</code> names the grant, waiting on, default 10000</td></tr>
         <tr><td class="table-mono">RIFT_PING_MS</td><td>how long after a device's last ping a frame's reply carries the next, default 10000</td></tr>
@@ -456,7 +462,7 @@ mise run dist                           # a checkout: this host's release archiv
         <tr><td class="table-mono">rift read &lt;track&gt; &lt;from us&gt; &lt;to us&gt;</td><td>prints the range's frames, silence where nothing is held</td></tr>
         <tr><td class="table-mono">rift device ear|mouth &lt;name&gt; &lt;file.pcm&gt; [--fast]</td><td>a device, its own process: plays a raw PCM file (16 kHz, mono, 16-bit little-endian) as the track's frames, a short tail dropped, answering every ping, paced in real time and stamped from now, a pause or clock step of over 100 ms playing on from the clock as a hole, or with <code class="code">--fast</code> sent as fast as each is answered and stamped as if captured ending now; prints its reply, then each notice and refusal; exit 0 once every frame is answered, <code class="code">{"code":"unknown","ok":false}</code> and exit 1 if the connection ends first; an unreadable file is <code class="code">rift device: &lt;cause&gt;</code>, exit 1</td></tr>
         <tr><td class="table-mono">rift device ear &lt;name&gt; --mic [&lt;microphone&gt;]</td><td>a device, its own process, macOS only: hears the default input (the built-in in place of a Bluetooth one, when there is one), or the one named, whatever its transport, while the ears are open (<a href="#microphone">the microphone</a>); prints its reply, then each notice and refusal; when the connection ends (<code class="code">{"code":"unknown","ok":false}</code>) or the daemon is down, it waits a poll and connects again; SIGTERM, SIGINT or SIGHUP, its only exit: <code class="code">rift device: stopped by SIG&lt;name&gt;</code>, exit 0; a withheld grant or a failed open is one stderr line, and it keeps trying; on Linux exit 2</td></tr>
-        <tr><td class="table-mono">rift setup [--print | --remove]</td><td>brings the release into hotswap's layout and links <code class="code">~/.local/bin/rift</code> (with none installed, the latest, through packslip), signs the release with <a href="#identity">rift's identity</a>, then writes both agents' plists on that link, boots the ear's out, loads the daemon's, or swaps it with one <code class="code">kickstart -k</code> (a bootout then a bootstrap when it re-signed the release), and waits for the new daemon to answer health ready, then loads the ear's and waits for that daemon to list <code class="code">ear-&lt;host&gt;</code>, loading either afresh once when not ready past <code class="code">$RIFT_RELOAD_MS</code>; the ear's failure is <code class="code">rift setup: &lt;line naming dev.gigantic.rift.ear&gt;</code>, exit 1, the daemon left serving; <code class="code">--print</code> prints both plists, <code class="code">--remove</code> has hotswap forget the layout and the upgrade agent, unloads both agents and removes their plists, the link, the keychain and its password</td></tr>
+        <tr><td class="table-mono">rift setup [--print | --remove]</td><td>brings the release into hotswap's layout and links <code class="code">~/.local/bin/rift</code> (with none installed, the latest, through packslip), signs the release with <a href="#identity">rift's identity</a>, then writes both agents' plists on that link, boots the ear's out, loads the daemon's, or swaps it with one <code class="code">kickstart -k</code> (a bootout then a bootstrap when it re-signed the release), and waits for the new daemon to answer health ready, then loads the ear's and waits for that daemon to list <code class="code">ear-&lt;host&gt;</code>, loading either afresh once when not ready past <code class="code">$RIFT_RELOAD_MS</code>; the ear's failure is <code class="code">rift setup: &lt;line naming dev.gigantic.rift.ear&gt;</code>, exit 1, the daemon left serving; an ear whose track another device already holds is loaded unwaited, a disabled one left unloaded, each said in a line, exit 0; <code class="code">--print</code> prints both plists (the daemon's alone off macOS), <code class="code">--remove</code> has hotswap forget the layout and the upgrade agent, unloads both agents and removes their plists, the link, the keychain and its password</td></tr>
         <tr><td class="table-mono">rift upgrade [--check | --back | --retry]</td><td>hotswap's swap onto a newer release: installed beside the running one, <code class="code">current</code> moved, <code class="code">rift setup</code>, then the smoke (<code class="code">rift version</code>, <code class="code">rift status</code> until the daemon answers with it); a failure rolls back. Exit 0 green or settled, 1 red, 2 unable to try</td></tr>
         <tr><td class="table-mono">rift version</td><td>the build, as the hello reports it</td></tr>
       </tbody>

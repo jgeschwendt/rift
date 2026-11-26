@@ -64,10 +64,13 @@ tagged with the open's number so a closed open's are dropped, each buffer with t
 callback handed it over, which alone may rebase its frames. The stream (`hold`) is built, held
 and dropped on a thread of its own, closed by dropping its stop sender; an open abandoned while it
 waits closes as soon as it returns. A `--mic` device stands: main loops on the attempt, whatever
-ends one (a connection ended, `down`, a refusal) waited out `$RIFT_POLL_MS` before the next, and
-a signal thread armed before the first ends it on SIGTERM, SIGINT or SIGHUP with one stderr line
-(written, never `eprintln!`, so a closed stderr cannot panic it) and `exit(0)`, which still writes
-the coverage profile.
+ends one (a connection ended, `down`, a refusal) waited out `$RIFT_POLL_MS` before the next. A
+refusal (a protocol mismatch, a refused hello or device) also goes to stderr, launchd keeping no
+stdout: once per code (`strike`) until it connects, the wait doubled per refusal in a row to 64
+polls. Each attempt first caps `<root>/ear.err` (`rotate`, the daemon's). A signal thread armed
+before the first ends it on SIGTERM, SIGINT or SIGHUP with one stderr line (written, never
+`eprintln!`, so a closed stderr cannot panic it) and `exit(0)`, which still writes the coverage
+profile.
 
 ### `rift setup`
 
@@ -77,9 +80,11 @@ as after `shutdown`, stays down), `RunAtLoad`, `ThrottleInterval` 10,
 `ExitTimeOut` 3, `StandardErrorPath` `<root>/serve.err`. Beside it the standing ear's,
 `dev.gigantic.rift.ear`: the same but `ProgramArguments` `~/.local/bin/rift device ear <host>
 --mic`, `KeepAlive` true, `StandardErrorPath` `<root>/ear.err`; `<host>` is `scutil --get
-LocalHostName` (resolved from `PATH`, under `$RIFT_SIGN_MS`) lowercased, and one that is no track
-name (unset, or past `well`) is one line, exit 1, before anything else. `setup --print` prints
-both and writes nothing. `setup`, `launchctl` resolved from `PATH` (none, as on Linux: one line,
+LocalHostName` (resolved from `PATH`, under `$RIFT_SIGN_MS`) lowercased, asked only by `--print`
+and an install: `setup --print` prints both and writes nothing, the daemon's alone when there is no
+name (no `scutil`, off macOS); an install refuses one that is no track name (unset, or past
+`well`) in one line, exit 1, right after the `launchctl` check, before anything is written;
+`--remove` asks for none. `setup`, `launchctl` resolved from `PATH` (none, as on Linux: one line,
 exit 1, before anything is written), `gui/<id -u>` the domain, each call that changes something
 printed:
 
@@ -138,10 +143,15 @@ printed:
    again`, the reload once more, then at most `$RIFT_READY_MS`: `<label> not ready <ms> ms after
    its load; see <root>/serve.err`, exit 1. launchd holds a kickstart's respawn until 10 s after
    the last launch, so a swap soon after a load waits that out, inside the first budget;
-9. the ear reloaded (never kickstarted), then step 8 for it with `ear-<host>` among the new
-   daemon's `devices` as ready and `<root>/ear.err` named: the old ear left before this daemon
-   started, so the one it lists is the one just loaded. Its failure is the line, exit 1, the
-   daemon serving; a daemon failure before it leaves the ear unloaded.
+9. the ear: listed disabled by `launchctl print-disabled gui/<id -u>` (`"<label>" => disabled`,
+   as `launchctl disable gui/<id -u>/dev.gigantic.rift.ear` leaves it, the way to opt out): not
+   loaded, one line, exit 0. `ear-<host>` already among the new daemon's `devices` (another
+   device, a hand-run ear, connected first): bootstrapped, one line that the standing ear takes
+   the track over once that one leaves, exit 0, no wait. Else reloaded (never kickstarted), then
+   step 8 for it with `ear-<host>` among `devices` as ready and `<root>/ear.err` named. A device
+   that connects between that check and the ear's own connect still passes for it; the standing
+   ear, refused `taken`, says so in `ear.err` and takes over once that one leaves. Its failure is
+   the line, exit 1, the daemon serving; a daemon failure before it leaves the ear unloaded.
 
 Observed (observed 2026-11-25 · `/usr/bin/log show`, since zsh shadows `log`): the first upgrade
 onto a signing release re-signed it, then `kickstart -k`; launchd refused the spawn (`Launch
@@ -151,7 +161,9 @@ exit code = 78: EX_CONFIG`). The background-task manager's record for a plist in
 a refused job stays refused through every later kickstart, and a bootout then a bootstrap spawned
 it at once. It needs a job the system already holds a record for, so the suite stands it in with
 the stub's `refuse`. Hence a reload after any re-sign, and one reload past the first budget for
-whatever else refuses. A rollback onto a release older than this runs that release's setup, which
+whatever else refuses. A rollback onto a release older than the standing ear leaves
+`dev.gigantic.rift.ear` loaded and unmanaged: that release's setup neither reloads nor removes it.
+A rollback onto a release older than this runs that release's setup, which
 only kickstarts a loaded job: a job refused before it, or refused onto that release's ad-hoc
 signature, stays down until a setup of this release or `launchctl bootout` then `bootstrap` by
 hand.
