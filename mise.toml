@@ -4,6 +4,8 @@
 # hk runs the pre-push gate (hk.pkl); `hk install --mise` wires it.
 hk = "2.5.0"
 rust = "1.94.0"
+# engines/transcribe's Python and its lock
+uv = "0.13.10"
 
 [tasks.check]
 description = "the gate hk's pre-push runs: fmt, clippy, 100 % line coverage"
@@ -16,12 +18,15 @@ run = [
 [tasks.check-engines]
 description = "the reference model engines' gate: fmt, lints, each engine's protocol logic at 100 % of lines against a stub model; a model's own test runs only where its weights are"
 dir = "{{config_root}}/engines"
-# main.rs, models.rs and pocket.rs hold the model and command-line lines alone, exempt, as each
-# model's own test runs only where its weights are
+# main.rs, models.rs, pocket.rs and moonshine.py hold the model and command-line lines alone,
+# exempt, as each model's own test runs only where its weights are
 run = [
   "cargo fmt --check",
   "cargo clippy --all-targets --locked -- -D warnings",
   "cargo llvm-cov --locked --fail-under-lines 100 --ignore-filename-regex '/(main|models|pocket)\\.rs$' --show-missing-lines",
+  "uv run --project transcribe --locked ruff format --check transcribe",
+  "uv run --project transcribe --locked ruff check transcribe",
+  "uv run --project transcribe --locked pytest transcribe -p no:cacheprovider -rs --cov=transcribe/src --cov-config=transcribe/pyproject.toml",
 ]
 
 [tasks.cover]

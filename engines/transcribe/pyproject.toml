@@ -1,0 +1,39 @@
+[project]
+dependencies = ["moonshine-voice==0.1.5", "numpy==2.3.3"]
+description = "rift's reference words engine: Moonshine v2 Medium Streaming on rift's socket"
+license = "PolyForm-Noncommercial-1.0.0"
+name = "transcribe"
+requires-python = "==3.12.*"
+version = "0.1.0"
+
+[project.scripts]
+transcribe = "transcribe:main"
+
+[build-system]
+build-backend = "uv_build"
+requires = ["uv_build==0.13.9"]
+
+[dependency-groups]
+dev = ["pytest-cov==7.1.0", "pytest==9.2.0", "ruff==0.17.6"]
+
+[tool.coverage.report]
+fail_under = 100
+show_missing = true
+
+[tool.coverage.run]
+# the model's own lines run only where its weights are (tests/test_model.py)
+omit = ["*/moonshine.py"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["ALL"]
+# D203/D213 contradict D211/D212; COM812 fights the formatter; a CLI prints by design; the house
+# docblock names what a thing is ("The next line…"), in one sentence however long (D205, D401)
+# the licence is the repo's LICENSE.md, never a per-file header (CPY001)
+ignore = ["COM812", "CPY001", "D203", "D205", "D213", "D401", "T201"]
+
+[tool.ruff.lint.per-file-ignores]
+# tests assert by design, sit outside the package, and reach into its private parts
+"tests/*" = ["INP001", "PLR2004", "S101", "SLF001"]
