@@ -14,7 +14,6 @@ use std::io::{BufRead as _, BufReader, Write as _};
 use std::iter;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::process::ExitCode;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -231,7 +230,8 @@ struct Open {
     since: Instant,
 }
 
-/// The device after its reply, until the daemon goes (`unknown`, exit 1): every ping answered on
+/// The device after its reply, until the daemon goes (`unknown`, then main waits a poll and
+/// connects again): every ping answered on
 /// the reader's thread as it arrives; every line printed unless ok and obeyed for the ears; the
 /// inputs listed on a thread of their own every `$RIFT_POLL_MS`; the wanted one opened while the
 /// ears are on and closed when they go off or another is wanted; its sound sent as frames from its
@@ -242,7 +242,7 @@ struct Open {
     clippy::single_call_fn,
     reason = "the device's entry: main calls it once, on macOS"
 )]
-pub fn run(reader: BufReader<UnixStream>, reply: &Value, pinned: Option<&str>) -> ExitCode {
+pub fn run(reader: BufReader<UnixStream>, reply: &Value, pinned: Option<&str>) {
     let hear = || -> Option<()> {
         let source: &'static dyn Source =
             env::var_os("RIFT_MIC").map_or(&Mic, |dir| Box::leak(Box::new(Fake(dir.into()))));
@@ -442,5 +442,4 @@ pub fn run(reader: BufReader<UnixStream>, reply: &Value, pinned: Option<&str>) -
     };
     let _: Option<()> = hear();
     println!("{}", error("unknown"));
-    ExitCode::FAILURE
 }

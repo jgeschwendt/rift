@@ -28,7 +28,7 @@ its lines open a real microphone, which no test may, so it holds those lines and
 | `src/ear.rs` | macOS: `device ear <name> --mic`, its loop, the 16 kHz converter, and `Fake`, the suite's microphones under `$RIFT_MIC` |
 | `src/mic.rs` | macOS: the cpal lines alone, exempt from coverage |
 | `build.rs` | the build identity: `$RIFT_VERSION` (the release workflow's), else the crate version; then the short commit, `-dirty` over uncommitted work, `unknown` outside git; on macOS the Info.plist linked in |
-| `tests/rift.rs` | the end-to-end suite: the built binary over temp roots via `RIFT_ROOT`, stub `launchctl`, `curl`, `security`, `openssl` and `codesign` planted on `PATH` and a temp `HOME` (also `HOTSWAP_TEST_HOME`) hotswap's layout is laid out in, a copy of the build its release, for `setup` and `upgrade`; `$RIFT_MIC`'s fake inputs for `--mic`; a `Daemon` guard kills every process it holds, so one whose lines must count toward coverage ends by itself instead (a daemon by `shutdown`, a device with its daemon): a killed process writes no profile |
+| `tests/rift.rs` | the end-to-end suite: the built binary over temp roots via `RIFT_ROOT`, stub `launchctl`, `curl`, `security`, `openssl`, `codesign` and `scutil` planted on `PATH` and a temp `HOME` (also `HOTSWAP_TEST_HOME`) hotswap's layout is laid out in, a copy of the build its release, for `setup` and `upgrade`; `$RIFT_MIC`'s fake inputs for `--mic`; a `Daemon` guard kills every process it holds, so one whose lines must count toward coverage ends by itself instead (a daemon by `shutdown`, a file-fed device with its daemon, a `--mic` one by a stop signal): a killed process writes no profile |
 | `docs/index.html` | the design page: what rift is today and what it will be |
 | `docs/protocol.html` | the wire contract, protocol 1 |
 
@@ -51,7 +51,8 @@ SIGTERM, SIGINT and SIGHUP take the shutdown path: stop accepting, close the ope
 ### The clients and `rift device`
 
 Each prints the daemon's reply (a feed, a listen and a read, in its place, each line after it until
-the stream ends), exit 0 on `"ok":true`; `down` and `unknown` exit 1. A daemon of another protocol is
+the stream ends), exit 0 on `"ok":true`; `down` and `unknown` exit 1, but a `--mic` device's
+(below). A daemon of another protocol is
 one stderr line naming both and the fix (`rift setup`), exit 1; another version, the same line
 beside the reply. `rift device`, as `docs/index.html#cli` has it, answers the reply's ping before its
 first frame, so the daemon never refuses it `unsynced`. With `--mic` (`src/ear.rs`) one channel
@@ -61,16 +62,25 @@ the line is passed on; the inputs, listed on a thread every poll; each open's ou
 tagged with the open's number so a closed open's are dropped, each buffer with the clock as the
 callback handed it over, which alone may rebase its frames. The stream (`hold`) is built, held
 and dropped on a thread of its own, closed by dropping its stop sender; an open abandoned while it
-waits closes as soon as it returns.
+waits closes as soon as it returns. A `--mic` device stands: main loops on the attempt, whatever
+ends one (a connection ended, `down`, a refusal) waited out `$RIFT_POLL_MS` before the next, and
+a signal thread armed before the first ends it on SIGTERM, SIGINT or SIGHUP with one stderr line
+(written, never `eprintln!`, so a closed stderr cannot panic it) and `exit(0)`, which still writes
+the coverage profile.
 
 ### `rift setup`
 
 The plist for `dev.gigantic.rift`: `ProgramArguments` `~/.local/bin/rift serve`,
 `EnvironmentVariables` the root it ran with, `KeepAlive` on an unclean exit only (a drain's exit 0,
 as after `shutdown`, stays down), `RunAtLoad`, `ThrottleInterval` 10,
-`ExitTimeOut` 3, `StandardErrorPath` `<root>/serve.err`. `setup --print` prints it and writes
-nothing. `setup`, `launchctl` resolved from `PATH` (none, as on Linux: one line, exit 1, before
-anything is written), `gui/<id -u>` the domain, each call that changes something printed:
+`ExitTimeOut` 3, `StandardErrorPath` `<root>/serve.err`. Beside it the standing ear's,
+`dev.gigantic.rift.ear`: the same but `ProgramArguments` `~/.local/bin/rift device ear <host>
+--mic`, `KeepAlive` true, `StandardErrorPath` `<root>/ear.err`; `<host>` is `scutil --get
+LocalHostName` (resolved from `PATH`, under `$RIFT_SIGN_MS`) lowercased, and one that is no track
+name (unset, or past `well`) is one line, exit 1, before anything else. `setup --print` prints
+both and writes nothing. `setup`, `launchctl` resolved from `PATH` (none, as on Linux: one line,
+exit 1, before anything is written), `gui/<id -u>` the domain, each call that changes something
+printed:
 
 1. an earlier install, any other agent in `~/Library/LaunchAgents` whose program is `~/.local/bin/rift`
    `serve`, is booted out; its root moves to this one while this one does not exist (`moved <old>
@@ -118,14 +128,19 @@ anything is written), `gui/<id -u>` the domain, each call that changes something
    where the callback hands them over, and an offset a pong moves only when its span proves it
    wrong, end both (`mic` and `late` in the suite; verified 2026-11-25 · a 200 s run, twenty
    full segments, then a restart, its one hole, and a 300 ms freeze with none);
-5. the plist by temp + rename (`wrote <path>`);
-6. the same plist already loaded and the release not re-signed this run: `kickstart -k`, the
-   swap; else the reload: booted out when loaded, then `bootstrap`;
-7. health polled every 100 ms until a daemon answers ready (after a swap, not the one it
+5. both plists by temp + rename (`wrote <path>`);
+6. the ear booted out when loaded, before the daemon is touched;
+7. the same daemon plist already loaded and the release not re-signed this run: `kickstart -k`,
+   the swap; else the reload: booted out when loaded, then `bootstrap`;
+8. health polled every 100 ms until a daemon answers ready (after a swap, not the one it
    replaced). None past `$RIFT_RELOAD_MS`: `<label> not ready <ms> ms after its load; loading it
    again`, the reload once more, then at most `$RIFT_READY_MS`: `<label> not ready <ms> ms after
    its load; see <root>/serve.err`, exit 1. launchd holds a kickstart's respawn until 10 s after
-   the last launch, so a swap soon after a load waits that out, inside the first budget.
+   the last launch, so a swap soon after a load waits that out, inside the first budget;
+9. the ear reloaded (never kickstarted), then step 8 for it with `ear-<host>` among the new
+   daemon's `devices` as ready and `<root>/ear.err` named: the old ear left before this daemon
+   started, so the one it lists is the one just loaded. Its failure is the line, exit 1, the
+   daemon serving; a daemon failure before it leaves the ear unloaded.
 
 Observed (observed 2026-11-25 · `/usr/bin/log show`, since zsh shadows `log`): the first upgrade
 onto a signing release re-signed it, then `kickstart -k`; launchd refused the spawn (`Launch
@@ -143,7 +158,7 @@ hand.
 After each bootout `launchctl print` is polled every 100 ms until it fails, at most
 `$RIFT_BOOTOUT_MS`: `<label> still loaded <ms> ms after its bootout`, exit 1. `setup --remove`
 first has hotswap forget the layout, its record and the upgrade agent (refused while a swap runs),
-then boots out every earlier install and `dev.gigantic.rift`, removes their plists,
+then boots out every earlier install, `dev.gigantic.rift.ear` and `dev.gigantic.rift`, removes their plists,
 `~/.local/bin/rift`, the keychain and its password as files (never `security delete-keychain`,
 which may ask to unlock it), and leaves the root alone. Idempotent.
 

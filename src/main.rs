@@ -28,7 +28,7 @@ use std::os::unix::fs::{
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::panic;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode, Output, Stdio, id};
+use std::process::{Command, ExitCode, Output, Stdio, exit, id};
 use std::str::FromStr;
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
@@ -285,6 +285,16 @@ fn hex(bytes: &[u8]) -> String {
     })
 }
 
+/// Whether `<kind>-<name>` is a track: an ear or a mouth, its name 1 to 64 ASCII letters, digits,
+/// `-` or `_` (docs/protocol.html#stream).
+fn well(kind: &str, name: &str) -> bool {
+    matches!(kind, "ear" | "mouth")
+        && (1..=64).contains(&name.len())
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_".contains(&byte))
+}
+
 /// The guard on `live`, a poisoned lock taken as it stands.
 fn lock(live: &Mutex<Live>) -> MutexGuard<'_, Live> {
     live.lock().unwrap_or_else(PoisonError::into_inner)
@@ -416,6 +426,18 @@ fn main() -> ExitCode {
                 eprintln!("rift device: --mic is macOS only; a file-fed device plays anywhere");
                 return ExitCode::from(2);
             }
+            // a stop signal ends the ear at once, wherever it waits, exit 0: it holds nothing an
+            // exit does not let go, and the daemon closes its segment as it goes
+            if mic {
+                drop(Signals::new([SIGHUP, SIGINT, SIGTERM]).map(|mut signals| {
+                    thread::spawn(move || {
+                        let signal = signals.forever().next().unwrap_or_default();
+                        let name = signal_name(signal).unwrap_or_default();
+                        drop(writeln!(io::stderr(), "rift device: stopped by {name}"));
+                        exit(0)
+                    })
+                }));
+            }
             // a device's file, read before it connects
             let pcm = match words
                 .get(3)
@@ -434,68 +456,73 @@ fn main() -> ExitCode {
                 let _: usize = reader.read_line(&mut line)?;
                 serde_json::from_str(&line).map_err(io::Error::other)
             };
-            // set once the request may have left: a failure after it is an unknown outcome
-            let sent = Cell::new(false);
-            let talk = || -> io::Result<(Value, Value, BufReader<UnixStream>)> {
-                let mut stream = UnixStream::connect(&sock)?;
-                stream.set_read_timeout(Some(Duration::from_secs(1)))?;
-                let mut reader = BufReader::new(stream.try_clone()?);
-                let hello =
-                    json!({"client": format!("rift/{VERSION}"), "op": "hello", "proto": PROTO});
-                writeln!(stream, "{hello}")?;
-                let greeting = answer(&mut reader)?;
-                let greeted = greeting["ok"] == true;
-                if greeted {
-                    sent.set(true);
-                    writeln!(stream, "{wanted}")?;
-                }
-                let reply = if greeted {
-                    answer(&mut reader)?
-                } else {
-                    Value::Null
+            let poll = Duration::from_millis(setting("RIFT_POLL_MS", 1000));
+            // an ear stands: whatever ends an attempt, it waits a poll and connects again
+            loop {
+                // set once the request may have left: a failure after it is an unknown outcome
+                let sent = Cell::new(false);
+                let talk = || -> io::Result<(Value, Value, BufReader<UnixStream>)> {
+                    let mut stream = UnixStream::connect(&sock)?;
+                    stream.set_read_timeout(Some(Duration::from_secs(1)))?;
+                    let mut reader = BufReader::new(stream.try_clone()?);
+                    let hello =
+                        json!({"client": format!("rift/{VERSION}"), "op": "hello", "proto": PROTO});
+                    writeln!(stream, "{hello}")?;
+                    let greeting = answer(&mut reader)?;
+                    let greeted = greeting["ok"] == true;
+                    if greeted {
+                        sent.set(true);
+                        writeln!(stream, "{wanted}")?;
+                    }
+                    let reply = if greeted {
+                        answer(&mut reader)?
+                    } else {
+                        Value::Null
+                    };
+                    Ok((greeting, reply, reader))
                 };
-                Ok((greeting, reply, reader))
-            };
-            match talk() {
-                Ok((hello, _, _)) if hello["code"] == "proto" => {
-                    eprintln!(
-                        "rift {verb}: the daemon speaks protocol {} ({}), this client protocol {PROTO} ({VERSION}); fix: rift setup, so both are one release",
-                        hello["proto"],
-                        hello["version"].as_str().unwrap_or_default()
-                    );
-                    ExitCode::FAILURE
-                }
-                Ok((hello, reply, mut reader)) if hello["ok"] == true => {
-                    if hello["version"] != VERSION {
+                let code = match talk() {
+                    Ok((hello, _, _)) if hello["code"] == "proto" => {
                         eprintln!(
-                            "rift {verb}: the daemon is {}, this client {VERSION}; fix: rift setup",
+                            "rift {verb}: the daemon speaks protocol {} ({}), this client protocol {PROTO} ({VERSION}); fix: rift setup, so both are one release",
+                            hello["proto"],
                             hello["version"].as_str().unwrap_or_default()
                         );
+                        ExitCode::FAILURE
                     }
-                    if verb == "device" && reply["ok"] == true {
-                        println!("{reply}");
-                        #[cfg(target_os = "macos")]
-                        if mic {
-                            return ear::run(reader, &reply, words.get(4).copied());
+                    Ok((hello, reply, mut reader)) if hello["ok"] == true => {
+                        if hello["version"] != VERSION {
+                            eprintln!(
+                                "rift {verb}: the daemon is {}, this client {VERSION}; fix: rift setup",
+                                hello["version"].as_str().unwrap_or_default()
+                            );
                         }
-                        let fast = words.len() == 5;
-                        // a reply carrying `ping` is answered with this device's clock
-                        let pong = |conn: &mut BufReader<UnixStream>, ping: &Value| {
-                            writeln!(
-                                conn.get_mut(),
-                                "{}",
-                                json!({"op": "pong", "ping": ping, "t": now()})
-                            )
-                        };
-                        let frames = pcm.chunks_exact(FRAME);
-                        // stamped from now in real time, or, sent as fast as accepted, ending now
-                        let mut base = now().saturating_sub(
-                            u64::try_from(frames.len())
-                                .unwrap_or_default()
-                                .saturating_mul(20_000)
-                                .saturating_mul(u64::from(fast)),
-                        );
-                        let played = pong(&mut reader, &reply["ping"]).and_then(|()| {
+                        if verb == "device" && reply["ok"] == true {
+                            println!("{reply}");
+                            #[cfg(target_os = "macos")]
+                            if mic {
+                                ear::run(reader, &reply, words.get(4).copied());
+                                thread::sleep(poll);
+                                continue;
+                            }
+                            let fast = words.len() == 5;
+                            // a reply carrying `ping` is answered with this device's clock
+                            let pong = |conn: &mut BufReader<UnixStream>, ping: &Value| {
+                                writeln!(
+                                    conn.get_mut(),
+                                    "{}",
+                                    json!({"op": "pong", "ping": ping, "t": now()})
+                                )
+                            };
+                            let frames = pcm.chunks_exact(FRAME);
+                            // stamped from now in real time, or, sent as fast as accepted, ending now
+                            let mut base = now().saturating_sub(
+                                u64::try_from(frames.len())
+                                    .unwrap_or_default()
+                                    .saturating_mul(20_000)
+                                    .saturating_mul(u64::from(fast)),
+                            );
+                            let played = pong(&mut reader, &reply["ping"]).and_then(|()| {
                             (0u64..).step_by(20_000).zip(frames).try_for_each(|(at, frame)| {
                                 // paced on the clock its pongs read; over 100 ms off it (a pause,
                                 // a sleep, a clock step) plays on from now, the gap a hole
@@ -530,40 +557,45 @@ fn main() -> ExitCode {
                                 })
                             })
                         });
-                        return played.map_or_else(
-                            |_| {
-                                println!("{}", error("unknown"));
-                                ExitCode::FAILURE
-                            },
-                            |()| ExitCode::SUCCESS,
-                        );
-                    }
-                    if matches!(verb, "feed" | "listen" | "read") && reply["ok"] == true {
-                        if reply["reset"] == true {
-                            eprintln!(
-                                "rift feed: the log does not hold that position; from this boot's first event"
+                            return played.map_or_else(
+                                |_| {
+                                    println!("{}", error("unknown"));
+                                    ExitCode::FAILURE
+                                },
+                                |()| ExitCode::SUCCESS,
                             );
                         }
-                        drop(reader.get_ref().set_read_timeout(None));
-                        drop(
-                            reader
-                                .lines()
-                                .map_while(Result::ok)
-                                .try_for_each(|line| writeln!(io::stdout(), "{line}")),
-                        );
-                        return ExitCode::SUCCESS;
+                        if matches!(verb, "feed" | "listen" | "read") && reply["ok"] == true {
+                            if reply["reset"] == true {
+                                eprintln!(
+                                    "rift feed: the log does not hold that position; from this boot's first event"
+                                );
+                            }
+                            drop(reader.get_ref().set_read_timeout(None));
+                            drop(
+                                reader
+                                    .lines()
+                                    .map_while(Result::ok)
+                                    .try_for_each(|line| writeln!(io::stdout(), "{line}")),
+                            );
+                            return ExitCode::SUCCESS;
+                        }
+                        println!("{reply}");
+                        ExitCode::from(u8::from(reply["ok"] != true))
                     }
-                    println!("{reply}");
-                    ExitCode::from(u8::from(reply["ok"] != true))
+                    Ok((refused, _, _)) => {
+                        println!("{refused}");
+                        ExitCode::FAILURE
+                    }
+                    Err(_) => {
+                        println!("{}", error(if sent.get() { "unknown" } else { "down" }));
+                        ExitCode::FAILURE
+                    }
+                };
+                if !mic {
+                    break code;
                 }
-                Ok((refused, _, _)) => {
-                    println!("{refused}");
-                    ExitCode::FAILURE
-                }
-                Err(_) => {
-                    println!("{}", error(if sent.get() { "unknown" } else { "down" }));
-                    ExitCode::FAILURE
-                }
+                thread::sleep(poll);
             }
         }
         (&["serve"], None) => {
@@ -870,14 +902,6 @@ fn main() -> ExitCode {
                         let id_ok = request["id"].is_null()
                             || request["id"].is_string()
                             || request["id"].is_number();
-                        // a track is `<kind>-<name>`
-                        let well = |kind: &str, name: &str| {
-                            matches!(kind, "ear" | "mouth")
-                                && (1..=64).contains(&name.len())
-                                && name.bytes().all(|byte| {
-                                    byte.is_ascii_alphanumeric() || b"-_".contains(&byte)
-                                })
-                        };
                         let track = request["track"].as_str().unwrap_or_default();
                         let tracked = track
                             .split_once('-')
@@ -1398,9 +1422,11 @@ fn main() -> ExitCode {
             // hotswap's link through its `current`, never this executable: a checkout's setup
             // wires the installed release
             let exe = home.join(".local/bin/rift");
-            let label = "dev.gigantic.rift";
-            let plist = format!(
-                r#"<?xml version="1.0" encoding="UTF-8"?>
+            let (label, ear) = ("dev.gigantic.rift", "dev.gigantic.rift.ear");
+            // an agent's plist: the link run with `said`, `keep` its KeepAlive, `err` its stderr
+            let sheet = |name: &str, said: &str, keep: &str, err: &str| {
+                format!(
+                    r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -1409,11 +1435,11 @@ fn main() -> ExitCode {
   <key>ExitTimeOut</key>
   <integer>3</integer>
   <key>KeepAlive</key>
-  <dict><key>SuccessfulExit</key><false/></dict>
+  {keep}
   <key>Label</key>
-  <string>{label}</string>
+  <string>{name}</string>
   <key>ProgramArguments</key>
-  <array><string>{}</string><string>serve</string></array>
+  <array><string>{}</string>{said}</array>
   <key>RunAtLoad</key>
   <true/>
   <key>StandardErrorPath</key>
@@ -1423,23 +1449,75 @@ fn main() -> ExitCode {
 </dict>
 </plist>
 "#,
-                root.display(),
-                exe.display(),
-                // beside run/, not in it: launchd creates the parent of this path 0744, which serve refuses
-                root.join("serve.err").display()
-            );
+                    root.display(),
+                    exe.display(),
+                    // beside run/, not in it: launchd creates the parent of this path 0744, which serve refuses
+                    root.join(err).display()
+                )
+            };
             let path = home.join(format!("Library/LaunchAgents/{label}.plist"));
+            let heard = path.with_file_name(format!("{ear}.plist"));
             let install = || -> io::Result<()> {
+                // a tool call past `$RIFT_SIGN_MS` is killed, since a keychain asking at the
+                // screen would hold setup forever
+                let allowed = Duration::from_millis(setting("RIFT_SIGN_MS", 30_000));
+                let ask = |name: &str, line: &[&str]| -> io::Result<Output> {
+                    let said = format!("{name} {}", line.first().unwrap_or(&""));
+                    let mut child = Command::new(name)
+                        .args(line)
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .spawn()
+                        .map_err(|cause| io::Error::other(format!("{said}: {cause}")))?;
+                    let begun = Instant::now();
+                    while child.try_wait()?.is_none() {
+                        if begun.elapsed() > allowed {
+                            drop(child.kill());
+                            return Err(io::Error::other(format!(
+                                "{said}: no answer in {} ms; is it asking at the screen?",
+                                allowed.as_millis()
+                            )));
+                        }
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    child.wait_with_output()
+                };
+                // the standing ear's track is this Mac's for good: its local host name, which
+                // Sharing sets and no network renames, lowercased
+                let host = ask("scutil", &["--get", "LocalHostName"])?;
+                let mac = String::from_utf8_lossy(&host.stdout)
+                    .trim()
+                    .to_ascii_lowercase();
+                if !host.status.success() || !well("ear", &mac) {
+                    return Err(io::Error::other(format!(
+                        "scutil --get LocalHostName gave {:?}, no track name (1 to 64 letters, digits, - or _)",
+                        String::from_utf8_lossy(&[host.stdout, host.stderr].concat()).trim()
+                    )));
+                }
+                let plist = sheet(
+                    label,
+                    "<string>serve</string>",
+                    "<dict><key>SuccessfulExit</key><false/></dict>",
+                    "serve.err",
+                );
+                let standing = sheet(
+                    ear,
+                    &format!(
+                        "<string>device</string><string>ear</string><string>{mac}</string><string>--mic</string>"
+                    ),
+                    "<true/>",
+                    "ear.err",
+                );
                 if words.contains(&"--print") {
-                    print!("{plist}");
+                    print!("{plist}{standing}");
                     return Ok(());
                 }
                 let uid = Command::new("id").arg("-u").output()?.stdout;
                 let gui = format!("gui/{}", String::from_utf8_lossy(&uid).trim());
-                let job = format!("{gui}/{label}");
                 let call = |line: &[&str]| {
                     Command::new("launchctl").args(line).output().map_err(|cause| {
-                        io::Error::other(format!("launchctl: {cause} (setup installs a launchd agent, macOS only; --print prints the plist)"))
+                        io::Error::other(format!("launchctl: {cause} (setup installs launchd agents, macOS only; --print prints their plists)"))
                     })
                 };
                 let must = |line: &[&str]| {
@@ -1514,38 +1592,9 @@ fn main() -> ExitCode {
                     .collect();
                 older.sort();
                 // rift's own keychain and code-signing identity (docs/index.html#identity), so a
-                // rebuild keeps the microphone's grant; a tool call past `$RIFT_SIGN_MS` is killed,
-                // since a keychain asking at the screen would hold setup forever
-                let (keychain, pass) = (
-                    root.join("rift.keychain-db"),
-                    root.join("rift.keychain-pass"),
-                );
-                let (kc, allowed) = (
-                    keychain.to_string_lossy(),
-                    Duration::from_millis(setting("RIFT_SIGN_MS", 30_000)),
-                );
-                let ask = |name: &str, line: &[&str]| -> io::Result<Output> {
-                    let said = format!("{name} {}", line.first().unwrap_or(&""));
-                    let mut child = Command::new(name)
-                        .args(line)
-                        .stdin(Stdio::null())
-                        .stdout(Stdio::piped())
-                        .stderr(Stdio::piped())
-                        .spawn()
-                        .map_err(|cause| io::Error::other(format!("{said}: {cause}")))?;
-                    let begun = Instant::now();
-                    while child.try_wait()?.is_none() {
-                        if begun.elapsed() > allowed {
-                            drop(child.kill());
-                            return Err(io::Error::other(format!(
-                                "{said}: no answer in {} ms; is it asking at the screen?",
-                                allowed.as_millis()
-                            )));
-                        }
-                        thread::sleep(Duration::from_millis(10));
-                    }
-                    child.wait_with_output()
-                };
+                // rebuild keeps the microphone's grant
+                let keychain = root.join("rift.keychain-db");
+                let (kc, pass) = (keychain.to_string_lossy(), root.join("rift.keychain-pass"));
                 let need = |name: &str, line: &[&str]| -> io::Result<()> {
                     let out = ask(name, line)?;
                     if !out.status.success() {
@@ -1564,6 +1613,8 @@ fn main() -> ExitCode {
                         unload(&agent.1)?;
                         gone(&agent.0);
                     }
+                    unload(ear)?;
+                    gone(&heard);
                     unload(label)?;
                     gone(&path);
                     gone(&exe);
@@ -1703,12 +1754,14 @@ security import "$1/identity.p12" -k "$3" -P "$2" -T /usr/bin/codesign"#,
                     .inspect_err(|_| drop(fs::remove_file(&copy)))?;
                     println!("signed {} as {label} by {hash}", target.display());
                 }
-                let staged = path.with_extension("plist.new");
                 path.parent().map_or(Ok(()), fs::create_dir_all)?;
-                fs::write(&staged, &plist)?;
-                fs::rename(&staged, &path)?;
-                println!("wrote {}", path.display());
-                // the pid of a daemon answering health ready on the socket, if one does
+                for (file, text) in [(&path, &plist), (&heard, &standing)] {
+                    let staged = file.with_extension("plist.new");
+                    fs::write(&staged, text)?;
+                    fs::rename(&staged, file)?;
+                    println!("wrote {}", file.display());
+                }
+                // the health of a daemon answering ready on the socket, if one does
                 let serving = || -> Option<Value> {
                     let mut stream = UnixStream::connect(&sock).ok()?;
                     stream.set_read_timeout(Some(Duration::from_secs(1))).ok()?;
@@ -1717,27 +1770,12 @@ security import "$1/identity.p12" -k "$3" -P "$2" -T /usr/bin/codesign"#,
                     writeln!(stream, "{hello}\n{}", json!({"op": "health"})).ok()?;
                     let reply: Value =
                         serde_json::from_str(&BufReader::new(stream).lines().nth(1)?.ok()?).ok()?;
-                    (reply["state"] == "ready").then(|| reply["pid"].clone())
-                };
-                let load = || -> io::Result<()> {
-                    unload(label)?;
-                    must(&["bootstrap", &gui, &path.to_string_lossy()])
-                };
-                // the same plist loaded and the release not re-signed: a swap is one kickstart;
-                // else it is loaded afresh, since launchd refused a kickstart onto a changed
-                // signature (AGENTS.md, observed 2026-11-25)
-                let before = if swap && !signed {
-                    let before = serving();
-                    must(&["kickstart", "-k", &job])?;
-                    before
-                } else {
-                    load()?;
-                    None
+                    (reply["state"] == "ready").then_some(reply)
                 };
                 // launchd holds a respawn until ThrottleInterval after the last launch: wait it out
-                let ready = |wait: Duration| {
+                let ready = |wait: Duration, done: &dyn Fn(&Value) -> bool| {
                     let begun = Instant::now();
-                    while !serving().is_some_and(|now| Some(now) != before) {
+                    while !serving().is_some_and(|health| done(&health)) {
                         if begun.elapsed() > wait {
                             return false;
                         }
@@ -1749,24 +1787,56 @@ security import "$1/identity.p12" -k "$3" -P "$2" -T /usr/bin/codesign"#,
                     Duration::from_millis(setting("RIFT_RELOAD_MS", 15_000)),
                     Duration::from_millis(setting("RIFT_READY_MS", 30_000)),
                 );
-                if ready(first) {
-                    return Ok(());
-                }
-                // a job launchd refused to spawn stays refused through any kickstart: loaded
-                // afresh, once
-                println!(
-                    "{label} not ready {} ms after its load; loading it again",
-                    first.as_millis()
-                );
-                load()?;
-                if ready(patience) {
-                    return Ok(());
-                }
-                Err(io::Error::other(format!(
-                    "{label} not ready {} ms after its load; see {}",
-                    patience.as_millis(),
-                    root.join("serve.err").display()
-                )))
+                // `name` kickstarted, else loaded afresh, then waited on until the daemon's
+                // health is `done`; a job launchd refused to spawn stays refused through any
+                // kickstart, so one not done past the first budget is loaded afresh, once
+                let up = |name: &str,
+                          file: &Path,
+                          err: &str,
+                          kick: bool,
+                          done: &dyn Fn(&Value) -> bool| {
+                    let load = || -> io::Result<()> {
+                        unload(name)?;
+                        must(&["bootstrap", &gui, &file.to_string_lossy()])
+                    };
+                    if kick {
+                        must(&["kickstart", "-k", &format!("{gui}/{name}")])?;
+                    } else {
+                        load()?;
+                    }
+                    if ready(first, done) {
+                        return Ok(());
+                    }
+                    println!(
+                        "{name} not ready {} ms after its load; loading it again",
+                        first.as_millis()
+                    );
+                    load()?;
+                    if ready(patience, done) {
+                        return Ok(());
+                    }
+                    Err(io::Error::other(format!(
+                        "{name} not ready {} ms after its load; see {}",
+                        patience.as_millis(),
+                        root.join(err).display()
+                    )))
+                };
+                // the ear out first, so the new daemon lists only the ear loaded after it
+                unload(ear)?;
+                // the same plist loaded and the release not re-signed: a swap is one kickstart;
+                // else it is loaded afresh, since launchd refused a kickstart onto a changed
+                // signature (AGENTS.md, observed 2026-11-25)
+                let before = serving().map(|health| health["pid"].clone());
+                up(label, &path, "serve.err", swap && !signed, &|health| {
+                    Some(&health["pid"]) != before.as_ref()
+                })?;
+                // the ear only once the daemon is up: whatever fails there leaves it serving
+                let track = json!(format!("ear-{mac}"));
+                up(ear, &heard, "ear.err", false, &|health| {
+                    health["devices"]
+                        .as_array()
+                        .is_some_and(|held| held.contains(&track))
+                })
             };
             install().map_or_else(
                 |cause| {
