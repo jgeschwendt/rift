@@ -2599,8 +2599,8 @@ esac
                 &[&["setup"], args].concat(),
             )
         };
-        // its own keychain and identity, so the release is signed again; the ear disabled by the
-        // owner, its plist written and never loaded
+        // its own keychain and identity, so the release is signed again; the ear disabled in
+        // launchd, its plist written and never loaded
         fs::write(format!("{root}/disabled"), "")?;
         let moving = format!("{}{}{}", rerun(&[], &[])?, calls()?, signs()?);
         fs::remove_file(format!("{root}/disabled"))?;

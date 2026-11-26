@@ -1874,7 +1874,7 @@ security import "$1/identity.p12" -k "$3" -P "$2" -T /usr/bin/codesign"#,
                     Some(&health["pid"]) != before.as_ref()
                 })?;
                 // the ear only once the daemon is up: whatever fails there leaves it serving. One
-                // the owner disabled is written, never loaded: the way to opt out
+                // disabled in launchd is written, never loaded: the way to opt out
                 if String::from_utf8_lossy(&call(&["print-disabled", &gui])?.stdout)
                     .contains(&format!("\"{ear}\" => disabled"))
                 {
