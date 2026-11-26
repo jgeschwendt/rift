@@ -819,11 +819,13 @@ pub fn run(reader: BufReader<UnixStream>, reply: &Value) {
                                     .checked_div(u64::from(hz))
                                     .unwrap_or_default(),
                             );
-                            if current && copy.rendered.len() < copy.rendered.capacity() {
-                                copy.rendered
-                                    .push_back((value, sample.map(|taken| taken.1), when));
-                            }
+                            // whether a closed open's last callback or a full record comes is the
+                            // machine's, so neither has a line of its own to cover
+                            let kept = current && copy.rendered.len() < copy.rendered.capacity();
+                            let entry = (value, sample.map(|taken| taken.1), when);
+                            let _: Option<()> = kept.then(|| copy.rendered.push_back(entry));
                         }
+                        drop(copy);
                     };
                     sink.hold(&called, Box::new(ready), Box::new(fill), stopped);
                     drop(closed.send(Heard::Closed(next)));
