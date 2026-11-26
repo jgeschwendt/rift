@@ -2917,18 +2917,28 @@ mod tests {
         same(&format!("{:?}", restarted.0.wait()?.code()), "Some(0)")
     }
 
-    /// Whether every turn line in `lines` comes after the frame holding its end, and the frames'
-    /// `t`s, in the order read.
+    /// Whether every turn line in `lines` comes after the frame holding its end, every voice line
+    /// after the frame holding its start (an off's, an end, as a turn's), and the frames' `t`s,
+    /// in the order read.
     fn ordered(lines: &[Value]) -> (bool, Vec<u64>) {
         let held = lines.iter().enumerate().all(|(index, got)| {
-            got.get("turn").is_none_or(|turn| {
-                lines.iter().take(index).any(|seen| {
-                    seen["t"].as_u64().is_some_and(|at| {
-                        turn["end"]
-                            .as_u64()
-                            .is_some_and(|stop| at < stop && stop <= at.saturating_add(20_000))
+            let (time, inside) = match (got.get("turn"), got.get("voice")) {
+                (Some(turn), _) => (&turn["end"], false),
+                (_, Some(voice)) => (&voice["start"], voice["on"] == true),
+                _ => return true,
+            };
+            lines.iter().take(index).any(|seen| {
+                seen["t"]
+                    .as_u64()
+                    .zip(time.as_u64())
+                    .is_some_and(|(at, mark)| {
+                        let end = at.saturating_add(20_000);
+                        if inside {
+                            at <= mark && mark < end
+                        } else {
+                            at < mark && mark <= end
+                        }
                     })
-                })
             })
         });
         (
@@ -3001,14 +3011,27 @@ mod tests {
             .copied()
             .chain(placed(&mut ear, base, 5..10)?)
             .collect();
-        // live: its frames, the turn line after the frame holding its end
+        // live: its frames, each voice line after the frame holding its start, the turn line
+        // after the frame holding its end, the voice's off before the turn it closes
         let live: Vec<Value> = iter::repeat_with(|| line(&mut words))
-            .take(11)
+            .take(13)
             .collect::<Result<_, _>>()?;
         let turned = json!({"turn": {"end": closed, "start": at(1)}});
+        let marks = |lines: &[Value]| -> Vec<Value> {
+            lines
+                .iter()
+                .filter(|got| got["t"].is_null())
+                .cloned()
+                .collect()
+        };
+        let spoken = [
+            json!({"voice": {"on": true, "start": at(1)}}),
+            json!({"voice": {"on": false, "start": closed}}),
+            turned,
+        ];
         same(
-            &format!("{:?} {}", ordered(&live), live.contains(&turned)),
-            &format!("{:?} true", (true, all.clone())),
+            &format!("{:?} {}", ordered(&live), json!(marks(&live))),
+            &format!("{:?} {}", (true, all.clone()), json!(spoken)),
         )?;
         // gone with its voice on: the voice, then its end
         same(
@@ -3032,16 +3055,22 @@ mod tests {
         drop(words);
         // its end logged, so the next words engine is not refused `taken`
         until(|| unlisted(&root, "ear-desk", "words"))?;
-        // replayed, here and after a restart: the turn after the frame holding its end
+        // replayed, here and after a restart: the same lines in the same places, and the voice
+        // left on
         let replayed = || -> Result<Vec<Value>, Box<dyn Error>> {
             let mut again = greet(&root)?;
             drop(line_after(&mut again, &engine("words", json!(at(0))))?);
-            iter::repeat_with(|| line(&mut again)).take(11).collect()
+            iter::repeat_with(|| line(&mut again)).take(14).collect()
         };
         let once = replayed()?;
+        let left = json!({"voice": {"on": true, "start": all[6]}});
         same(
-            &format!("{:?} {}", ordered(&once), once.contains(&turned)),
-            &format!("{:?} true", (true, all)),
+            &format!("{:?} {}", ordered(&once), json!(marks(&once))),
+            &format!(
+                "{:?} {}",
+                (true, all),
+                json!([&spoken[..], &[left]].concat())
+            ),
         )?;
         same(
             &say(&mut greet(&root)?, r#"{"op":"shutdown"}"#)?,

@@ -557,7 +557,10 @@
       waits until it has ruled on it. A words engine also reads each logged
       <code class="code">turn</code> on its track, <code class="code">{"turn":{"end":…,"start":…}}</code>,
       after the frame holding its <code class="code">end</code>, so it may finish a turn knowing it
-      has all of it. A turn line may come long after its end (a turn engine holding a turn it
+      has all of it, and each logged <code class="code">voice</code>,
+      <code class="code">{"voice":{"on":true,"start":…}}</code>, after the frame holding its
+      <code class="code">start</code> (an off's, the voice's end, as a turn's, before the turn it
+      closes), so it knows where speech is; replayed alike. A turn line may come long after its end (a turn engine holding a turn it
       found unfinished), so a words engine keeps its audio past a turn's end until the line or
       its own rule closes it. Word times are as fine as the engine can give: one without per-word
       times may spread them within its span. 1024 live lines unsent drop the engine, as a listener.</li>

@@ -16,7 +16,7 @@ mod mouth;
 mod speaker;
 mod tail;
 
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 use signal_hook::low_level::signal_name;
@@ -611,17 +611,34 @@ impl Live {
             .get(track)
             .map(|held| held.spans.clone())
             .unwrap_or_default();
-        let mut turns: Vec<(u64, u64)> = (marks.get("turn").into_iter().flatten())
-            .filter(|&&turn| words && turn.1 > since && turn > turned)
-            .copied()
+        // each turn and voice line by when it is due, the voices' before a turn due with them:
+        // a turn after the frame holding its end, a voice on after the frame holding its start,
+        // a voice off (an end) as a turn
+        let queued = |due: u64, rank: u64, said: Value| ((due, rank), format!("{said}\n"));
+        let voices = (marks.get("voice").into_iter().flatten()).flat_map(|&(on, off)| {
+            [
+                Some(queued(
+                    on.saturating_add(1),
+                    0,
+                    json!({"voice": {"on": true, "start": on}}),
+                )),
+                (off != u64::MAX)
+                    .then(|| queued(off, 0, json!({"voice": {"on": false, "start": off}}))),
+            ]
+        });
+        let mut turns: Vec<((u64, u64), String)> = (marks.get("turn").into_iter().flatten())
+            .map(|&(start, stop)| queued(stop, 1, json!({"turn": {"end": stop, "start": start}})))
+            .chain(voices.flatten())
+            .filter(|said| words && said.0.0 > since && said.0 > turned)
             .collect();
+        turns.sort();
         if spans.is_empty() && turns.is_empty() {
             return None;
         }
         let reach = (spans.iter())
             .map(|span| span.0.saturating_add(span.2.saturating_mul(20_000)))
             .fold(from, u64::max);
-        let next = (reach, since, turns.last().copied().unwrap_or(turned));
+        let next = (reach, since, turns.last().map_or(turned, |said| said.0));
         let root = self.root.clone();
         let frames = spans.into_iter().flat_map(move |(start, low, high, path)| {
             // the archive as it is set when the segment is read, the sweep having moved it
@@ -640,19 +657,14 @@ impl Live {
                 },
             )
         });
-        // before each frame the turns that ended by its start, the rest after the last
+        // before each frame the lines due by its start, the rest after the last
         let lines = frames.map(Some).chain([None]).flat_map(move |frame| {
             let due = match frame {
                 Some(Ok((at, _))) => at,
                 _ => u64::MAX,
             };
-            (turns.extract_if(.., |turn| turn.1 <= due))
-                .map(|(start, stop)| {
-                    Ok(format!(
-                        "{}\n",
-                        json!({"turn": {"end": stop, "start": start}})
-                    ))
-                })
+            (turns.extract_if(.., |said| said.0.0 <= due))
+                .map(|said| Ok(said.1))
                 .chain(frame.map(|held| held.map(|known| known.1)))
                 .collect::<Vec<_>>()
         });
@@ -775,19 +787,24 @@ impl Live {
                 if let Some(engine) = self.engines.get_mut(slot) {
                     engine.on ^= switched;
                 }
-                // a mask kept for the frames it covers, open until its off; a turn for the words
-                // engine's replays
-                if matches!(op, "mask" | "turn") {
+                // a mask kept for the frames it covers, open until its off; a turn and a voice,
+                // open until its off, for the words engine's replays
+                if op != "words" {
                     let held = self.tracks.entry(track.clone()).or_default();
                     let spans = held.spans.entry(op.to_owned()).or_default();
                     match spans.last_mut() {
-                        Some(open) if op == "mask" && on => open.1 = begun,
-                        _ => spans.push((begun, if op == "mask" { u64::MAX } else { reached })),
+                        Some(open) if switched && on => open.1 = begun,
+                        _ => spans.push((begun, if switched { u64::MAX } else { reached })),
                     }
                 }
-                // a turn's line to the words engine, after the frame holding its end
-                if op == "turn" {
-                    let line = json!({"turn": {"end": reached, "start": begun}});
+                // a turn's line and a voice's to the words engine, after the frame holding its
+                // end or start: its fields under its kind
+                if matches!(op, "turn" | "voice") {
+                    let mut line = json!({});
+                    line[op] = (fields.iter())
+                        .map(|&field| (field.to_owned(), request[field].clone()))
+                        .collect::<Map<_, _>>()
+                        .into();
                     self.fan(&format!("{track} turn"), &format!("{line}\n"));
                 }
                 Ok(json!({"ok": true, "seq": self.seq}))
@@ -1657,9 +1674,9 @@ fn main() -> ExitCode {
                     stall: Duration::from_millis(setting("RIFT_STALL_MS", 15_000)),
                     state: "ready",
                     sweeps,
-                    // the logged masks, each from its on to its off, and turns, the sweep cutting
-                    // those past the window
-                    tracks: of("mask").chain(of("turn")).fold(
+                    // the logged masks and voices, each from its on to its off, and turns, the
+                    // sweep cutting those past the window
+                    tracks: of("mask").chain(of("turn")).chain(of("voice")).fold(
                         BTreeMap::new(),
                         |mut tracks, span| {
                             let field = |key: &str| span[key].as_str().unwrap_or_default();
