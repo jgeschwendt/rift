@@ -502,7 +502,7 @@
   <header>
     <h2 class="h2">Engines</h2>
     <p class="docs-note">Served as far as <a href="index.html#engines">the slices</a> built: the
-      connection, its <code class="code">through</code> aside. An engine is a client that does one kind of work
+      connection and words. An engine is a client that does one kind of work
       on one track and reports results, which the daemon checks and logs as events
       (<a href="index.html#engines">the design</a>). Every op, field, event and code here is
       additive: <code class="code">proto</code> stays 1, and nothing above changes meaning.</p>
@@ -526,8 +526,9 @@
       kind and track held is refused <code class="code">taken</code>, as a device is.</li>
     <li><strong>No clock of its own.</strong> An engine is never pinged: every time it sends is one
       it read off what it was given, on the daemon's clock. A report naming a time past the end of
-      the last frame it was given, or before its last report's, is <code class="code">bad_request</code>
-      and logs nothing.</li>
+      the last frame it was given, or starting before the latest time its kind of report names on
+      that track (logged, any boot: a partial's the last final's end), is
+      <code class="code">bad_request</code> and logs nothing.</li>
     <li><strong>What a turn or words engine reads.</strong> Its track's frames,
       <code class="code">{"pcm":"…","t":1764000000000000}</code> as a reader's, from
       <code class="code">from</code>: replayed from disk, then live, one gapless, duplicate-free

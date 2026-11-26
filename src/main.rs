@@ -74,6 +74,8 @@ static STOP: OnceLock<String> = OnceLock::new();
 
 /// An engine: a client doing one kind of work on one track (docs/protocol.html#engines).
 struct Engine {
+    /// Where the last frame it was given ends: a report naming a time past it is refused.
+    given: u64,
     /// Its name.
     name: String,
 }
@@ -121,6 +123,9 @@ struct Live {
     held: Vec<Value>,
     /// The last connection key handed out.
     keys: u64,
+    /// The latest time each track's logged reports of each kind name, any boot: a `words`,
+    /// `turn` or `mask` its end, a `voice` its start; a report before it is refused.
+    latest: BTreeMap<(String, String), u64>,
     /// The last play's number, across every boot.
     numbered: u64,
     /// Each open play, by its mouth's track.
@@ -302,6 +307,20 @@ impl Live {
         reply
     }
 
+    /// Passes the frame placed on `track` at `at` to its turn and words engines, which read the
+    /// frames it has had since the times they asked from.
+    fn hear(&mut self, track: &str, at: u64, pcm: &str) {
+        for kind in ["turn", "words"] {
+            if let Some(engine) = self.engines.get_mut(&(track.to_owned(), kind.to_owned())) {
+                engine.given = at.saturating_add(20_000);
+            }
+        }
+        self.fan(
+            &format!("{track} heard"),
+            &format!("{}\n", json!({"pcm": pcm, "t": at})),
+        );
+    }
+
     /// The hello reply.
     fn hello(&self) -> Value {
         json!({"boot": self.boot, "ok": true, "pid": id(), "proto": PROTO, "since": self.since, "state": self.state, "version": VERSION})
@@ -330,6 +349,10 @@ impl Live {
             .cloned()
             .collect();
         for slot in gone {
+            // a words engine's partials readers end with it
+            let partials = format!("{} partial", slot.0);
+            self.feeds
+                .retain(|feed| slot.1 != "words" || feed.2 != partials);
             let name = self.engines.remove(&slot).map(|engine| engine.name);
             drop(self.emit(&json!({"kind": "engine", "name": name, "on": false, "stage": slot.1, "track": slot.0})));
         }
@@ -340,6 +363,101 @@ impl Live {
     const fn mark<T>(&mut self, wrote: io::Result<T>) -> io::Result<T> {
         self.state = if wrote.is_ok() { "ready" } else { "degraded" };
         wrote
+    }
+
+    /// `track`'s frames on disk from `from` on, each segment read as the replay reaches it, and
+    /// where the last ends: a turn or words engine's replay, the live frames joined after it.
+    fn replay(&self, track: &str, from: u64) -> (Box<dyn Iterator<Item = String> + Send>, u64) {
+        let mut spans: Vec<(u64, u64, PathBuf)> = (self.segments(track).iter())
+            .filter(|held| end(held) > from)
+            .map(|held| {
+                let count = held["samples"].as_u64().unwrap_or_default();
+                (
+                    held["start"].as_u64().unwrap_or_default(),
+                    count.checked_div(320).unwrap_or_default(),
+                    self.root.join(held["path"].as_str().unwrap_or_default()),
+                )
+            })
+            .collect();
+        spans.sort();
+        let given = (spans.iter())
+            .map(|span| span.0.saturating_add(span.1.saturating_mul(20_000)))
+            .max()
+            .unwrap_or_default();
+        let frames = spans.into_iter().flat_map(move |(start, count, path)| {
+            (fs::read(path).unwrap_or_default().chunks_exact(FRAME))
+                .take(usize::try_from(count).unwrap_or_default())
+                .zip((start..).step_by(20_000))
+                .filter(|&(_, at)| at.saturating_add(20_000) > from)
+                .map(|(pcm, at)| format!("{}\n", json!({"pcm": hex(pcm), "t": at})))
+                .collect::<Vec<_>>()
+        });
+        (Box::new(frames), given)
+    }
+
+    /// `slot`'s engine's report, checked and acted on (docs/protocol.html#engines): its reply, else
+    /// `bad_request` and nothing logged. A span starts on or after the latest of its kind and ends
+    /// no later than the last frame the engine was given; words rise inside it.
+    fn report(&mut self, slot: &(String, String), request: &Value) -> io::Result<Value> {
+        let (track, op) = (&slot.0, request["op"].as_str().unwrap_or_default());
+        let (first, last) = (request["start"].as_u64(), request["end"].as_u64());
+        let (latest, (given, name)) = (
+            (self
+                .latest
+                .get(&(track.clone(), op.replace("partial", "words"))))
+            .copied()
+            .unwrap_or_default(),
+            (self.engines.get(slot))
+                .map(|engine| (engine.given, engine.name.clone()))
+                .unwrap_or_default(),
+        );
+        let timed = first
+            .zip(last)
+            .is_some_and(|(start, end)| latest <= start && start <= end && end <= given);
+        let mut reach = first.unwrap_or_default();
+        let worded = request["words"].as_array().is_some_and(|said| {
+            said.iter().all(|word| {
+                let span =
+                    (word["start"].as_u64().zip(word["end"].as_u64())).filter(|&(start, end)| {
+                        reach <= start
+                            && start <= end
+                            && Some(end) <= last
+                            && word["text"].is_string()
+                    });
+                reach = span.map_or(u64::MAX, |held| held.1);
+                span.is_some()
+            })
+        });
+        let heard = json!({"end": last, "engine": name, "start": first, "track": track, "words": request["words"]});
+        match (slot.1.as_str(), op) {
+            ("words", "partial") if timed && worded => {
+                self.fan(&format!("{track} partial"), &format!("{heard}\n"));
+                Ok(json!({"ok": true}))
+            }
+            ("words", "words") if timed && worded => {
+                let mut event = heard;
+                event["kind"] = op.into();
+                drop(self.emit(&event)?);
+                let _: Option<u64> = self
+                    .latest
+                    .insert((track.clone(), op.to_owned()), last.unwrap_or_default());
+                Ok(json!({"ok": true, "seq": self.seq}))
+            }
+            _ => Ok(error("bad_request")),
+        }
+    }
+
+    /// `track`'s segments on disk, as their events: the closed ones still under `audio/`, then
+    /// the open one as it stands.
+    fn segments(&self, track: &str) -> Vec<Value> {
+        let open = (self.tracks.get(track).and_then(|held| held.open)).map(|(num, start, written)| {
+            json!({"path": format!("audio/{}/{track}/{num}.pcm", self.boot), "samples": written, "start": start, "track": track})
+        });
+        (self.held.iter().map(|event| &event["e"]))
+            .chain(open.as_ref())
+            .filter(|held| held["track"] == track)
+            .cloned()
+            .collect()
     }
 
     /// Ends `mouth` every play whose mouth owes progress (its play's end after `end`, or given
@@ -1054,6 +1172,30 @@ fn main() -> ExitCode {
                         .map(|&event| event.clone())
                         .collect(),
                     keys: 0,
+                    // reports rise, so each kind's last logged is its latest
+                    latest: held_events
+                        .iter()
+                        .map(|event| &event["e"])
+                        .filter(|event| {
+                            matches!(
+                                event["kind"].as_str(),
+                                Some("mask" | "turn" | "voice" | "words")
+                            )
+                        })
+                        .map(|event| {
+                            (
+                                (
+                                    event["track"].as_str().unwrap_or_default().to_owned(),
+                                    event["kind"].as_str().unwrap_or_default().to_owned(),
+                                ),
+                                // a voice's start, every other kind's end
+                                event["end"]
+                                    .as_u64()
+                                    .max(event["start"].as_u64())
+                                    .unwrap_or_default(),
+                            )
+                        })
+                        .collect(),
                     numbered: last("play")
                         .map_or(0, |play| play["play"].as_u64().unwrap_or_default()),
                     plays: BTreeMap::new(),
@@ -1359,15 +1501,24 @@ fn main() -> ExitCode {
                             (
                                 true,
                                 Some(
-                                    "device" | "engine" | "feed" | "hush" | "listen" | "play"
-                                    | "read",
+                                    "device" | "engine" | "feed" | "hush" | "listen" | "partials"
+                                    | "play" | "read",
                                 ),
                             ) if device.is_some() => (Ok(error("bad_request")), Next::Go),
                             (true, Some(op)) if giving.is_some() && op != "give" && op != "end" => {
                                 (Ok(error("bad_request")), Next::Go)
                             }
-                            (true, Some(_)) if engaged.is_some() => {
-                                (Ok(error("bad_request")), Next::Go)
+                            (true, Some(_)) if engaged.is_some() => (
+                                guard.report(&engaged.clone().unwrap_or_default(), &request),
+                                Next::Go,
+                            ),
+                            (true, Some("engine"))
+                                if request["from"].as_u64().is_some_and(|from| {
+                                    from < now()
+                                        .saturating_sub(guard.window.saturating_mul(1_000_000))
+                                }) =>
+                            {
+                                (Ok(error("gone")), Next::Go)
                             }
                             (true, Some("engine"))
                                 if role.is_some_and(|(kind, _)| {
@@ -1385,21 +1536,47 @@ fn main() -> ExitCode {
                                 match on {
                                     Ok(_) => {
                                         let slot = (track.to_owned(), kind.to_owned());
-                                        drop(guard.engines.insert(
-                                            slot.clone(),
-                                            Engine {
-                                                name: name.to_owned(),
-                                            },
-                                        ));
+                                        // a turn or words engine's frames: from disk from its
+                                        // `from` (none for live), then live as each is placed
+                                        let (backlog, reach) = guard.replay(
+                                            track,
+                                            request["from"].as_u64().unwrap_or(u64::MAX),
+                                        );
                                         let mut reply = json!({"ok": true, "seq": guard.seq});
                                         if !request["id"].is_null() {
                                             reply["id"] = request["id"].clone();
                                         }
+                                        if matches!(kind, "turn" | "words") {
+                                            let latest = |what: &str| {
+                                                guard
+                                                    .latest
+                                                    .get(&(track.to_owned(), what.to_owned()))
+                                                    .copied()
+                                            };
+                                            // a turn engine's: its turns' and its voice's
+                                            reply["through"] = latest(kind)
+                                                .max(latest(&kind.replace("turn", "voice")))
+                                                .into();
+                                            guard.feeds.push((
+                                                sender.clone(),
+                                                key,
+                                                format!("{track} heard"),
+                                            ));
+                                        }
+                                        drop(guard.engines.insert(
+                                            slot.clone(),
+                                            Engine {
+                                                given: reach,
+                                                name: name.to_owned(),
+                                            },
+                                        ));
                                         (queue, engaged) = (Some(sender), Some(slot));
                                         (
                                             Ok(Value::Null),
                                             Next::Device(
-                                                Box::new(iter::once(format!("{reply}\n"))),
+                                                Box::new(
+                                                    iter::once(format!("{reply}\n")).chain(backlog),
+                                                ),
                                                 incoming,
                                             ),
                                         )
@@ -1561,13 +1738,12 @@ fn main() -> ExitCode {
                                             if full >= state.segment {
                                                 drop(state.close(Some(&name)));
                                             }
+                                            let sound = hex(&bytes);
                                             state.fan(
                                                 &name,
-                                                &format!(
-                                                    "{}\n",
-                                                    json!({"pcm": hex(&bytes), "t": start})
-                                                ),
+                                                &format!("{}\n", json!({"pcm": sound, "t": start})),
                                             );
+                                            state.hear(&name, start, &sound);
                                             let mut reply = json!({"ok": true, "t": start});
                                             if pinged.elapsed() >= every {
                                                 (reply["ping"], pinged) =
@@ -1771,6 +1947,23 @@ fn main() -> ExitCode {
                                     });
                                 (kept, Next::Go)
                             }
+                            // a words engine's partials, live, until it leaves
+                            (true, Some("partials"))
+                                if tracked
+                                    && !guard
+                                        .engines
+                                        .contains_key(&(track.to_owned(), "words".to_owned())) =>
+                            {
+                                (Ok(error("absent")), Next::Go)
+                            }
+                            (true, Some("partials")) if tracked => {
+                                let (sender, incoming) = mpsc::sync_channel(BEHIND);
+                                guard.feeds.push((sender, key, format!("{track} partial")));
+                                (
+                                    Ok(json!({"ok": true})),
+                                    Next::Feed(Box::new(iter::empty()), incoming),
+                                )
+                            }
                             (true, Some("listen")) if tracked => {
                                 let (sender, incoming) = mpsc::sync_channel(BEHIND);
                                 guard.feeds.push((sender, key, track.to_owned()));
@@ -1833,15 +2026,9 @@ fn main() -> ExitCode {
                                                 .min(clock_now),
                                         ),
                                     );
-                                    let open = guard.tracks.get(track).and_then(|held| held.open).map(|(num, start, written)| {
-                                        json!({"path": format!("audio/{}/{track}/{num}.pcm", guard.boot), "samples": written, "start": start, "track": track})
-                                    });
                                     let mut spans: Vec<(u64, PathBuf)> = guard
-                                        .held
+                                        .segments(track)
                                         .iter()
-                                        .map(|event| &event["e"])
-                                        .chain(open.as_ref())
-                                        .filter(|held| held["track"] == track)
                                         .map(|held| {
                                             (
                                                 samples(held["start"].as_u64().unwrap_or_default()),
@@ -1958,8 +2145,8 @@ fn main() -> ExitCode {
                                 true,
                                 Some(
                                     "device" | "done" | "ears" | "end" | "engine" | "feed"
-                                    | "frame" | "give" | "hush" | "keep" | "listen" | "play"
-                                    | "pong" | "quiet" | "read" | "sound",
+                                    | "frame" | "give" | "hush" | "keep" | "listen" | "partials"
+                                    | "play" | "pong" | "quiet" | "read" | "sound",
                                 )
                                 | None,
                             ) => (Ok(error("bad_request")), Next::Go),

@@ -2550,7 +2550,7 @@ mod tests {
         let mut transcribe = greet(&root)?;
         same(
             &say(&mut transcribe, words)?,
-            r#"{"id":7,"ok":true,"seq":2}"#,
+            r#"{"id":7,"ok":true,"seq":2,"through":null}"#,
         )?;
         same(
             &say(&mut greet(&root)?, words)?,
@@ -2605,6 +2605,199 @@ mod tests {
         )?;
         drop((ear, aloud, probe));
         same(&format!("{:?}", daemon.0.wait()?.code()), "Some(0)")
+    }
+
+    /// The next line on `conn`, parsed.
+    fn line(conn: &mut BufReader<UnixStream>) -> Result<Value, Box<dyn Error>> {
+        Ok(serde_json::from_str(&next(conn)?)?)
+    }
+
+    /// A words engine, the suite as it and as its ear (docs/protocol.html#engines): `absent`
+    /// partials with none; frames from a `from` inside the window, replayed from disk across a
+    /// hole, then live, each placed frame once and in order; finals logged with the values sent,
+    /// one overlapping, out of order, past the last frame given or with a word out of its span
+    /// refused and unlogged; a partial reaching a `partials` reader, never the log, the reader
+    /// ended as the engine leaves; a reconnect's `through` the last final's end; `gone` before
+    /// the window; an engine dropped mid-stream leaving a file-fed ear's every frame answered and
+    /// its segments' samples summing to what it sent.
+    #[test]
+    fn words() -> Outcome {
+        let root = temp("words")?;
+        let (mut daemon, _) = serve(
+            &root,
+            &[("RIFT_PING_MS", "86400000"), ("RIFT_SEGMENT_MS", "100")],
+        )?;
+        drop(rift(&root, &[], &["ears", "on"])?);
+        let partials = r#"{"op":"partials","track":"ear-desk"}"#;
+        let mut probe = greet(&root)?;
+        same(&say(&mut probe, partials)?, &code("absent"))?;
+        let (mut ear, hi) = device(&root, r#"{"kind":"ear","name":"desk","op":"device"}"#, 0)?;
+        let base = hi["ping"].as_u64().unwrap_or_default() - 2_000_000;
+        let mut send = |range: &[u64]| -> Result<Vec<Value>, Box<dyn Error>> {
+            range
+                .iter()
+                .map(|&index| -> Result<Value, Box<dyn Error>> {
+                    Ok(frame(&mut ear, base + index * 20_000, u8::try_from(index)?)?["t"].clone())
+                })
+                .collect()
+        };
+        // seven frames, a 100 ms hole, five more; then an engine from inside the first, then five live
+        let mut placed = send(&[0, 1, 2, 3, 4, 5, 6, 12, 13, 14, 15, 16])?;
+        let first = placed[0].as_u64().unwrap_or_default();
+        let words = |from: Value| {
+            json!({"from": from, "kind": "words", "name": "transcribe", "op": "engine", "track": "ear-desk"}).to_string()
+        };
+        same(&say(&mut greet(&root)?, &words(json!(1u8)))?, &code("gone"))?;
+        let mut engine = greet(&root)?;
+        let reply = serde_json::from_str::<Value>(&say(&mut engine, &words(json!(first + 1)))?)?;
+        same(&reply["through"].to_string(), "null")?;
+        placed.extend(send(&[17, 18, 19, 20, 21])?);
+        let read: Vec<Value> = iter::repeat_with(|| line(&mut engine))
+            .take(placed.len())
+            .collect::<Result<_, _>>()?;
+        same(
+            &json!(read.iter().map(|got| got["t"].clone()).collect::<Vec<_>>()).to_string(),
+            &json!(placed).to_string(),
+        )?;
+        same(
+            &read
+                .iter()
+                .zip([
+                    0u8, 1, 2, 3, 4, 5, 6, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21,
+                ])
+                .all(|(got, fill)| got["pcm"] == format!("{fill:02x}").repeat(640))
+                .to_string(),
+            "true",
+        )?;
+        same(
+            &format!(
+                "{} {}",
+                placed[7].as_u64().unwrap_or_default() - placed[6].as_u64().unwrap_or_default(),
+                placed[1].as_u64().unwrap_or_default() - first
+            ),
+            "120000 20000",
+        )?;
+        // a final, then the refused; a partial to its reader alone
+        let end = placed[16].as_u64().unwrap_or_default() + 20_000;
+        let mut reader = greet(&root)?;
+        same(&say(&mut reader, partials)?, r#"{"ok":true}"#)?;
+        let final_words =
+            json!([{"end": first + 40_000, "start": first + 10_000, "text": "hello"}]);
+        let report = |op: &str, start: u64, stop: u64, said: &Value| {
+            json!({"end": stop, "op": op, "start": start, "words": said}).to_string()
+        };
+        let logged = serde_json::from_str::<Value>(&say(
+            &mut engine,
+            &report("words", first, first + 60_000, &final_words),
+        )?)?;
+        for line in [
+            report("words", first + 40_000, first + 80_000, &json!([])),
+            report("words", first + 80_000, first + 60_000, &json!([])),
+            report("words", first + 60_000, end + 1, &json!([])),
+            report(
+                "words",
+                first + 60_000,
+                end,
+                &json!([{"end": end + 1, "start": end, "text": "x"}]),
+            ),
+            report(
+                "words",
+                first + 60_000,
+                end,
+                &json!([{"end": end, "start": end, "text": 1u8}]),
+            ),
+            report(
+                "words",
+                first + 60_000,
+                end,
+                &json!([{"end": end, "start": end - 10, "text": "b"}, {"end": end - 5, "start": end - 20, "text": "a"}]),
+            ),
+            report("words", first + 60_000, end, &json!("x")),
+            report("partial", first, end, &json!([])),
+            r#"{"op":"turn","start":1,"end":2}"#.to_owned(),
+        ] {
+            same(&say(&mut engine, &line)?, &code("bad_request"))?;
+        }
+        let guess = json!([{"end": end, "start": end - 20_000, "text": "the"}]);
+        same(
+            &say(&mut engine, &report("partial", first + 60_000, end, &guess))?,
+            r#"{"ok":true}"#,
+        )?;
+        same(
+            &next(&mut reader)?,
+            &json!({"end": end, "engine": "transcribe", "start": first + 60_000, "track": "ear-desk", "words": guess}).to_string(),
+        )?;
+        same(
+            &kinds(&root, "words", usize::MAX)?,
+            &json!({"end": first + 60_000, "engine": "transcribe", "kind": "words", "track": "ear-desk", "words": final_words}).to_string(),
+        )?;
+        let seq = events(&root)?
+            .iter()
+            .find(|event| event["e"]["kind"] == "words")
+            .map_or(Value::Null, |event| event["seq"].clone());
+        same(
+            &logged.to_string(),
+            &json!({"ok": true, "seq": seq}).to_string(),
+        )?;
+        // gone, its reader ended; back from where it left off
+        drop(engine);
+        same(&next(&mut reader)?, "")?;
+        let mut again = greet(&root)?;
+        same(
+            &serde_json::from_str::<Value>(&say(&mut again, &words(Value::Null))?)?["through"]
+                .to_string(),
+            &(first + 60_000).to_string(),
+        )?;
+        drop((again, ear, reader));
+        // an engine dropped mid-stream takes nothing from a file-fed ear
+        let file = format!("{root}/fed.pcm");
+        fs::write(&file, vec![7u8; 640 * 250])?;
+        let mut fed = greet(&root)?;
+        drop(say(
+            &mut fed,
+            r#"{"from":null,"kind":"words","name":"w","op":"engine","track":"ear-fed"}"#,
+        )?);
+        let (at, path) = (root.clone(), file);
+        let feeding = thread::spawn(move || {
+            rift(&at, &[], &["device", "ear", "fed", &path, "--fast"])
+                .map_err(|cause| cause.to_string())
+        });
+        drop(line(&mut fed)?);
+        drop(fed);
+        // its reply alone printed: no frame refused
+        let out = feeding.join().map_err(|_panic| "the device panicked")??;
+        same(
+            &format!(
+                "{} {}",
+                out.starts_with("0\n{\"ears\":true,\"ok\":true"),
+                out.lines().count()
+            ),
+            "true 2",
+        )?;
+        same(&say(&mut probe, r#"{"op":"shutdown"}"#)?, r#"{"ok":true}"#)?;
+        same(&format!("{:?}", daemon.0.wait()?.code()), "Some(0)")?;
+        same(
+            &events(&root)?
+                .iter()
+                .filter(|event| event["e"]["kind"] == "segment" && event["e"]["track"] == "ear-fed")
+                .map(|event| event["e"]["samples"].as_u64().unwrap_or_default())
+                .sum::<u64>()
+                .to_string(),
+            "80000",
+        )?;
+        // `through` holds across a restart
+        let (mut restarted, _) = serve(&root, &[])?;
+        let mut later = greet(&root)?;
+        same(
+            &serde_json::from_str::<Value>(&say(&mut later, &words(Value::Null))?)?["through"]
+                .to_string(),
+            &(first + 60_000).to_string(),
+        )?;
+        same(
+            &say(&mut greet(&root)?, r#"{"op":"shutdown"}"#)?,
+            r#"{"ok":true}"#,
+        )?;
+        same(&format!("{:?}", restarted.0.wait()?.code()), "Some(0)")
     }
 
     /// The daemon's clock now, in microseconds since the epoch.
