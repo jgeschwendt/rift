@@ -142,6 +142,12 @@ struct Live {
     quiet: bool,
     /// The state root; `events.ndjson` and the segments under `audio/` are its durable state.
     root: PathBuf,
+    /// Each mouth's last say to end, by its track: its last line, its client's and its hush's.
+    said: BTreeMap<String, Value>,
+    /// The last say's number, across every boot.
+    sayings: u64,
+    /// Each open say, by its mouth's track.
+    says: BTreeMap<String, Say>,
     /// A segment's length in samples, whole frames.
     segment: u64,
     /// The last event's `seq` in this boot.
@@ -183,6 +189,26 @@ struct Play {
     rate: u64,
     /// The run under way: its first sample, its samples so far and when the first sounded.
     run: Option<(u64, u64, u64)>,
+}
+
+/// A say: text a client gives for a mouth, which its speech engine speaks through a play of its
+/// own (docs/protocol.html#engines).
+struct Say {
+    /// Its client's connection key.
+    client: u64,
+    /// Whether its client sent `end`.
+    end: bool,
+    /// Why it ends when not as its play does: a hush, its client or its engine gone, quiet, the
+    /// drain or its mouth gone before it had a play.
+    hushed: Option<&'static str>,
+    /// Its marks, rising: by its play's sample `.0`, its first `.1` characters had sounded.
+    marks: Vec<(u64, u64)>,
+    /// Its number.
+    num: u64,
+    /// Its play, once opened.
+    play: Option<u64>,
+    /// All it was given.
+    text: String,
 }
 
 /// A track, one device's sound on the daemon's clock, in this boot.
@@ -228,6 +254,47 @@ impl Live {
         }
         self.sweep();
         Ok(())
+    }
+
+    /// Ends each open say `pick` takes, by its mouth, `reason` its play's (or its own end's) unless
+    /// it was hushed first: `spoken` logged, its whole text when its play ran to its end, else as
+    /// far as its largest mark under `played`; its last line kept for its client, whose read side
+    /// is shut; its engine told to stop unless it spoke to its end.
+    fn conclude(
+        &mut self,
+        reason: &str,
+        played: Option<u64>,
+        pick: &mut dyn FnMut(&String, &mut Say) -> bool,
+    ) {
+        let ended: Vec<(String, Say)> = self.says.extract_if(.., pick).collect();
+        for (track, say) in ended {
+            let why = say.hushed.unwrap_or(reason);
+            let spoken = if why == "end" && played.is_some() {
+                say.text.chars().count()
+            } else {
+                (say.marks.iter())
+                    .filter(|mark| Some(mark.0) <= played)
+                    .map(|mark| usize::try_from(mark.1).unwrap_or_default())
+                    .max()
+                    .unwrap_or_default()
+            };
+            let mut last = json!({"kind": "spoken", "play": say.play, "reason": why, "say": say.num, "spoken": spoken, "text": say.text, "track": track});
+            drop(self.emit(&last));
+            if let Some(fields) = last.as_object_mut() {
+                drop(fields.remove("kind"));
+                drop(fields.insert("seq".to_owned(), self.seq.into()));
+            }
+            drop(self.said.insert(track.clone(), last));
+            drop(
+                self.conns
+                    .get(&say.client)
+                    .map(|conn| conn.shutdown(Shutdown::Read)),
+            );
+            if why != "end" {
+                let line = json!({"hush": say.num});
+                self.fan(&format!("{track} say"), &format!("{line}\n"));
+            }
+        }
     }
 
     /// Appends `event` to the log as this boot's next `seq` (the file opened, written whole and
@@ -285,6 +352,10 @@ impl Live {
             "runs",
             &format!("{}\n", json!({"played": num, "track": track})),
         );
+        // a say's play over, the say is
+        self.conclude(reason, Some(played), &mut |mouth, say| {
+            mouth == track && say.play == Some(num)
+        });
         SLACK.notify_all();
     }
 
@@ -379,6 +450,12 @@ impl Live {
             drop(self.emit(&json!({"kind": "engine", "name": name, "on": false, "stage": slot.1, "track": slot.0})));
             // an echo engine gone, its held frames go on unruled: the stage fails open
             self.release(&slot.0);
+            // a speech engine gone, its say ends `engine`, its play hushed
+            let playing = (self.says.get(&slot.0)).is_some_and(|say| say.play.is_some());
+            self.unsay(Some(&slot.0), "engine");
+            if playing {
+                self.hush(&slot.0, "hush");
+            }
         }
     }
 
@@ -532,7 +609,32 @@ impl Live {
             event[field] = request[field].clone();
         }
         let (begun, reached) = (first.unwrap_or_default(), last.unwrap_or_default());
+        // a speech engine's say, open on its mouth: done after its end with no play coming; a
+        // mark rising, no further than the text given
+        let saying = (self.says.get(track)).filter(|say| Some(say.num) == request["say"].as_u64());
+        let done = saying.is_some_and(|say| say.end && say.play.is_none());
+        let mark = (request["samples"].as_u64().zip(request["text"].as_u64())).filter(
+            |&(samples, text)| {
+                saying.is_some_and(|say| {
+                    let (low, few) = say.marks.last().copied().unwrap_or_default();
+                    samples >= low
+                        && text >= few
+                        && usize::try_from(text)
+                            .is_ok_and(|count| count <= say.text.chars().count())
+                })
+            },
+        );
         match (slot.1.as_str(), op) {
+            ("speech", "done") if done => {
+                self.conclude("end", None, &mut |mouth, _| mouth == track);
+                Ok(json!({"ok": true}))
+            }
+            ("speech", "mark") if mark.is_some() => {
+                if let Some(say) = self.says.get_mut(track) {
+                    say.marks.extend(mark);
+                }
+                Ok(json!({"ok": true}))
+            }
             ("echo", "ruled") if timed => {
                 if let Some(engine) = self.engines.get_mut(slot) {
                     engine.ruled = reached;
@@ -630,6 +732,16 @@ impl Live {
     /// leaves.
     fn tell(&mut self, track: &str, line: &Value) {
         self.fan(&format!("{track}>"), &format!("{line}\n"));
+    }
+
+    /// Ends the open say of `only`, else of every mouth, for `reason`, kept before its play's: at
+    /// once when it has no play, else as its play ends, which the caller hushes.
+    fn unsay(&mut self, only: Option<&str>, reason: &'static str) {
+        self.conclude(reason, None, &mut |mouth, say| {
+            let picked = only.is_none_or(|one| one == mouth);
+            say.hushed = say.hushed.or_else(|| picked.then_some(reason));
+            picked && say.play.is_none()
+        });
     }
 }
 
@@ -1324,6 +1436,18 @@ fn main() -> ExitCode {
                         (&event["play"], &event["track"], sounded.sum())
                     })
                     .collect();
+                // each say the log holds without its end, its play if it had one; its marks were
+                // never logged, so none of it is known to have sounded
+                let spoke: BTreeSet<u64> = of("spoken")
+                    .filter_map(|event| event["say"].as_u64())
+                    .collect();
+                let unsaid: Vec<Value> = of("say")
+                    .filter(|event| !event["say"].as_u64().is_some_and(|num| spoke.contains(&num)))
+                    .map(|event| {
+                        let play = of("play").find(|play| play["say"] == event["say"]);
+                        json!({"kind": "spoken", "play": play.map(|found| &found["play"]), "reason": "lost", "say": event["say"], "spoken": 0u8, "track": event["track"]})
+                    })
+                    .collect();
                 let live: &'static Mutex<Live> = Box::leak(Box::new(Mutex::new(Live {
                     ahead: setting("RIFT_AHEAD_MS", 200),
                     archive: kept.map_or(Value::Null, |keep| keep["archive"].clone()),
@@ -1375,6 +1499,9 @@ fn main() -> ExitCode {
                     plays: BTreeMap::new(),
                     quiet: last("quiet").is_some_and(|quiet| quiet["on"] == true),
                     root: root.clone(),
+                    said: BTreeMap::new(),
+                    sayings: last("say").map_or(0, |say| say["say"].as_u64().unwrap_or_default()),
+                    says: BTreeMap::new(),
                     segment: setting("RIFT_SEGMENT_MS", 10_000u64)
                         .checked_div(20)
                         .unwrap_or_default()
@@ -1446,6 +1573,9 @@ fn main() -> ExitCode {
                 // a play a kill left open: what its logged runs sounded, the rest not on disk
                 for (num, track, played) in unended {
                     drop(guard.emit(&json!({"kind": "played", "play": num, "played": played, "reason": "lost", "track": track}))?);
+                }
+                for spoken in unsaid {
+                    drop(guard.emit(&spoken)?);
                 }
                 // a segment a kill left open: cut to whole frames and closed with its event, its
                 // start where its track's last event of that boot ended
@@ -1578,6 +1708,8 @@ fn main() -> ExitCode {
                     );
                     // an engine's track and kind
                     let mut engaged = None::<(String, String)>;
+                    // a say's mouth and number
+                    let mut saying = None::<(String, u64)>;
                     let every = Duration::from_millis(setting("RIFT_PING_MS", 10_000));
                     loop {
                         let mut raw = Vec::new();
@@ -1604,6 +1736,10 @@ fn main() -> ExitCode {
                                 well(kind, name) && (kind == "mouth" || request["plays"] != true)
                             })
                             .map(|(kind, name)| format!("{kind}-{name}"));
+                        // a play's rate, which the mouth converts from
+                        let rated = request["rate"]
+                            .as_u64()
+                            .is_some_and(|rate| (8000..=48_000).contains(&rate));
                         // an engine's kind and name: echo, turn and words on an ear, speech on a
                         // mouth, `from` a turn's and a words engine's alone
                         let role = request["kind"]
@@ -1688,10 +1824,14 @@ fn main() -> ExitCode {
                                 true,
                                 Some(
                                     "device" | "engine" | "feed" | "hush" | "listen" | "partials"
-                                    | "play" | "read",
+                                    | "play" | "read" | "say",
                                 ),
                             ) if device.is_some() => (Ok(error("bad_request")), Next::Go),
-                            (true, Some(op)) if giving.is_some() && op != "give" && op != "end" => {
+                            // a play's connection carries its gives and a say's its text, then `end`
+                            (true, Some(op))
+                                if giving.is_some() && op != "give" && op != "end"
+                                    || saying.is_some() && op != "text" && op != "end" =>
+                            {
                                 (Ok(error("bad_request")), Next::Go)
                             }
                             (true, Some(_)) if engaged.is_some() => (
@@ -1839,6 +1979,10 @@ fn main() -> ExitCode {
                                         } else {
                                             &mut guard.quiet
                                         }) = on;
+                                        // quiet on ends every say, one with a play as it ends
+                                        if op == "quiet" && on {
+                                            guard.unsay(None, "quiet");
+                                        }
                                         // quiet on hushes every play, each waited on apart
                                         for playing in
                                             guard.plays.keys().filter(|_| op == "quiet" && on)
@@ -2011,12 +2155,44 @@ fn main() -> ExitCode {
                                 };
                                 (Ok(json!({"given": total, "ok": true})), next)
                             }
+                            // a say's text, passed to its engine as given, then its end
+                            (true, Some(op @ ("end" | "text")))
+                                if saying.as_ref().is_some_and(|held| {
+                                    guard
+                                        .says
+                                        .get(&held.0)
+                                        .is_some_and(|say| say.num == held.1 && !say.end)
+                                }) && (op == "end" || request["text"].is_string()) =>
+                            {
+                                let (mouth, num) = saying.clone().unwrap_or_default();
+                                let text = request["text"].as_str().unwrap_or_default();
+                                let count = guard.says.get_mut(&mouth).map_or(0, |say| {
+                                    say.end = op == "end";
+                                    say.text.push_str(text);
+                                    say.text.chars().count()
+                                });
+                                let (told, reply) = if op == "end" {
+                                    (json!({"end": num}), json!({"ok": true}))
+                                } else {
+                                    (
+                                        json!({"say": num, "text": text}),
+                                        json!({"ok": true, "text": count}),
+                                    )
+                                };
+                                guard.fan(&format!("{mouth} say"), &format!("{told}\n"));
+                                (Ok(reply), Next::Go)
+                            }
+                            // a say's play ends only after the say's `end`
                             (true, Some("end"))
                                 if giving.as_ref().is_some_and(|held| {
                                     guard
                                         .plays
                                         .get(&held.0)
                                         .is_some_and(|play| play.num == held.1 && !play.end)
+                                        && !guard
+                                            .says
+                                            .get(&held.0)
+                                            .is_some_and(|say| say.play == Some(held.1) && !say.end)
                                 }) =>
                             {
                                 let (mouth, num) = giving.clone().unwrap_or_default();
@@ -2031,44 +2207,106 @@ fn main() -> ExitCode {
                                 }
                                 (Ok(json!({"ok": true})), Next::Go)
                             }
+                            // a say ends with its play, or alone with none yet
                             (true, Some("hush")) if tracked && track.starts_with("mouth-") => {
+                                let said = guard.says.get(track).map(|say| say.num);
+                                guard.unsay(Some(track), "hush");
                                 let (held, mut last) = quell(guard, track, "hush", PATIENCE);
                                 (guard, last["ok"]) = (held, true.into());
+                                if let Some(num) = said {
+                                    last["say"] = num.into();
+                                }
                                 (Ok(last), Next::Go)
                             }
-                            (true, Some("play"))
+                            // a play, or a say, which also needs its mouth's speech engine
+                            (true, Some(op @ ("play" | "say")))
                                 if tracked
                                     && track.starts_with("mouth-")
-                                    && request["rate"]
-                                        .as_u64()
-                                        .is_some_and(|rate| (8000..=48_000).contains(&rate)) =>
+                                    && (op == "say" || rated) =>
                             {
-                                let refused = if guard.quiet {
+                                // a say's play names the say, open on the mouth and not yet
+                                // played; a say holds the mouth from any other play or say
+                                let say = request.get("say").filter(|_| op == "play");
+                                let refused = if say.is_some_and(|claimed| {
+                                    !guard.says.get(track).is_some_and(|held| {
+                                        *claimed == held.num && held.play.is_none()
+                                    })
+                                }) {
+                                    "bad_request"
+                                } else if guard.quiet {
                                     "quiet"
                                 } else if !guard
                                     .tracks
                                     .get(track)
                                     .is_some_and(|held| held.conn.is_some() && held.plays)
+                                    || op == "say"
+                                        && !(guard.engines)
+                                            .contains_key(&(track.to_owned(), "speech".to_owned()))
                                 {
                                     "absent"
-                                } else if guard.plays.contains_key(track) {
+                                } else if guard.plays.contains_key(track)
+                                    || say.is_none() && guard.says.contains_key(track)
+                                {
                                     "busy"
                                 } else {
                                     ""
                                 };
-                                let num = guard.numbered.saturating_add(1);
+                                let (said, num) = (
+                                    guard.sayings.saturating_add(1),
+                                    guard.numbered.saturating_add(1),
+                                );
                                 let rate = request["rate"].as_u64().unwrap_or_default();
-                                let opened = if refused.is_empty() {
-                                    guard.emit(&json!({"kind": "play", "play": num, "rate": rate, "track": track})).map(|_| {
+                                let mut event = json!({"kind": "play", "play": num, "rate": rate, "track": track});
+                                if let Some(claimed) = say {
+                                    event["say"] = claimed.clone();
+                                }
+                                let opened = if !refused.is_empty() {
+                                    Ok(error(refused))
+                                } else if op == "say" {
+                                    guard
+                                        .emit(&json!({"kind": "say", "say": said, "track": track}))
+                                        .map(|_| {
+                                            guard.sayings = said;
+                                            drop(guard.says.insert(
+                                                track.to_owned(),
+                                                Say {
+                                                    client: key,
+                                                    end: false,
+                                                    hushed: None,
+                                                    marks: Vec::new(),
+                                                    num: said,
+                                                    play: None,
+                                                    text: String::new(),
+                                                },
+                                            ));
+                                            saying = Some((track.to_owned(), said));
+                                            json!({"ok": true, "say": said, "seq": guard.seq})
+                                        })
+                                } else {
+                                    guard.emit(&event).map(|_| {
                                         guard.numbered = num;
-                                        let opening = json!({"play": num, "rate": rate, "track": track});
+                                        if let Some(held) = guard.says.get_mut(track) {
+                                            held.play = Some(num);
+                                        }
+                                        let opening =
+                                            json!({"play": num, "rate": rate, "track": track});
                                         guard.fan("runs", &format!("{opening}\n"));
-                                        let _: Option<Play> = guard.plays.insert(track.to_owned(), Play { end: false, given: 0, giver: key, heard: Instant::now(), hushed: None, num, rate, run: None });
+                                        let _: Option<Play> = guard.plays.insert(
+                                            track.to_owned(),
+                                            Play {
+                                                end: false,
+                                                given: 0,
+                                                giver: key,
+                                                heard: Instant::now(),
+                                                hushed: None,
+                                                num,
+                                                rate,
+                                                run: None,
+                                            },
+                                        );
                                         giving = Some((track.to_owned(), num));
                                         json!({"ok": true, "play": num, "seq": guard.seq})
                                     })
-                                } else {
-                                    Ok(error(refused))
                                 };
                                 (opened, Next::Go)
                             }
@@ -2356,8 +2594,9 @@ fn main() -> ExitCode {
                                 true,
                                 Some(
                                     "device" | "done" | "ears" | "end" | "engine" | "feed"
-                                    | "frame" | "give" | "hush" | "keep" | "listen" | "partials"
-                                    | "play" | "pong" | "quiet" | "read" | "sound",
+                                    | "frame" | "give" | "hush" | "keep" | "listen" | "mark"
+                                    | "partials" | "play" | "pong" | "quiet" | "read" | "say"
+                                    | "sound" | "text",
                                 )
                                 | None,
                             ) => (Ok(error("bad_request")), Next::Go),
@@ -2429,6 +2668,23 @@ fn main() -> ExitCode {
                             drop(writer.write_all(format!("{line}\n").as_bytes()));
                         }
                     }
+                    // a say's the same: its client gone before `end` hushes it (`left`)
+                    if let Some((mouth, num)) = saying {
+                        let mut guard = lock(live);
+                        let unended =
+                            (guard.says.get(&mouth)).is_some_and(|say| say.num == num && !say.end);
+                        if unended {
+                            guard.unsay(Some(&mouth), "left");
+                            guard = quell(guard, &mouth, "hush", PATIENCE).0;
+                        }
+                        let last = (guard.said.get(&mouth))
+                            .filter(|last| last["say"] == num)
+                            .cloned();
+                        drop(guard);
+                        if let Some(line) = last {
+                            drop(writer.write_all(format!("{line}\n").as_bytes()));
+                        }
+                    }
                     drop(writer.shutdown(Shutdown::Both));
                     let mut guard = lock(live);
                     drop(guard.conns.remove(&key));
@@ -2440,6 +2696,7 @@ fn main() -> ExitCode {
                     // a device's open segment closes as it leaves, and the play it held ends
                     if let Some(name) = device {
                         guard.finish(&name, "mouth");
+                        guard.unsay(Some(&name), "mouth");
                         drop(guard.close(Some(&name)));
                         let held = guard.tracks.entry(name).or_default();
                         (held.conn, held.plays) = (None, false);
@@ -2460,7 +2717,9 @@ fn main() -> ExitCode {
                     let left = budget.saturating_sub(begun.elapsed());
                     guard = quell(guard, &track, "stop", left).0;
                 }
-                // every engine's end logged before `stop`, which nothing follows
+                // every say and engine's end logged before `stop`, which nothing follows; a say
+                // with a play ended with it
+                guard.unsay(None, "stop");
                 guard.leave(None);
                 drop(guard.close(None));
                 drop(guard.emit(&json!({"kind": "stop", "reason": reason})));

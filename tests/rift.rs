@@ -2955,7 +2955,7 @@ mod tests {
         let (mut daemon, _) = serve(&root, &envs)?;
         drop(rift(&root, &[], &["ears", "on"])?);
         let (mut ear, hi) = device(&root, r#"{"kind":"ear","name":"desk","op":"device"}"#, 0)?;
-        // 30 s back: room for the 1035 frames sent, none ahead of now
+        // 30 s back: the 1035 frames sent all end before now
         let base = hi["ping"].as_u64().unwrap_or_default() - 30_000_000;
         let cancel = r#"{"kind":"echo","name":"cancel","op":"engine","track":"ear-desk"}"#;
         let listen = |from: Value| {
@@ -3202,6 +3202,287 @@ mod tests {
         )?;
         same(&signal(&mouth, "TERM")?, "")?;
         same(&format!("{:?}", mouth.0.wait()?.code()), "Some(0)")
+    }
+
+    /// Says, the suite as the client, the speech engine, its play's giver and the mouth
+    /// (docs/protocol.html#engines): `absent` with no speech engine or no playing mouth, `quiet`,
+    /// `busy` for a say or a play while one is open; text passed to the engine as given and
+    /// counted; the say's play naming it alone admitted, its `end` refused before the say's, its
+    /// event naming the say; marks rising, no further than the text; a say to its end, `spoken`
+    /// its whole text; hushed once the mouth reported a run, `spoken` the largest mark under
+    /// `played`; `done` with no play; hushed with none; `left`, `engine`, `quiet` and `mouth`,
+    /// with a play and without; the drain's `stop`; a kill's `lost`, says numbered across boots.
+    #[test]
+    fn says() -> Outcome {
+        let root = temp("says")?;
+        let (mut daemon, _) = serve(&root, &[("RIFT_DRAIN_MS", "400")])?;
+        let opening = r#"{"op":"say","track":"mouth-desk"}"#;
+        let speech = r#"{"kind":"speech","name":"read-aloud","op":"engine","track":"mouth-desk"}"#;
+        let mouthed = r#"{"kind":"mouth","name":"desk","op":"device","plays":true}"#;
+        let text = |said: &str| json!({"op": "text", "text": said}).to_string();
+        let tagged = |num: u8| {
+            json!({"op": "play", "rate": 16_000u16, "say": num, "track": "mouth-desk"}).to_string()
+        };
+        let zeros =
+            |samples: usize| json!({"op": "give", "pcm": "0000".repeat(samples)}).to_string();
+        let mark = |num: u8, samples: u16, upto: u8| {
+            json!({"op": "mark", "samples": samples, "say": num, "text": upto}).to_string()
+        };
+        let sound = |num: u8, samples: u16| {
+            json!({"from": 0u8, "op": "sound", "play": num, "samples": samples, "t": 1_000_000u32})
+                .to_string()
+        };
+        let done = |num: u8| json!({"op": "done", "say": num}).to_string();
+        let mut probe = greet(&root)?;
+        for (line, reply) in [
+            (r#"{"op":"say","track":"ear-desk"}"#, "bad_request"),
+            (opening, "absent"),
+            (&text("x"), "bad_request"),
+            (&mark(1, 1, 1), "bad_request"),
+        ] {
+            same(&say(&mut probe, line)?, &code(reply))?;
+        }
+        let mut engine = greet(&root)?;
+        drop(say(&mut engine, speech)?);
+        same(&say(&mut probe, opening)?, &code("absent"))?;
+        let (mut mouth, _) = device(&root, mouthed, 0)?;
+        drop(rift(&root, &[], &["quiet", "on"])?);
+        same(&say(&mut probe, opening)?, &code("quiet"))?;
+        drop(rift(&root, &[], &["quiet", "off"])?);
+        // say 1, spoken to its end
+        let mut client = greet(&root)?;
+        same(&line_after(&mut client, opening)?["say"].to_string(), "1")?;
+        for line in [
+            opening,
+            r#"{"op":"play","rate":16000,"track":"mouth-desk"}"#,
+        ] {
+            same(&say(&mut probe, line)?, &code("busy"))?;
+        }
+        same(
+            &say(&mut client, r#"{"op":"health"}"#)?,
+            &code("bad_request"),
+        )?;
+        same(
+            &say(&mut client, &text("Hello there. "))?,
+            r#"{"ok":true,"text":13}"#,
+        )?;
+        same(&next(&mut engine)?, r#"{"say":1,"text":"Hello there. "}"#)?;
+        let mut giver = greet(&root)?;
+        same(&say(&mut giver, &tagged(2))?, &code("bad_request"))?;
+        same(
+            &line_after(&mut giver, &tagged(1))?["play"].to_string(),
+            "1",
+        )?;
+        same(&say(&mut greet(&root)?, &tagged(1))?, &code("bad_request"))?;
+        same(&say(&mut giver, &zeros(800))?, r#"{"given":800,"ok":true}"#)?;
+        drop(next(&mut mouth)?);
+        same(&say(&mut giver, r#"{"op":"end"}"#)?, &code("bad_request"))?;
+        let mut verdicts = Vec::new();
+        for report in [
+            mark(1, 800, 13),
+            mark(1, 700, 13),
+            mark(1, 900, 12),
+            mark(1, 900, 99),
+            mark(9, 900, 13),
+            done(1),
+        ] {
+            verdicts.push(
+                line_after(&mut engine, &report)?["code"]
+                    .as_str()
+                    .unwrap_or("ok")
+                    .to_owned(),
+            );
+        }
+        same(
+            &verdicts.join(" "),
+            "ok bad_request bad_request bad_request bad_request bad_request",
+        )?;
+        same(
+            &say(&mut client, &text("How are you?"))?,
+            r#"{"ok":true,"text":25}"#,
+        )?;
+        same(&say(&mut client, r#"{"op":"end"}"#)?, r#"{"ok":true}"#)?;
+        same(&say(&mut client, &text("x"))?, &code("bad_request"))?;
+        same(
+            &format!("{} {}", next(&mut engine)?, next(&mut engine)?),
+            r#"{"say":1,"text":"How are you?"} {"end":1}"#,
+        )?;
+        same(&say(&mut engine, &mark(1, 1600, 25))?, r#"{"ok":true}"#)?;
+        same(&say(&mut giver, r#"{"op":"end"}"#)?, r#"{"ok":true}"#)?;
+        same(&next(&mut mouth)?, r#"{"end":1}"#)?;
+        send(&mut mouth, &sound(1, 800))?;
+        send(&mut mouth, r#"{"op":"done","play":1}"#)?;
+        let mut spoken = line(&mut client)?;
+        same(
+            &format!("{spoken} {}", next(&mut client)?),
+            &format!(
+                "{} ",
+                json!({"play": 1u8, "reason": "end", "say": 1u8, "seq": spoken["seq"], "spoken": 25u8, "text": "Hello there. How are you?", "track": "mouth-desk"})
+            ),
+        )?;
+        same(
+            &kinds(&root, "play", usize::MAX)?,
+            r#"{"kind":"play","play":1,"rate":16000,"say":1,"track":"mouth-desk"}"#,
+        )?;
+        drop((client, giver));
+        // say 2, hushed once the mouth reported 800 samples: as far as the mark under them
+        client = greet(&root)?;
+        drop(say(&mut client, opening)?);
+        drop(say(&mut client, &text("One. Two. "))?);
+        drop(next(&mut engine)?);
+        giver = greet(&root)?;
+        drop(say(&mut giver, &tagged(2))?);
+        drop(say(&mut giver, &zeros(1600))?);
+        drop(next(&mut mouth)?);
+        for report in [mark(2, 400, 5), mark(2, 1200, 10)] {
+            same(&say(&mut engine, &report)?, r#"{"ok":true}"#)?;
+        }
+        send(&mut mouth, &sound(2, 800))?;
+        send(&mut probe, r#"{"op":"hush","track":"mouth-desk"}"#)?;
+        same(&next(&mut mouth)?, r#"{"hush":2}"#)?;
+        send(&mut mouth, r#"{"op":"done","play":2}"#)?;
+        let hushed = line(&mut probe)?;
+        spoken = line(&mut client)?;
+        same(
+            &format!(
+                "{} {} {} {} {}",
+                hushed["say"],
+                hushed["played"],
+                spoken["reason"],
+                spoken["spoken"],
+                next(&mut engine)?
+            ),
+            r#"2 800 "hush" 5 {"hush":2}"#,
+        )?;
+        drop((client, giver));
+        // say 3, done with no play; say 4, hushed with none
+        client = greet(&root)?;
+        drop(say(&mut client, opening)?);
+        drop(say(&mut client, &text("x"))?);
+        same(&next(&mut engine)?, r#"{"say":3,"text":"x"}"#)?;
+        same(&say(&mut engine, &done(3))?, &code("bad_request"))?;
+        drop(say(&mut client, r#"{"op":"end"}"#)?);
+        same(&next(&mut engine)?, r#"{"end":3}"#)?;
+        same(&say(&mut engine, &done(3))?, r#"{"ok":true}"#)?;
+        spoken = line(&mut client)?;
+        same(
+            &format!(
+                "{} {} {}",
+                spoken["play"], spoken["reason"], spoken["spoken"]
+            ),
+            r#"null "end" 0"#,
+        )?;
+        client = greet(&root)?;
+        drop(say(&mut client, opening)?);
+        same(
+            &say(&mut probe, r#"{"op":"hush","track":"mouth-desk"}"#)?,
+            r#"{"ok":true,"play":null,"say":4}"#,
+        )?;
+        same(
+            &format!("{} {}", line(&mut client)?["reason"], next(&mut engine)?),
+            r#""hush" {"hush":4}"#,
+        )?;
+        // the client gone, without a play (say 5) and with one (say 6)
+        client = greet(&root)?;
+        drop(say(&mut client, opening)?);
+        drop(client);
+        same(&next(&mut engine)?, r#"{"hush":5}"#)?;
+        client = greet(&root)?;
+        drop(say(&mut client, opening)?);
+        giver = greet(&root)?;
+        drop(say(&mut giver, &tagged(6))?);
+        drop(say(&mut giver, &zeros(1))?);
+        drop(next(&mut mouth)?);
+        drop(client);
+        same(&next(&mut mouth)?, r#"{"hush":3}"#)?;
+        send(&mut mouth, r#"{"op":"done","play":3}"#)?;
+        same(&next(&mut engine)?, r#"{"hush":6}"#)?;
+        drop(giver);
+        // quiet (say 7)
+        client = greet(&root)?;
+        drop(say(&mut client, opening)?);
+        drop(rift(&root, &[], &["quiet", "on"])?);
+        same(
+            &format!("{} {}", line(&mut client)?["reason"], next(&mut engine)?),
+            r#""quiet" {"hush":7}"#,
+        )?;
+        drop(rift(&root, &[], &["quiet", "off"])?);
+        // the engine gone, without a play (say 8) and with one (say 9)
+        client = greet(&root)?;
+        drop(say(&mut client, opening)?);
+        drop(engine);
+        same(&line(&mut client)?["reason"].to_string(), r#""engine""#)?;
+        engine = greet(&root)?;
+        drop(say(&mut engine, speech)?);
+        client = greet(&root)?;
+        drop(say(&mut client, opening)?);
+        giver = greet(&root)?;
+        drop(say(&mut giver, &tagged(9))?);
+        drop(say(&mut giver, &zeros(1))?);
+        drop(next(&mut mouth)?);
+        drop(engine);
+        same(&next(&mut mouth)?, r#"{"hush":4}"#)?;
+        send(&mut mouth, r#"{"op":"done","play":4}"#)?;
+        same(&line(&mut client)?["reason"].to_string(), r#""engine""#)?;
+        drop(giver);
+        // the mouth gone (say 10)
+        engine = greet(&root)?;
+        drop(say(&mut engine, speech)?);
+        client = greet(&root)?;
+        drop(say(&mut client, opening)?);
+        drop(mouth);
+        same(
+            &format!("{} {}", line(&mut client)?["reason"], next(&mut engine)?),
+            r#""mouth" {"hush":10}"#,
+        )?;
+        // the drain (say 11): its end, then the engine's, then `stop`
+        (mouth, _) = device(&root, mouthed, 0)?;
+        client = greet(&root)?;
+        drop(say(&mut client, opening)?);
+        same(&say(&mut probe, r#"{"op":"shutdown"}"#)?, r#"{"ok":true}"#)?;
+        same(&line(&mut client)?["reason"].to_string(), r#""stop""#)?;
+        drop((mouth, client, engine, probe));
+        same(&format!("{:?}", daemon.0.wait()?.code()), "Some(0)")?;
+        let held = events(&root)?;
+        same(
+            &json!(
+                held.iter()
+                    .rev()
+                    .take(3)
+                    .map(|event| event["e"]["kind"].clone())
+                    .collect::<Vec<_>>()
+            )
+            .to_string(),
+            r#"["stop","engine","spoken"]"#,
+        )?;
+        // a kill: the next boot ends say 12 `lost`, with its play; the next say is 13
+        let (killed, _) = serve(&root, &[])?;
+        (engine, mouth) = (greet(&root)?, device(&root, mouthed, 0)?.0);
+        drop(say(&mut engine, speech)?);
+        client = greet(&root)?;
+        drop(say(&mut client, opening)?);
+        giver = greet(&root)?;
+        drop(say(&mut giver, &tagged(12))?);
+        drop(killed);
+        drop((engine, mouth, client, giver));
+        let (mut again, _) = serve(&root, &[])?;
+        same(
+            &kinds(&root, "spoken", 3)?,
+            r#"{"kind":"spoken","play":5,"reason":"lost","say":12,"spoken":0,"track":"mouth-desk"}"#,
+        )?;
+        engine = greet(&root)?;
+        drop(say(&mut engine, speech)?);
+        (mouth, _) = device(&root, mouthed, 0)?;
+        same(
+            &line_after(&mut greet(&root)?, opening)?["say"].to_string(),
+            "13",
+        )?;
+        drop((engine, mouth));
+        same(
+            &say(&mut greet(&root)?, r#"{"op":"shutdown"}"#)?,
+            r#"{"ok":true}"#,
+        )?;
+        same(&format!("{:?}", again.0.wait()?.code()), "Some(0)")
     }
 
     /// Frames `range` 20 ms apart from `base` on `ear`'s clock, each of its index's fill; where

@@ -501,8 +501,8 @@
 <section class="docs-section" id="engines" data-component="engines">
   <header>
     <h2 class="h2">Engines</h2>
-    <p class="docs-note">Served as far as <a href="index.html#engines">the slices</a> built: the
-      connection, words, turn and echo, its clean track aside. An engine is a client that does one kind of work
+    <p class="docs-note">Served, the echo engine's clean track aside (<a href="index.html#engines">the
+      slices</a>). An engine is a client that does one kind of work
       on one track and reports results, which the daemon checks and logs as events
       (<a href="index.html#engines">the design</a>). Every op, field, event and code here is
       additive: <code class="code">proto</code> stays 1, and nothing above changes meaning.</p>
@@ -557,14 +557,15 @@
       <code class="code">{"end":5}</code> (no more text) and <code class="code">{"hush":5}</code>
       (stop now). It gives the audio through the <a href="#plays">plays</a> path on a connection of
       its own, <code class="code">{"op":"play","rate":24000,"say":5,"track":"mouth-desk"}</code>, one
-      play per say, ended only after the say's <code class="code">end</code>; a play naming a say
+      play per say, ended only after the say's <code class="code">end</code> (before it, the play's
+      <code class="code">end</code> is <code class="code">bad_request</code>); a play naming a say
       that is not open on that mouth, or one already played, is <code class="code">bad_request</code>.</li>
   </ul>
   <div class="table-wrap">
     <table data-table>
       <thead><tr><th>report</th><th>kind</th><th>line</th><th>rule; logged as</th></tr></thead>
       <tbody>
-        <tr><td class="table-mono">done</td><td>speech</td><td class="table-mono">{"op":"done","say":5}</td><td>after the say's <code class="code">end</code>, no play is coming (nothing to sound); the say ends <code class="code">end</code>, <code class="code">spoken</code> 0. With its play opened: <code class="code">bad_request</code></td></tr>
+        <tr><td class="table-mono">done</td><td>speech</td><td class="table-mono">{"op":"done","say":5}</td><td>after the say's <code class="code">end</code>, no play is coming (nothing to sound); the say ends <code class="code">end</code>, <code class="code">spoken</code> 0. Before its <code class="code">end</code> or with its play opened: <code class="code">bad_request</code></td></tr>
         <tr><td class="table-mono">frame</td><td>echo</td><td class="table-mono">{"op":"frame","pcm":"…","t":…}</td><td>the clean track's frame for the ear's frame at <code class="code">t</code>, at most one each; streamed to <code class="code">clean-&lt;name&gt;</code> as a device's frames are, segments and window alike</td></tr>
         <tr><td class="table-mono">mark</td><td>speech</td><td class="table-mono">{"op":"mark","samples":21600,"say":5,"text":13}</td><td>the say's first <code class="code">text</code> characters (Unicode scalar values) have sounded once the play's sample <code class="code">samples</code> has; both rising; not logged, kept for <code class="code">spoken</code></td></tr>
         <tr><td class="table-mono">mask</td><td>echo</td><td class="table-mono">{"end":…,"op":"mask","start":…}</td><td>[<code class="code">start</code>, <code class="code">end</code>) of the ear is the machine hearing itself; masks never overlap and rise; <code class="code">mask</code></td></tr>
@@ -598,12 +599,13 @@
       <code class="code">"say":5</code> beside the play's fields. A say's connection that ends before
       <code class="code">end</code> hushes it (<code class="code">left</code>); after it, it speaks
       out. A speech engine that leaves ends its open say <code class="code">engine</code>, its play
-      hushed.</li>
+      hushed: either play's <code class="code">played</code> says <code class="code">hush</code>,
+      its say the cause.</li>
     <li><strong>What sounded.</strong> A say ends with its play's <code class="code">played</code>
       (or, with no play, at once). <code class="code">spoken</code> is the say's whole text when the
       play ended <code class="code">end</code>; otherwise the largest mark's
       <code class="code">text</code> whose <code class="code">samples</code> is at most the play's
-      <code class="code">played</code>, 0 with no such mark. A client reads which text sounded as the
+      <code class="code">played</code>, 0 with no such mark or no play. A client reads which text sounded as the
       first <code class="code">spoken</code> characters of <code class="code">text</code>, never by
       time.</li>
     <li><strong>Reasons.</strong> A say's are its play's (<code class="code">end</code>,

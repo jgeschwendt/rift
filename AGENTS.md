@@ -112,6 +112,29 @@ finished. A standing `--speaker` device stands, strikes, rotates `mouth.err` and
 does; a device reply without `"plays":true` is struck as a refusal. `rift play` gives 16384 bytes
 at a time, its stop signal arming as a standing device's but exit 1.
 
+### Engines
+
+The design is `docs/index.html#engines`, the wire `docs/protocol.html#engines`. `Live.engines`
+holds each connected engine by track and kind; an engine's lines leave through its own queue,
+its `engine` reply first, then (a turn's and a words engine's) its replay, then what it is told
+under its topics: `<track>` (an echo engine, as a listener), `runs` (every play's open, runs and
+end, to echo engines), `<track> heard` (the frames passed on), `<track> turn` (a words engine's
+turn lines), `<track> say` (a speech engine's says), `<track> partial` (`partials` readers). A
+placed frame joins its track's `pending` and passes on (`release`, masked by `masked`) once its
+echo engine's `ruled` reaches its end, at once with none; the replay (`replay`) reads `segments`
+up to the first pending frame, applying `Track.spans` (the logged masks and turns, derived at
+boot, cut by the sweep) as live does, so the join is the lock's. `latest`, derived from the log,
+is each track's floor per report kind and the reply's `through`. A say (`Live.says`) holds its
+mouth; `conclude` ends the says a predicate picks (its play's `finish`, `done`, `unsay` for a
+hush, its client or engine gone, quiet, the drain, its mouth gone) and logs `spoken`; the next
+boot logs `lost` for a `say` without one. `rift engine run tail` (`src/tail.rs`) reads until its
+connection ends.
+
+Coverage in `main` is fragile around new loops: a standing device's `exit` mid-loop writes a
+profile whose counter expressions for unrelated regions of `main` read -1, cancelling a region
+run once in the merge (observed 2026-11-26 · the drain's engine loop, its one count cancelled);
+a region of its own (a method, a precomputed guard) holds its count.
+
 ### `rift setup`
 
 The plist for `dev.gigantic.rift`: `ProgramArguments` `~/.local/bin/rift serve`,
