@@ -1714,6 +1714,8 @@ fn main() -> ExitCode {
                     loop {
                         let mut raw = Vec::new();
                         drop((&mut reader).take(LINE + 1).read_until(b'\n', &mut raw));
+                        // a pong's reading, before any wait on the lock widens its round trip
+                        let arrived = now();
                         let whole = raw.ends_with(b"\n");
                         let over = !whole && u64::try_from(raw.len()).unwrap_or(u64::MAX) > LINE;
                         // end of stream, or a read error, mid-line or between lines
@@ -2430,7 +2432,7 @@ fn main() -> ExitCode {
                                 let (ping, theirs, back) = (
                                     request["ping"].as_u64().unwrap_or_default(),
                                     request["t"].as_u64().unwrap_or_default(),
-                                    now(),
+                                    arrived,
                                 );
                                 // the pong was stamped between the ping and its reading: the
                                 // first is placed at the midpoint, a later one moves the offset
