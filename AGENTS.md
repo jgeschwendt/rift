@@ -87,16 +87,24 @@ under way, whether it was ended or hushed), `Live.ended` each mouth's last play'
 give is passed under the topic `<track>>`, a playing device's queue of its own beside `ears`, so a
 full one is dropped by `fan` as a slow feed is; its reply waits on `ROOM`, the one `Condvar` every
 change to a play wakes, while `given` less taken reaches `$RIFT_AHEAD_MS`, so a giver is seen to
-leave only once that wait ends. `quell` hushes and waits for `done` up to `PATIENCE` (1 s), then
-cuts the mouth and ends the play at its last report; the drain runs it per play inside its budget.
-`finish` logs the run under way and `played`, closes the mouth's open segment, keeps the last line
-and shuts the giver's read side, so a giver blocked on a read wakes to write it. `src/mouth.rs`'s
-loop is the ear's shape: the reader thread's lines (the reply first, pings answered there), the
-output listings on a thread every poll, each open's outcome tagged with its number; the output's
-callback fills under one mutex with the loop (`Shared`), a closed open's callback left silent. A
-standing `--speaker` device stands, strikes, rotates `mouth.err` and stops as `--mic` does; a
-device reply without `"plays":true` is struck as a refusal. `rift play` gives 16384 bytes at a
-time, its stop signal arming as a standing device's but exit 1.
+leave only once that wait ends, the stall rule at the latest. A give is taken only while its play
+is neither ended nor hushed; `hush` and an `end` finish a play given nothing at once. `quell`
+hushes and waits for `done` up to `PATIENCE` (1 s), then cuts the mouth and ends the play at its
+last report; the drain runs it per play inside its budget. `stalled`, run with the sweep every
+second, ends `mouth` a play whose mouth owes progress and has not reported (`Play.heard`) for
+`$RIFT_STALL_MS`. `finish` logs the run under way and `played`, closes the mouth's open segment,
+keeps the last line and shuts the giver's read side, so a giver blocked on a read wakes to write
+it. `src/mouth.rs`'s loop is the ear's shape: the reader thread's lines (the reply first, pings
+answered there), the output listings on a thread every poll, each open's outcome and its end
+(`Closed`, a failed output) tagged with its number. The output's callback only copies: converted
+samples out of `Ring.queued`, each with its position, and what it rendered into `Ring.rendered`,
+preallocated and never grown; the loop holds the one mutex only to copy in and out, converting
+(the precomputed `window`), accounting (`absorb`, `Play::taken`), cutting and writing outside it.
+A closed open's callback renders silence and records nothing; a closed output's queue is converted
+again from its first untaken position. The mouth ignores a give for a play it has ended or
+finished. A standing `--speaker` device stands, strikes, rotates `mouth.err` and stops as `--mic`
+does; a device reply without `"plays":true` is struck as a refusal. `rift play` gives 16384 bytes
+at a time, its stop signal arming as a standing device's but exit 1.
 
 ### `rift setup`
 
@@ -108,8 +116,9 @@ as after `shutdown`, stays down), `RunAtLoad`, `ThrottleInterval` 10,
 <host> --mic` (the signed release's copy at one path every release shares, since the microphone's
 grant is keyed by the program's path; the daemon opens no microphone and stays on the link),
 `KeepAlive` true, `StandardErrorPath` `<root>/ear.err`; and the standing mouth's,
-`dev.gigantic.rift.mouth`, the ear's but `device mouth <host> --speaker` and `<root>/mouth.err`
-(an output asks no grant; one program serves both). `<host>` is `scutil --get
+`dev.gigantic.rift.mouth`, the ear's but `ProgramArguments` `~/.local/libexec/rift/mouth device
+mouth <host> --speaker` (a copy of its own, at a path no setup older than the mouth writes) and
+`<root>/mouth.err`. `<host>` is `scutil --get
 LocalHostName` (resolved from `PATH`, under `$RIFT_SIGN_MS`) lowercased, asked only by `--print`
 and an install: `setup --print` prints the three and writes nothing, the daemon's alone when there is no
 name (no `scutil`, off macOS); an install refuses one that is no track name (unset, or past
@@ -173,8 +182,8 @@ printed:
    full segments, then a restart, its one hole, and a 300 ms freeze with none);
 5. the signed release copied to the ear's fixed path, `~/.local/libexec/rift/rift`, by temp +
    rename unless it is already there byte for byte (`installed <release> as <path>`), so a
-   running ear keeps the file it mapped and a rerun changes nothing; then the three plists by temp
-   + rename (`wrote <path>`);
+   running ear keeps the file it mapped and a rerun changes nothing; then the daemon's and the
+   ear's plists by temp + rename (`wrote <path>`);
 6. the ear, then the mouth, booted out when loaded, before the daemon is touched;
 7. the same daemon plist already loaded and the release not re-signed this run: `kickstart -k`,
    the swap; else the reload: booted out when loaded, then `bootstrap`;
@@ -192,19 +201,22 @@ printed:
    that connects between that check and the ear's own connect still passes for it; the standing
    ear, refused `taken`, says so in `ear.err` and takes over once that one leaves. Its failure is
    the line, exit 1, the daemon serving; a daemon failure before it leaves the ear unloaded;
-10. the mouth by step 9's rules, `mouth-<host>` and `<root>/mouth.err` for the ear's, one
-   `print-disabled` serving both, whatever the ear's outcome: each failure its own line, exit 1
-   once both are tried.
+10. the mouth, only once the ear is good (loaded, held or disabled): the signed release copied to
+   `~/.local/libexec/rift/mouth` as in step 5, its plist written, then step 9's rules with
+   `mouth-<host>` and `<root>/mouth.err`, one `print-disabled` serving both. A failure from the
+   copy on boots it out and removes its plist and copy before the line, exit 1, so a failed setup
+   leaves nothing of the mouth.
 
-The upgrade from a release without the mouth runs this setup; each failure leaves (a hotswap
-rollback then runs the older setup, which knows nothing of the mouth): before step 5, nothing of
-the mouth; from step 5, its plist written, and from step 6 the old ear booted out, so a daemon
-failure leaves ear and mouth unloaded with their plists in place, which launchd loads at the next
-login; after step 8, the daemon serving and the mouth loaded or named. A mouth plist the older
-release then finds is left loaded and unmanaged, as the ear's is below, and its program, the
-fixed copy, is the older release again, which reads `--speaker` as a file it cannot open and
-exits 1, respawned every `ThrottleInterval`, a line into `mouth.err` each time, uncapped, until
-a setup of this release or `launchctl bootout` by hand.
+The upgrade from a release without the mouth runs this setup, and a failed one is rolled back by
+hotswap running the older setup, which knows nothing of the mouth: a failure before step 10
+leaves no mouth from this run (one from an earlier run of this release stays booted out, its
+plist and copy in place); a failure in step 10 leaves none at all. A rollback or `upgrade --back`
+after a good upgrade leaves the mouth loaded on its own copy, which the older setup never writes:
+it meets the older daemon's reply without `"plays":true`, says so once and waits as a refusal,
+64 polls at most, `mouth.err` capped at each attempt, never an older program respawning. The
+older release's `setup --remove` leaves the mouth's job loaded, its plist and its copy (its
+`~/.local/libexec/rift/` then not empty, so left); one line clears them:
+`launchctl bootout gui/$(id -u)/dev.gigantic.rift.mouth; rm -f ~/Library/LaunchAgents/dev.gigantic.rift.mouth.plist ~/.local/libexec/rift/mouth`.
 
 Observed (observed 2026-11-25 · `/usr/bin/log show`, since zsh shadows `log`): the first upgrade
 onto a signing release re-signed it, then `kickstart -k`; launchd refused the spawn (`Launch
@@ -225,7 +237,7 @@ After each bootout `launchctl print` is polled every 100 ms until it fails, at m
 `$RIFT_BOOTOUT_MS`: `<label> still loaded <ms> ms after its bootout`, exit 1. `setup --remove`
 first has hotswap forget the layout, its record and the upgrade agent (refused while a swap runs),
 then boots out every earlier install, `dev.gigantic.rift.ear`, `dev.gigantic.rift.mouth` and `dev.gigantic.rift`, removes their plists,
-`~/.local/bin/rift`, the ear's copy and its `~/.local/libexec/rift/`, the keychain and its password as files (never `security delete-keychain`,
+`~/.local/bin/rift`, the ear's and the mouth's copies and their `~/.local/libexec/rift/`, the keychain and its password as files (never `security delete-keychain`,
 which may ask to unlock it), and leaves the root alone. Idempotent.
 
 hotswap never re-hashes an installed release (verified 2026-11-25 · `src/lib.rs` at the pinned

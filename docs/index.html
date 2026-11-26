@@ -348,12 +348,25 @@
       idle pays for the open is unmeasured. A change of the
       default closes it and opens the new one, what is queued kept; an output that goes with no
       default left is one stderr line and a wait, the play queued and its giver paced, until one
-      appears. Each output its frames name, <code class="code">speaker</code>, as an ear's name their
+      appears. An output that fails while it stays listed (cpal pauses its stream on a rate change,
+      a Bluetooth profile's switch or a device lost: anything but a glitch) ends its open; the mouth
+      says so, closes it as above and opens it again a poll on, a refused open retried as any. Each
+      output its frames name, <code class="code">speaker</code>, as an ear's name their
       microphone.</li>
+    <li><strong>The callback copies, nothing more.</strong> The output's callback takes samples the
+      loop already converted to the output's rate, each with its position among the given samples,
+      out of a queue bounded at a quarter second, and records each sample it renders, silence
+      included, with its position and when it sounds, into a buffer whose capacity never grows: no
+      allocation, no JSON, no socket. The two share one mutex, which each side holds only for that
+      copy, the loop converting, accounting, cutting and writing outside it: a ring free of locks
+      would need <code class="code">unsafe</code>, which is forbidden, or a crate the tree does not
+      have. A hush drops the converted queue and
+      the given samples alike.</li>
     <li><strong>Conversion.</strong> Audio is given 16-bit mono at a stated rate, 8 to 48 kHz, and
       converted once, in the mouth, to the output's rate: each output sample a Hann-windowed sinc
       interpolation of the given samples around its position, 16 each side, cut at 0.45 of the lower
-      of the two rates, then written to every channel; no gain, the system's volume alone. Audio is
+      of the two rates, its taps precomputed at 256 phases between two samples once a play and
+      output, the nearest phase read; then written to every channel; no gain, the system's volume alone. Audio is
       not narrowed before it is played. The track is then made from what the output took, by the
       ear's own converter to 16 kHz.</li>
     <li><strong>Where audio waits.</strong> In the mouth alone: the daemon passes each give on as it
@@ -365,8 +378,13 @@
       next run with the next give; there is no priming wait, so a giver slower than real time is heard
       as it is, in runs. The last 16 samples wait for the play's <code class="code">end</code>, which
       the interpolation needs, so an <code class="code">end</code> held up past what the mouth holds
-      splits off a run of them. The daemon's queue to the mouth is the mouth's alone; one full, a
-      mouth not reading, is dropped as a slow feed is and its play ends.</li>
+      splits off a run of them; the last sample stands for what is past it, so a play run to its end
+      counts every given sample played. The daemon's queue to the mouth is the mouth's alone; one
+      full, a mouth not reading, is dropped as a slow feed is and its play ends. A play given nothing
+      ends at once at its <code class="code">end</code> or its hush; a give after either is refused
+      and the mouth ignores one for a play it has ended. A mouth that owes progress and reports none
+      for <code class="code">$RIFT_STALL_MS</code> (5 s) has its play ended
+      <code class="code">mouth</code> and its giver answered.</li>
     <li><strong>Stamping.</strong> From the output's callback: this device's clock in the callback
       plus the latency cpal reports for it (the I/O buffer plus CoreAudio's device latency and safety
       offset), so a sample's time is when it sounds, never when it was given. A run's start is its
@@ -396,7 +414,7 @@
       what that drops is at most what the mouth held. <code class="code">rift play</code> stopped by
       a signal ends this way, at once. One that leaves after <code class="code">end</code> leaves its
       play to play out. A giver whose reply is withheld is seen to leave once the mouth takes enough
-      to answer it, or a hush ends the play.</li>
+      to answer it, or a hush or the stall rule ends the play.</li>
     <li><strong>It stands.</strong> As the ear: a connection that ends or a daemon that is down is
       waited out a poll, a refusal said once on stderr, the wait doubled to 64 polls, and SIGTERM,
       SIGINT or SIGHUP the only exit. Its connection gone, it drops what it holds at once: nothing
@@ -404,14 +422,17 @@
       release, is one stderr line naming it and the fix, then waited out as a refusal.</li>
     <li><strong>The standing mouth.</strong> <code class="code">rift setup</code> installs
       <code class="code">dev.gigantic.rift.mouth</code> beside the ear: <code class="code">rift device
-      mouth &lt;host&gt; --speaker</code> from the ear's fixed copy (an output needs no grant; one
-      program serves both), <code class="code">&lt;host&gt;</code> as the ear's, so its track is
-      <code class="code">mouth-&lt;host&gt;</code>; <code class="code">KeepAlive</code>, stderr
-      <code class="code">mouth.err</code>; booted out with the ear before the daemon is touched, and
-      once the new daemon answers ready loaded afresh and ready when that daemon lists its track, its
-      held, disabled and failure lines the ear's. Ear and mouth are each tried whatever the other's
-      outcome; each failure is its own <code class="code">rift setup:</code> line, exit 1 once both
-      are tried, the daemon serving.</li>
+      mouth &lt;host&gt; --speaker</code> from a copy of its own,
+      <code class="code">~/.local/libexec/rift/mouth</code>, a path no setup older than the mouth
+      writes (the ear's stays where its microphone grant is), so a rollback or
+      <code class="code">upgrade --back</code> leaves the mouth on a release that knows it, idling
+      on an older daemon with its backoff and its capped <code class="code">mouth.err</code>, never
+      an older program respawning. <code class="code">&lt;host&gt;</code> is the ear's, so its track
+      is <code class="code">mouth-&lt;host&gt;</code>; <code class="code">KeepAlive</code>. Booted out
+      with the ear before the daemon is touched, its copy and plist written only once the daemon
+      and the ear are good, then loaded afresh and ready when the daemon lists its track, its held
+      and disabled lines the ear's; a failure from that write on boots it out and removes plist and
+      copy before exit 1, so a failed setup leaves nothing of the mouth.</li>
   </ul>
   <div class="table-wrap">
     <table data-table>
@@ -430,6 +451,7 @@
         <tr><td>the daemon drains</td><td>each play hushed in turn inside <code class="code">$RIFT_DRAIN_MS</code>, one not answered by then ended at its last report, each logged <code class="code">stop</code> before <code class="code">stop</code>; the mouth drops its queue as the connection goes</td><td>all of it</td></tr>
         <tr><td>the daemon is killed</td><td>the mouth drops its queue as the connection goes; each giver's ends with an unknown outcome</td><td>the <code class="code">play</code> and its closed runs; the next boot logs <code class="code">played</code> <code class="code">lost</code>, the run under way not derivable but from the mouth's frames, when the ears were open</td></tr>
         <tr><td>the output vanishes</td><td>its queue kept; the next default opened, playing on with a new run, a hole and the new <code class="code">speaker</code> in the track; no output, a wait and a paced giver</td><td>all of it; samples the old output took and had not sounded count as played</td></tr>
+        <tr><td>the output fails, still listed</td><td>its open ended, said, opened again a poll on, playing on with a new run; stuck past <code class="code">$RIFT_STALL_MS</code>, the play ended <code class="code">mouth</code></td><td>all of it, as above</td></tr>
         <tr><td>the giver disconnects</td><td>before <code class="code">end</code>, hushed, <code class="code">left</code>; after it, played out</td><td>all of it</td></tr>
       </tbody>
     </table>
@@ -445,9 +467,10 @@
       <code class="code">$RIFT_MIC</code> for inputs: a directory whose <code class="code">default</code>
       names the default output; each file under <code class="code">outputs/</code> an output holding
       <code class="code">&lt;rate&gt; &lt;channels&gt; &lt;latency ms&gt;</code> or
-      <code class="code">fail</code>, unlisted when the file goes; it takes in real time, and with a
+      <code class="code">fail</code> (an open refused, or an open one failing as its file comes to
+      say so), unlisted when the file goes; it takes in real time, and with a
       <code class="code">take</code> file never past the output samples it names, in all for this
-      connection, so a test, not the clock, decides how far a play gets; every sample taken appended
+      connection, stalling there, so a test, not the clock, decides how far a play gets; every sample taken appended
       to <code class="code">heard/&lt;output&gt;</code> and an open and close line per open to
       <code class="code">log</code>. The cpal calls live in
       <code class="code">src/speaker.rs</code>, exempt from coverage as <code class="code">src/mic.rs</code>
@@ -461,24 +484,36 @@
       (<code class="code">lost</code>, the next boot's). <code class="code">mouth</code>, against the
       fake output: a play to its end at 16, 24 and 48 kHz into 48 and 44.1 kHz outputs, the same tone
       at the same level in <code class="code">heard</code>; <code class="code">rift play</code> to its
-      end and stopped by a signal; <code class="code">rift hush</code> at a set
-      <code class="code">take</code>, its counts exact; a giver that stalls (runs split, holes); the
-      default changed mid-play; no output, then a refused one; the linger; the ears closed; the drain;
-      an older daemon; a stop signal. <code class="code">setup</code>: the plist, disabled, held,
-      ready, both failing, <code class="code">--remove</code>.</li>
+      end and stopped by a signal; an empty play ended at its <code class="code">end</code> and at
+      its hush; <code class="code">rift hush</code> at a set <code class="code">take</code>, its
+      <code class="code">played</code> checked against the positions the fake's own record says it
+      took, the give after it refused and uncounted, nothing but silence taken after; a giver that
+      stalls (runs split, holes); the default changed mid-play; no output, then a refused one; an
+      output failing mid-play and recovering; the linger; the ears closed; the drain; an older
+      daemon; a stop signal. <code class="code">stuck</code>: an output taking nothing, ended by the
+      stall rule. <code class="code">setup</code>: the plist, disabled, held, ready, an ear failing
+      (the mouth not touched), a mouth failing (nothing of it left),
+      <code class="code">--remove</code>.</li>
     <li><strong>Deterministic on a slow runner.</strong> Every step waits on what it can observe (a
       feed line, a log line, a count in <code class="code">heard</code>) under the suite's bounds,
       never on a sleep; how far a play gets is <code class="code">take</code>'s, never the machine's
       speed; runs are checked contiguous and summing to what played, never counted, since a busy
       machine may run a mouth dry; a time is asserted only as a bound read around the act, the 1 s
-      cut as at least 1 s, the linger as at least 250 ms.</li>
+      cut as at least 1 s.</li>
+    <li><strong>Known limits.</strong> Samples an output took and had not sounded when it is lost
+      count as played, up to one output latency. A play starting within 20 ms of the last loses up to
+      20 ms of the mouth's own track. A killed daemon's <code class="code">lost</code> counts only
+      its logged runs. Two outputs of one name are one to the mouth, the first listed opened.</li>
     <li><strong>Checked on a Mac, by hand.</strong> Each rate through the built-in speakers, with no
       click at a give and none at a run; given → sounding and hush → silence, by the ear hearing the
       speakers, and whether cpal's reported latency matches, there and on a Bluetooth headset; the
       default moved between speakers, wired and Bluetooth mid-play, and a headset unplugged; what the
-      first play after idle pays for the open; the job under launchd from the fixed copy, asking nothing; sleep
-      and wake mid-play; the output's rate changed in Audio MIDI Setup mid-play; a muted output,
-      whose taken samples still count as played.</li>
+      first play after idle pays for the open; the job under launchd from its own copy, asking
+      nothing; sleep and wake mid-play; the output's rate changed in Audio MIDI Setup mid-play and a
+      Bluetooth headset switching profile, each seen as a failed output and reopened; no glitch from
+      the callback's mutex under load; a muted output, whose taken samples still count as played;
+      a rollback (<code class="code">rift upgrade --back</code> onto the release before the mouth)
+      leaving the mouth idle with its log capped.</li>
   </ul>
 </section>
 
@@ -569,12 +604,13 @@
         <tr><td class="table-mono">&lt;root&gt;/run/rift.sock</td><td>the socket, in <code class="code">run/</code> (0700) beside <code class="code">serve.lock</code> (the <code class="code">flock</code> that admits one instance), <code class="code">serve.pid</code> (a hint) and <code class="code">serve.log</code> (start, refused, accept, degraded, exit and panic lines)</td></tr>
         <tr><td class="table-mono">&lt;root&gt;/serve.err</td><td>launchd's stderr, for a failure before the daemon's log</td></tr>
         <tr><td class="table-mono">&lt;archive&gt;/audio/…, &lt;archive&gt;/index.ndjson</td><td>the archive, when one is set: every segment that left the window at its path, and its <code class="code">segment</code> event, one line each (<a href="protocol.html#audio">a repeated line</a> after a kill); nothing deletes there</td></tr>
-        <tr><td class="table-mono">~/.local/libexec/rift/rift</td><td>the standing ear's program: the signed release copied to one path every release shares, the one the microphone's grant belongs to (<a href="#identity">identity</a>), and the standing mouth's</td></tr>
+        <tr><td class="table-mono">~/.local/libexec/rift/rift</td><td>the standing ear's program: the signed release copied to one path every release shares, the one the microphone's grant belongs to (<a href="#identity">identity</a>)</td></tr>
+        <tr><td class="table-mono">~/.local/libexec/rift/mouth</td><td>the standing mouth's program: the signed release, copied as the mouth is loaded, at a path no release older than the mouth writes; <code class="code">setup --remove</code> removes it with the ear's copy and the directory</td></tr>
         <tr><td class="table-mono">~/.local/bin/rift</td><td>the binary: <a class="link" href="https://gigantic.dev/hotswap/">hotswap</a>'s link through <code class="code">~/.local/share/hotswap/rift/current</code>, the release installed; hotswap's record is under <code class="code">~/.local/state/hotswap/</code></td></tr>
         <tr><td class="table-mono">~/Library/LaunchAgents/dev.gigantic.rift.upgrade.plist</td><td>hotswap's upgrade agent: <code class="code">rift upgrade</code> every 900 s</td></tr>
         <tr><td class="table-mono">~/Library/LaunchAgents/dev.gigantic.rift.plist</td><td>the launchd agent: <code class="code">KeepAlive</code> on an unclean exit only, <code class="code">RunAtLoad</code></td></tr>
         <tr><td class="table-mono">~/Library/LaunchAgents/dev.gigantic.rift.ear.plist</td><td>the standing ear's agent: <code class="code">~/.local/libexec/rift/rift device ear &lt;host&gt; --mic</code>, <code class="code">KeepAlive</code> always, <code class="code">RunAtLoad</code></td></tr>
-        <tr><td class="table-mono">~/Library/LaunchAgents/dev.gigantic.rift.mouth.plist</td><td>the standing mouth's agent, <code class="code">~/.local/libexec/rift/rift device mouth &lt;host&gt; --speaker</code>, as the ear's</td></tr>
+        <tr><td class="table-mono">~/Library/LaunchAgents/dev.gigantic.rift.mouth.plist</td><td>the standing mouth's agent, <code class="code">~/.local/libexec/rift/mouth device mouth &lt;host&gt; --speaker</code>, as the ear's, written only as it is loaded</td></tr>
       </tbody>
     </table>
   </div>
@@ -603,6 +639,7 @@
         <tr><td class="table-mono">RIFT_SEGMENT_MS</td><td>a segment's length, in whole 20 ms frames, at least one, default 10000</td></tr>
         <tr><td class="table-mono">RIFT_SIGN_MS</td><td>how long <code class="code">setup</code> lets each <code class="code">launchctl</code>, <code class="code">scutil</code>, <code class="code">security</code>, <code class="code">openssl</code> and <code class="code">codesign</code> call run before killing it and failing, naming the call, default 30000</td></tr>
         <tr><td class="table-mono">RIFT_SPEAKER</td><td>the suite's fake outputs in place of the system's: a directory, its format in <code class="code">src/mouth.rs</code> (<a href="#mouth">the mouth</a>)</td></tr>
+        <tr><td class="table-mono">RIFT_STALL_MS</td><td>how long a play's mouth may report nothing while it owes progress before the daemon ends the play <code class="code">mouth</code>, checked every second, default 5000</td></tr>
         <tr><td class="table-mono">RIFT_ZERO_MS</td><td>how long a microphone may give only exact zeros after its open before <code class="code">--mic</code> closes it as a failed open, naming the grant, default 2000</td></tr>
       </tbody>
     </table>
@@ -637,7 +674,7 @@ mise run dist                           # a checkout: this host's release archiv
         <tr><td class="table-mono">rift device ear|mouth &lt;name&gt; &lt;file.pcm&gt; [--fast]</td><td>a device, its own process: plays a raw PCM file (16 kHz, mono, 16-bit little-endian) as the track's frames, a short tail dropped, answering every ping, paced in real time and stamped from now, a pause or clock step of over 100 ms playing on from the clock as a hole, or with <code class="code">--fast</code> sent as fast as each is answered and stamped as if captured ending now; prints its reply, then each notice and refusal; exit 0 once every frame is answered, <code class="code">{"code":"unknown","ok":false}</code> and exit 1 if the connection ends first; an unreadable file is <code class="code">rift device: &lt;cause&gt;</code>, exit 1</td></tr>
         <tr><td class="table-mono">rift device ear &lt;name&gt; --mic [&lt;microphone&gt;]</td><td>a device, its own process, macOS only: hears the default input (the built-in in place of a Bluetooth one, when there is one), or the one named, whatever its transport, while the ears are open (<a href="#microphone">the microphone</a>); prints its reply, then each notice and refusal; when the connection ends (<code class="code">{"code":"unknown","ok":false}</code>) or the daemon is down, it waits a poll and connects again; SIGTERM, SIGINT or SIGHUP, its only exit: <code class="code">rift device: stopped by SIG&lt;name&gt;</code>, exit 0; a withheld grant or a failed open is one stderr line, and it keeps trying; on Linux exit 2</td></tr>
         <tr><td class="table-mono">rift device mouth &lt;name&gt; --speaker</td><td>a device, its own process, macOS only: plays what it is given for <code class="code">mouth-&lt;name&gt;</code> on the default output, following it (<a href="#mouth">the mouth</a>), and streams what the output took as the track while the ears are open; stands, reconnects and stops as <code class="code">--mic</code> does; a daemon that plays nothing is one stderr line, <code class="code">rift device: the daemon &lt;version&gt; plays nothing; fix: rift setup</code>, waited out as a refusal; on Linux exit 2</td></tr>
-        <tr><td class="table-mono">rift setup [--print | --remove]</td><td>brings the release into hotswap's layout and links <code class="code">~/.local/bin/rift</code> (with none installed, the latest, through packslip), signs the release with <a href="#identity">rift's identity</a> and copies it to the standing devices' fixed path unless already there, then writes the three agents' plists, the daemon's on the link and the ear's and the mouth's on that copy, boots the ear's and the mouth's out, loads the daemon's, or swaps it with one <code class="code">kickstart -k</code> (a bootout then a bootstrap when it re-signed the release), and waits for the new daemon to answer health ready, then loads the ear's and the mouth's, each waited on until that daemon lists <code class="code">ear-&lt;host&gt;</code> or <code class="code">mouth-&lt;host&gt;</code>, each loaded afresh once when not ready past <code class="code">$RIFT_RELOAD_MS</code>, each tried whatever the other's outcome; a failure of either is <code class="code">rift setup: &lt;line naming its label&gt;</code>, exit 1 once both are tried, the daemon left serving; one whose track another device already holds is loaded unwaited, a disabled one left unloaded, each said in a line, exit 0; <code class="code">--print</code> prints the three plists (the daemon's alone off macOS), <code class="code">--remove</code> has hotswap forget the layout and the upgrade agent, unloads the three agents and removes their plists, the link, the fixed copy, the keychain and its password</td></tr>
+        <tr><td class="table-mono">rift setup [--print | --remove]</td><td>brings the release into hotswap's layout and links <code class="code">~/.local/bin/rift</code> (with none installed, the latest, through packslip), signs the release with <a href="#identity">rift's identity</a> and copies it to the ear's fixed path unless already there, then writes the daemon's plist on the link and the ear's on that copy, boots the ear's and the mouth's out, loads the daemon's, or swaps it with one <code class="code">kickstart -k</code> (a bootout then a bootstrap when it re-signed the release), and waits for the new daemon to answer health ready, then loads the ear's, waited on until that daemon lists <code class="code">ear-&lt;host&gt;</code>; with the ear good, copies the release to the mouth's own path, writes its plist and loads it, waited on until <code class="code">mouth-&lt;host&gt;</code> is listed, a failure there booting it out and removing both; each loaded afresh once when not ready past <code class="code">$RIFT_RELOAD_MS</code>; a failure is <code class="code">rift setup: &lt;line naming its label&gt;</code>, exit 1, the daemon left serving; one whose track another device already holds is loaded unwaited, a disabled one left unloaded, each said in a line, exit 0; <code class="code">--print</code> prints the three plists (the daemon's alone off macOS), <code class="code">--remove</code> has hotswap forget the layout and the upgrade agent, unloads the three agents and removes their plists, the link, both copies, the keychain and its password</td></tr>
         <tr><td class="table-mono">rift upgrade [--check | --back | --retry]</td><td>hotswap's swap onto a newer release: installed beside the running one, <code class="code">current</code> moved, <code class="code">rift setup</code>, then the smoke (<code class="code">rift version</code>, <code class="code">rift status</code> until the daemon answers with it); a failure rolls back. Exit 0 green or settled, 1 red, 2 unable to try</td></tr>
         <tr><td class="table-mono">rift version</td><td>the build, as the hello reports it</td></tr>
       </tbody>

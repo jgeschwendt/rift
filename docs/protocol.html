@@ -329,16 +329,25 @@
       <code class="code">played</code> event's fields and <code class="code">seq</code>, with no
       <code class="code">ok</code>, then the end of stream:
       <code class="code">{"dropped":0,"given":72000,"play":3,"played":72000,"reason":"end","seq":42,"track":"mouth-desk"}</code>.
-      A give whose reply was withheld is answered first; one read after the end is refused
-      <code class="code">bad_request</code> and is not in <code class="code">given</code>. A giver that
-      leaves after <code class="code">end</code> leaves its play playing out, with no one to tell.</li>
+      A give whose reply was withheld is answered first; one read after <code class="code">end</code>,
+      a hush or the play's end is refused <code class="code">bad_request</code>, never counted or
+      passed on. A play given nothing ends at once at its <code class="code">end</code> or its hush,
+      with its reason, its mouth never having held any of it. A giver that leaves after
+      <code class="code">end</code> leaves its play playing out, with no one to tell.</li>
+    <li><strong>A stall.</strong> A play whose mouth owes progress (audio it holds untaken, or the
+      play's end after <code class="code">end</code>) and has reported nothing for
+      <code class="code">$RIFT_STALL_MS</code> (default 5000; checked every second) ends
+      <code class="code">mouth</code>, its giver answered, its mouth told to drop it: an output
+      failed or stuck in place never holds a giver, and a giver gone while its reply is withheld is
+      seen then at the latest.</li>
     <li><strong>Reasons.</strong> <code class="code">end</code>: the giver sent
       <code class="code">end</code> and the mouth took all it was given.
       <code class="code">hush</code>: a <code class="code">hush</code> request.
       <code class="code">quiet</code>: quiet was set on. <code class="code">left</code>: the giver's
       connection ended before <code class="code">end</code>, which hushes the play.
       <code class="code">mouth</code>: the mouth's connection ended, its queue was full, it said
-      <code class="code">done</code> unasked, or it had not answered a hush within 1 s and was cut.
+      <code class="code">done</code> unasked, it stalled, or it had not answered a hush within 1 s and
+      was cut.
       <code class="code">stop</code>: the daemon's drain. <code class="code">lost</code>: a kill; the
       next boot's.</li>
     <li><strong>Counts.</strong> Every count is in the play's own samples at its rate.
@@ -383,7 +392,8 @@
       <code class="code">from</code> starts the next run and logs the last. <code class="code">sound</code>
       and <code class="code">done</code> naming a play that is not open are ignored; a
       <code class="code">done</code> for one neither ended nor hushed ends it
-      <code class="code">mouth</code>. A device without
+      <code class="code">mouth</code>. The mouth ignores a give for a play it has ended or finished,
+      and an <code class="code">end</code> or hush for one it never held. A device without
       <code class="code">plays</code>, the file-fed mouth among them, streams its track as before and
       is never given audio.</li>
     <li><strong>Its track.</strong> The mouth's frames are what its output took, at 16 kHz, cut on
