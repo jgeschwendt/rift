@@ -3797,6 +3797,229 @@ mod tests {
         .unwrap_or_default()
     }
 
+    /// Engine jobs against a stub `launchctl` (`launchctl.log` its calls, `loaded/` its jobs, each
+    /// started as its plist's command, a bootout waiting for the process to exit): `add` writes
+    /// the plist, the command verbatim, and is ready once health lists the kind on the
+    /// command's track, the job's stderr capped as its engine connects; a second `add` boots the
+    /// old job out and waits for its engine to leave before the new loads; a kind and track
+    /// another's engine holds is loaded unwaited; a disabled job written, not loaded; a command
+    /// naming no track refused; one never ready reloaded once, then named; `list` prints each
+    /// command as given; `remove` boots out and removes; `setup --remove` takes them too.
+    #[test]
+    fn jobs() -> Outcome {
+        let root = temp("jobs")?;
+        let _started = Started(root.clone());
+        let (home, bin, data) = (
+            format!("{root}/home"),
+            format!("{root}/bin"),
+            format!("{root}/data"),
+        );
+        let (mut daemon, _) = serve(&data, &[("RIFT_LOG_CAP", "10")])?;
+        fs::create_dir_all(format!("{root}/loaded"))?;
+        fs::create_dir_all(&bin)?;
+        fs::write(
+            format!("{bin}/launchctl"),
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> {root}/launchctl.log
+job=${{2##*/}}
+start() {{ RIFT_ROOT=$(sed -n 's|.*<key>RIFT_ROOT</key><string>\(.*\)</string>.*|\1|p' $1) $(sed -n 's|.*<array>\(.*\)</array>|\1|p' $1 | sed 's|<string>||g; s|</string>| |g') >/dev/null 2>&1 & echo $! > {root}/loaded/$(basename $1 .plist); }}
+stop() {{ kill $1 2>/dev/null || return 0; while kill -0 $1 2>/dev/null; do sleep 0.02; done; }}
+case $1 in
+print) [ -f {root}/loaded/$job ] || exit 113;;
+bootout) stop $(cat {root}/loaded/$job); rm {root}/loaded/$job;;
+bootstrap) start $3;;
+print-disabled) [ -f {root}/disabled ] && sed 's/.*/	"&" => disabled/' {root}/disabled; exit 0;;
+esac
+"#
+            ),
+        )?;
+        fs::set_permissions(format!("{bin}/launchctl"), Permissions::from_mode(0o755))?;
+        let path = format!("{bin}:/usr/bin:/bin");
+        let run = |envs: &[(&str, &str)], args: &[&str]| {
+            rift(
+                &data,
+                &[
+                    &[
+                        ("HOME", home.as_str()),
+                        ("HOTSWAP_TEST_HOME", home.as_str()),
+                        ("PATH", path.as_str()),
+                    ],
+                    envs,
+                ]
+                .concat(),
+                args,
+            )
+        };
+        let gui = format!(
+            "gui/{}",
+            String::from_utf8(bounded(Command::new("id").arg("-u"), "id")?.stdout)?.trim()
+        );
+        let agents = format!("{home}/Library/LaunchAgents");
+        let at = |kind: &str| {
+            (
+                format!("{agents}/dev.gigantic.rift.{kind}.plist"),
+                format!("{gui}/dev.gigantic.rift.{kind}"),
+            )
+        };
+        let ((echo, echo_job), (turn, turn_job), (words, _)) =
+            (at("echo"), at("turn"), at("words"));
+        let exe = env!("CARGO_BIN_EXE_rift");
+        let tail = |track: &'static str| [exe, "engine", "run", "tail", track];
+        let adding = |kind: &'static str, command: &[&'static str]| -> Vec<&'static str> {
+            [&["engine", "add", kind, "--"][..], command].concat()
+        };
+        // its stderr past the cap, capped as its engine connects
+        fs::create_dir_all(format!("{data}/engines"))?;
+        fs::write(format!("{data}/engines/echo.err"), "x".repeat(20))?;
+        same(
+            &run(&[], &adding("echo", &tail("ear-test")))?,
+            &format!("0\nwrote {echo}\nlaunchctl bootstrap {gui} {echo}\n"),
+        )?;
+        same(
+            &fs::read_to_string(&echo)?,
+            &format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>EnvironmentVariables</key>
+  <dict><key>RIFT_ROOT</key><string>{data}</string></dict>
+  <key>ExitTimeOut</key>
+  <integer>3</integer>
+  <key>KeepAlive</key>
+  <true/>
+  <key>Label</key>
+  <string>dev.gigantic.rift.echo</string>
+  <key>ProgramArguments</key>
+  <array><string>{exe}</string><string>engine</string><string>run</string><string>tail</string><string>ear-test</string></array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardErrorPath</key>
+  <string>{data}/engines/echo.err</string>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+</dict>
+</plist>
+"#
+            ),
+        )?;
+        same(
+            &format!(
+                "{} {}",
+                fs::read_to_string(format!("{data}/engines/echo.err.1"))?.len(),
+                fs::metadata(format!("{data}/engines/echo.err"))?.len()
+            ),
+            "20 0",
+        )?;
+        // the swap: the old job out, its engine gone from health, then the new one loaded
+        drop(fs::remove_file(format!("{root}/launchctl.log")));
+        same(
+            &run(
+                &[],
+                &adding(
+                    "echo",
+                    &[&tail("ear-test")[..], &["--tail-ms", "50"]].concat(),
+                ),
+            )?,
+            &format!(
+                "0\nlaunchctl bootout {echo_job}\nwrote {echo}\nlaunchctl bootstrap {gui} {echo}\n"
+            ),
+        )?;
+        same(
+            &fs::read_to_string(format!("{root}/launchctl.log"))?,
+            &format!(
+                "print {echo_job}\nbootout {echo_job}\nprint {echo_job}\nprint-disabled {gui}\nprint {echo_job}\nprint {echo_job}\nbootstrap {gui} {echo}\n"
+            ),
+        )?;
+        // another's engine on the track the command names: loaded to take over once it leaves
+        let mut held = Daemon(
+            Command::new(exe)
+                .env("RIFT_ROOT", &data)
+                .args(&tail("ear-held")[1..])
+                .stdout(Stdio::null())
+                .spawn()?,
+        );
+        until(|| {
+            let mut conn = greet(&data).map_err(|cause| io::Error::other(cause.to_string()))?;
+            Ok(say(&mut conn, r#"{"op":"health"}"#)?.contains("ear-held"))
+        })?;
+        same(
+            &run(
+                &[("RIFT_BOOTOUT_MS", "0")],
+                &adding("echo", &tail("ear-held")),
+            )?,
+            &format!(
+                "0\nlaunchctl bootout {echo_job}\nwrote {echo}\nlaunchctl bootstrap {gui} {echo}\near-held's echo engine is another's; dev.gigantic.rift.echo takes it over once it leaves\n"
+            ),
+        )?;
+        drop(held.0.kill());
+        drop(held.0.wait());
+        // disabled: written, not loaded, its command kept as given
+        fs::write(format!("{root}/disabled"), "dev.gigantic.rift.words\n")?;
+        same(
+            &run(
+                &[],
+                &adding("words", &["a&b <c>", "ear-test", "--terms", "x"]),
+            )?,
+            &format!(
+                "0\nwrote {words}\ndev.gigantic.rift.words is disabled, so written and not loaded; launchctl enable {gui}/dev.gigantic.rift.words stands it\n"
+            ),
+        )?;
+        same(
+            &run(&[], &["engine", "list"])?,
+            &format!(
+                "0\n{}\n{}\n",
+                json!({"command": tail("ear-held"), "kind": "echo"}),
+                json!({"command": ["a&b <c>", "ear-test", "--terms", "x"], "kind": "words"})
+            ),
+        )?;
+        // no track named; never ready, reloaded once, then named
+        same(
+            &run(&[], &adding("turn", &["/bin/true"]))?,
+            "1\nrift engine: the command names no track (ear-<name> or mouth-<name>) to wait for\n",
+        )?;
+        same(
+            &run(
+                &[("RIFT_READY_MS", "0"), ("RIFT_RELOAD_MS", "0")],
+                &adding("turn", &[exe, "listen", "ear-test"]),
+            )?,
+            &format!(
+                "1\nwrote {turn}\nlaunchctl bootstrap {gui} {turn}\ndev.gigantic.rift.turn not ready 0 ms after its load; loading it again\nlaunchctl bootout {turn_job}\nlaunchctl bootstrap {gui} {turn}\nrift engine: dev.gigantic.rift.turn not ready 0 ms after its load; see {data}/engines/turn.err\n"
+            ),
+        )?;
+        same(
+            &format!(
+                "{}{}{}",
+                run(&[], &["engine", "remove", "turn"])?,
+                run(&[], &["engine", "remove", "speech"])?,
+                run(&[], &["engine", "add", "nose", "--", "x"])?
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+            ),
+            &format!("0\nlaunchctl bootout {turn_job}\nremoved {turn}\n0\n2"),
+        )?;
+        // setup --remove takes the engine jobs with the rest
+        let removed = run(&[], &["setup", "--remove"])?;
+        same(
+            &format!(
+                "{} {} {}",
+                removed.contains(&format!(
+                    "launchctl bootout {echo_job}\nremoved {echo}\nremoved {words}\n"
+                )),
+                fs::exists(&echo)?,
+                fs::exists(&words)?
+            ),
+            "true false false",
+        )?;
+        same(
+            &say(&mut greet(&data)?, r#"{"op":"shutdown"}"#)?,
+            r#"{"ok":true}"#,
+        )?;
+        same(&format!("{:?}", daemon.0.wait()?.code()), "Some(0)")
+    }
+
     /// `setup --print` prints both plists on hotswap's link, the ear's track named by a stub
     /// `scutil`, the daemon's alone with no `scutil`, and writes nothing; an install refuses a host
     /// name unset, which `--remove` never asks for; an ear disabled is written, not loaded; a track
@@ -4508,18 +4731,23 @@ esac
             fs::write(format!("{root}/loaded/{loaded}"), "")?;
         }
         plant(&old)?;
-        // the keychain and its password go as files, the root stays; no host name is asked for
+        // the keychain and its password go as files, the root stays; no host name is asked for;
+        // the engine jobs, none here, are asked after first
         fs::write(format!("{root}/fail-scutil"), "")?;
+        let engines: String = ["echo", "speech", "turn", "words"]
+            .iter()
+            .map(|kind| absent(&format!("{gui}/dev.gigantic.rift.{kind}")))
+            .collect();
         same(
             &format!("{}{}{}", rerun(&["--remove"], &[])?, calls()?, signs()?),
             &format!(
-                "0\nremoved {earlier}\nlaunchctl bootout {earjob}\nremoved {earfile}\nlaunchctl bootout {mouthjob}\nremoved {mouthfile}\nlaunchctl bootout {job}\nremoved {file}\nremoved {exe}\nremoved {fixed}\nremoved {mouthcopy}\nremoved {moved}/rift.keychain-db\nremoved {moved}/rift.keychain-pass\nprint {gui}/dev.gigantic.rift.upgrade\nprint {former}\nprint {former}\n{deafen}print {job}\nbootout {job}\nprint {job}\nprint {job}\n"
+                "0\nremoved {earlier}\nlaunchctl bootout {earjob}\nremoved {earfile}\nlaunchctl bootout {mouthjob}\nremoved {mouthfile}\nlaunchctl bootout {job}\nremoved {file}\nremoved {exe}\nremoved {fixed}\nremoved {mouthcopy}\nremoved {moved}/rift.keychain-db\nremoved {moved}/rift.keychain-pass\nprint {gui}/dev.gigantic.rift.upgrade\nprint {former}\nprint {former}\n{engines}{deafen}print {job}\nbootout {job}\nprint {job}\nprint {job}\n"
             ),
         )?;
         same(
             &format!("{}{}", rerun(&["--remove"], &[])?, calls()?),
             &format!(
-                "0\nprint {gui}/dev.gigantic.rift.upgrade\n{unheard}print {job}\nprint {job}\n"
+                "0\nprint {gui}/dev.gigantic.rift.upgrade\n{engines}{unheard}print {job}\nprint {job}\n"
             ),
         )?;
         same(

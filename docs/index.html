@@ -596,7 +596,7 @@
 <section class="docs-section" id="engines" data-component="engines">
   <header>
     <h2 class="h2">Engines</h2>
-    <p class="docs-note">Built through slice 5; the clean track, the jobs, the model engines and the loop designed. The work that reads sound (the echo stage, voice
+    <p class="docs-note">Built through slice 6; the clean track, the model engines and the loop designed. The work that reads sound (the echo stage, voice
       and turns, words) and the work that makes it (speech) are engines: programs on rift's socket,
       each of one kind on one track, swapped while the daemon runs. Models come and go; the daemon,
       its clock, its log and its checks stay. The wire is <a href="protocol.html#engines">the
@@ -693,14 +693,23 @@
       <code class="code">rift engine add &lt;kind&gt; -- &lt;command…&gt;</code> writes
       <code class="code">dev.gigantic.rift.&lt;kind&gt;</code> (<code class="code">KeepAlive</code>,
       <code class="code">RunAtLoad</code>, stderr to <code class="code">&lt;root&gt;/engines/&lt;kind&gt;.err</code>,
-      capped by the daemon as each engine connects), boots out the job it replaces, loads the new
-      one and waits until health lists an engine of that kind on the command's track;
-      <code class="code">rift engine remove &lt;kind&gt;</code> unloads it and removes its plist;
-      <code class="code">rift engine list</code> prints each job's command. <code class="code">setup</code>
-      leaves engine jobs as they are (an engine stands and reconnects across the daemon's swap, as
-      a device does) and <code class="code">setup --remove</code> removes them. No fixed copy: an
-      engine opens no microphone or output, so no grant is keyed to its path; it runs from wherever
-      its command says.</li>
+      capped by the daemon as each engine connects), the command recorded verbatim, boots out the
+      job it replaces and waits for its engine to leave health, loads the new one and waits until
+      health lists an engine of that kind on the command's track (its first word of a track's form;
+      a command naming none is refused), reloading once as <code class="code">setup</code> does; a
+      kind and track another's engine still holds is loaded unwaited, to take over once it leaves,
+      and a job disabled in launchd is written, not loaded. <code class="code">rift engine remove
+      &lt;kind&gt;</code> unloads it and removes its plist; <code class="code">rift engine list</code>
+      prints each job's command, one <code class="code">{"command":[…],"kind":…}</code> line each.
+      <code class="code">setup</code> leaves engine jobs as they are (an engine stands and
+      reconnects across the daemon's swap, as a device does) and <code class="code">setup
+      --remove</code> removes them. No fixed copy: an engine opens no microphone or output, so no
+      grant is keyed to its path; it runs from wherever its command says, a checkout or an
+      installed copy alike.</li>
+    <li><strong>One job per kind, so one engine per kind per machine by job.</strong> A second
+      track's engine of a kind (a second ear's words) runs as any client does: by hand, or as a
+      launchd job of one's own under another label; the job names its track in its command, and
+      the slot it takes is that track's.</li>
   </ul>
   <pre class="snippet">rift engine add words -- uv run --project ~/src/transcribe transcribe ear-mac --terms ~/.config/transcribe/terms.txt
 rift engine add echo -- ~/.local/bin/rift engine run tail ear-mac
@@ -760,6 +769,7 @@ rift status                                   # "engines":{"ear-mac":{"echo":"ta
         <tr><td class="table-mono">~/Library/LaunchAgents/dev.gigantic.rift.upgrade.plist</td><td>hotswap's upgrade agent: <code class="code">rift upgrade</code> every 900 s</td></tr>
         <tr><td class="table-mono">~/Library/LaunchAgents/dev.gigantic.rift.plist</td><td>the launchd agent: <code class="code">KeepAlive</code> on an unclean exit only, <code class="code">RunAtLoad</code></td></tr>
         <tr><td class="table-mono">~/Library/LaunchAgents/dev.gigantic.rift.ear.plist</td><td>the standing ear's agent: <code class="code">~/.local/libexec/rift/rift device ear &lt;host&gt; --mic</code>, <code class="code">KeepAlive</code> always, <code class="code">RunAtLoad</code></td></tr>
+        <tr><td class="table-mono">~/Library/LaunchAgents/dev.gigantic.rift.&lt;kind&gt;.plist, &lt;root&gt;/engines/&lt;kind&gt;.err</td><td>an engine's job, its command as <code class="code">rift engine add</code> was given it, <code class="code">KeepAlive</code> always, <code class="code">RunAtLoad</code>, and its stderr</td></tr>
         <tr><td class="table-mono">~/Library/LaunchAgents/dev.gigantic.rift.mouth.plist</td><td>the standing mouth's agent, <code class="code">~/.local/libexec/rift/mouth device mouth &lt;host&gt; --speaker</code>, as the ear's, written only as it is loaded</td></tr>
       </tbody>
     </table>
@@ -778,7 +788,7 @@ rift status                                   # "engines":{"ear-mac":{"echo":"ta
         <tr><td class="table-mono">RIFT_BOOTOUT_MS</td><td><code class="code">setup</code>'s wait for launchd to let go of a job after a bootout, default 30000</td></tr>
         <tr><td class="table-mono">RIFT_DRAIN_MS</td><td>the drain's budget for open connections before they are cut, default 1000 (launchd's <code class="code">ExitTimeOut</code> is 3 s); before them, the wait for each mouth to answer its play's hush, within the same amount</td></tr>
         <tr><td class="table-mono">RIFT_LINGER_MS</td><td>how long after the output last took a play's sample <code class="code">--speaker</code> keeps it open, default 10000</td></tr>
-        <tr><td class="table-mono">RIFT_LOG_CAP</td><td>the size at which <code class="code">serve.log</code>, <code class="code">serve.err</code>, <code class="code">ear.err</code> and <code class="code">mouth.err</code> are each copied to <code class="code">.1</code> and emptied (emptied, not renamed, since launchd's writer appends on), default 1 MiB</td></tr>
+        <tr><td class="table-mono">RIFT_LOG_CAP</td><td>the size at which <code class="code">serve.log</code>, <code class="code">serve.err</code>, <code class="code">ear.err</code>, <code class="code">mouth.err</code> and each <code class="code">engines/&lt;kind&gt;.err</code> are each copied to <code class="code">.1</code> and emptied (emptied, not renamed, since launchd's writer appends on), default 1 MiB</td></tr>
         <tr><td class="table-mono">RIFT_MIC</td><td>the suite's fake microphones in place of the system's: a directory, its format in <code class="code">src/ear.rs</code></td></tr>
         <tr><td class="table-mono">RIFT_OPEN_MS</td><td>how long a microphone's open may wait before <code class="code">--mic</code> names the grant, waiting on, default 10000</td></tr>
         <tr><td class="table-mono">RIFT_PING_MS</td><td>how long after a device's last ping a frame's reply carries the next, default 10000</td></tr>
@@ -824,6 +834,7 @@ mise run dist                           # a checkout: this host's release archiv
         <tr><td class="table-mono">rift device ear|mouth &lt;name&gt; &lt;file.pcm&gt; [--fast]</td><td>a device, its own process: plays a raw PCM file (16 kHz, mono, 16-bit little-endian) as the track's frames, a short tail dropped, answering every ping, paced in real time and stamped from now, a pause or clock step of over 100 ms playing on from the clock as a hole, or with <code class="code">--fast</code> sent as fast as each is answered and stamped as if captured ending now; prints its reply, then each notice and refusal; exit 0 once every frame is answered, <code class="code">{"code":"unknown","ok":false}</code> and exit 1 if the connection ends first; an unreadable file is <code class="code">rift device: &lt;cause&gt;</code>, exit 1</td></tr>
         <tr><td class="table-mono">rift device ear &lt;name&gt; --mic [&lt;microphone&gt;]</td><td>a device, its own process, macOS only: hears the default input (the built-in in place of a Bluetooth one, when there is one), or the one named, whatever its transport, while the ears are open (<a href="#microphone">the microphone</a>); prints its reply, then each notice and refusal; when the connection ends (<code class="code">{"code":"unknown","ok":false}</code>) or the daemon is down, it waits a poll and connects again; SIGTERM, SIGINT or SIGHUP, its only exit: <code class="code">rift device: stopped by SIG&lt;name&gt;</code>, exit 0; a withheld grant or a failed open is one stderr line, and it keeps trying; on Linux exit 2</td></tr>
         <tr><td class="table-mono">rift device mouth &lt;name&gt; --speaker</td><td>a device, its own process, macOS only: plays what it is given for <code class="code">mouth-&lt;name&gt;</code> on the default output, following it (<a href="#mouth">the mouth</a>), and streams what the output took as the track while the ears are open; stands, reconnects and stops as <code class="code">--mic</code> does; a daemon that plays nothing is one stderr line, <code class="code">rift device: the daemon &lt;version&gt; plays nothing; fix: rift setup</code>, waited out as a refusal; on Linux exit 2</td></tr>
+        <tr><td class="table-mono">rift engine add &lt;kind&gt; -- &lt;command…&gt; | remove &lt;kind&gt; | list</td><td>an engine's launchd job, <code class="code">echo</code>, <code class="code">speech</code>, <code class="code">turn</code> or <code class="code">words</code> (<a href="#engines">engines</a>): each call that changes something printed, as <code class="code">setup</code> prints them; a failure is <code class="code">rift engine: &lt;line&gt;</code>, exit 1</td></tr>
         <tr><td class="table-mono">rift engine run tail &lt;ear&gt; [--tail-ms &lt;ms&gt;]</td><td>the reference echo engine on the ear track <code class="code">&lt;ear&gt;</code> (<a href="#engines">engines</a>); prints its reply, then works until the connection ends, <code class="code">{"code":"unknown","ok":false}</code>, exit 1</td></tr>
         <tr><td class="table-mono">rift setup [--print | --remove]</td><td>brings the release into hotswap's layout and links <code class="code">~/.local/bin/rift</code> (with none installed, the latest, through packslip), signs the release with <a href="#identity">rift's identity</a> and copies it to the ear's fixed path unless already there, then writes the daemon's plist on the link and the ear's on that copy, boots the ear's and the mouth's out, loads the daemon's, or swaps it with one <code class="code">kickstart -k</code> (a bootout then a bootstrap when it re-signed the release), and waits for the new daemon to answer health ready, then loads the ear's, waited on until that daemon lists <code class="code">ear-&lt;host&gt;</code>; with the ear good, copies the release to the mouth's own path, writes its plist and loads it, waited on until <code class="code">mouth-&lt;host&gt;</code> is listed, a failure there booting it out and removing both; each loaded afresh once when not ready past <code class="code">$RIFT_RELOAD_MS</code>; a failure is <code class="code">rift setup: &lt;line naming its label&gt;</code>, exit 1, the daemon left serving; one whose track another device already holds is loaded unwaited, a disabled one left unloaded, each said in a line, exit 0; <code class="code">--print</code> prints the three plists (the daemon's alone off macOS), <code class="code">--remove</code> has hotswap forget the layout and the upgrade agent, unloads the three agents and removes their plists, the link, both copies, the keychain and its password</td></tr>
         <tr><td class="table-mono">rift upgrade [--check | --back | --retry]</td><td>hotswap's swap onto a newer release: installed beside the running one, <code class="code">current</code> moved, <code class="code">rift setup</code>, then the smoke (<code class="code">rift version</code>, <code class="code">rift status</code> until the daemon answers with it); a failure rolls back. Exit 0 green or settled, 1 red, 2 unable to try</td></tr>

@@ -2019,6 +2019,11 @@ fn main() -> ExitCode {
                                 match on {
                                     Ok(_) => {
                                         let slot = (track.to_owned(), kind.to_owned());
+                                        // its job's stderr, capped as each engine connects
+                                        rotate(
+                                            &guard.root.join(format!("engines/{kind}.err")),
+                                            setting("RIFT_LOG_CAP", 1u64 << 20u8),
+                                        );
                                         // where its track's frames passed on reach: a turn or
                                         // words engine reading live starts there, an echo
                                         // engine's ruling too
@@ -3000,7 +3005,21 @@ fn main() -> ExitCode {
             write(json!({"event": "exit", "reason": reason}));
             ExitCode::SUCCESS
         }
-        (&["setup"] | &["setup", "--print" | "--remove"], None) => {
+        (
+            &["setup"]
+            | &["setup", "--print" | "--remove"]
+            | &["engine", "list"]
+            | &["engine", "remove", "echo" | "speech" | "turn" | "words"]
+            | &[
+                "engine",
+                "add",
+                "echo" | "speech" | "turn" | "words",
+                "--",
+                _,
+                ..,
+            ],
+            None,
+        ) => {
             // hotswap's link through its `current`, never this executable: a checkout's setup
             // wires the installed release
             let exe = home.join(".local/bin/rift");
@@ -3113,7 +3132,7 @@ fn main() -> ExitCode {
                 };
                 // with no host name (off macOS, no scutil) there is no ear and no mouth: the
                 // daemon's alone
-                if words.contains(&"--print") {
+                if words == ["setup", "--print"] {
                     print!(
                         "{plist}{}",
                         named().map_or_else(
@@ -3176,6 +3195,175 @@ fn main() -> ExitCode {
                         println!("removed {}", file.display());
                     }
                 };
+                let write = |file: &Path, text: &str| -> io::Result<()> {
+                    let staged = file.with_extension("plist.new");
+                    fs::write(&staged, text)?;
+                    fs::rename(&staged, file)?;
+                    println!("wrote {}", file.display());
+                    Ok(())
+                };
+                // the health of a daemon answering ready on the socket, if one does
+                let serving = || -> Option<Value> {
+                    let mut stream = UnixStream::connect(&sock).ok()?;
+                    stream.set_read_timeout(Some(Duration::from_secs(1))).ok()?;
+                    let hello =
+                        json!({"client": format!("rift/{VERSION}"), "op": "hello", "proto": PROTO});
+                    writeln!(stream, "{hello}\n{}", json!({"op": "health"})).ok()?;
+                    let reply: Value =
+                        serde_json::from_str(&BufReader::new(stream).lines().nth(1)?.ok()?).ok()?;
+                    (reply["state"] == "ready").then_some(reply)
+                };
+                // launchd holds a respawn until ThrottleInterval after the last launch: wait it out
+                let ready = |wait: Duration, done: &dyn Fn(&Value) -> bool| {
+                    let begun = Instant::now();
+                    while !serving().is_some_and(|health| done(&health)) {
+                        if begun.elapsed() > wait {
+                            return false;
+                        }
+                        thread::sleep(Duration::from_millis(100));
+                    }
+                    true
+                };
+                let (first, patience) = (
+                    Duration::from_millis(setting("RIFT_RELOAD_MS", 15_000)),
+                    Duration::from_millis(setting("RIFT_READY_MS", 30_000)),
+                );
+                // `name` kickstarted, else loaded afresh, then waited on until the daemon's
+                // health is `done`; a job launchd refused to spawn stays refused through any
+                // kickstart, so one not done past the first budget is loaded afresh, once
+                let up = |name: &str,
+                          file: &Path,
+                          err: &str,
+                          kick: bool,
+                          done: &dyn Fn(&Value) -> bool| {
+                    let load = || -> io::Result<()> {
+                        unload(name)?;
+                        must(&["bootstrap", &gui, &file.to_string_lossy()])
+                    };
+                    if kick {
+                        must(&["kickstart", "-k", &format!("{gui}/{name}")])?;
+                    } else {
+                        load()?;
+                    }
+                    if ready(first, done) {
+                        return Ok(());
+                    }
+                    println!(
+                        "{name} not ready {} ms after its load; loading it again",
+                        first.as_millis()
+                    );
+                    load()?;
+                    if ready(patience, done) {
+                        return Ok(());
+                    }
+                    Err(io::Error::other(format!(
+                        "{name} not ready {} ms after its load; see {}",
+                        patience.as_millis(),
+                        root.join(err).display()
+                    )))
+                };
+                // a job disabled in launchd, as `print-disabled` lists them, is written, never
+                // loaded: the way to opt out
+                let listing = || -> io::Result<String> {
+                    Ok(
+                        String::from_utf8_lossy(&call(&["print-disabled", &gui])?.stdout)
+                            .into_owned(),
+                    )
+                };
+                let disabled = |listed: &str, job: &str| {
+                    let off = listed.contains(&format!("\"{job}\" => disabled"));
+                    if off {
+                        println!(
+                            "{job} is disabled, so written and not loaded; launchctl enable {gui}/{job} stands it"
+                        );
+                    }
+                    off
+                };
+                // an engine's job, one per kind (docs/index.html#engines)
+                let kinds = ["echo", "speech", "turn", "words"];
+                let engine = |kind: &str| {
+                    let job = format!("{label}.{kind}");
+                    (path.with_file_name(format!("{job}.plist")), job)
+                };
+                if words.first() == Some(&"engine") {
+                    let (verb, rest) = (
+                        words.get(1).copied().unwrap_or_default(),
+                        words.get(2..).unwrap_or_default(),
+                    );
+                    let kind = rest.first().copied().unwrap_or_default();
+                    let (file, job) = engine(kind);
+                    if verb == "list" {
+                        // each job's command as it was given, its plist's escapes undone
+                        for (each, (held, _)) in
+                            kinds.map(|named_kind| (named_kind, engine(named_kind)))
+                        {
+                            let Ok(text) = fs::read_to_string(&held) else {
+                                continue;
+                            };
+                            let spelled: Vec<String> = (text
+                                .split_once("<key>ProgramArguments</key>"))
+                            .and_then(|(_, after)| after.split_once("</array>"))
+                            .map(|(array, _)| array.split("<string>").skip(1))
+                            .into_iter()
+                            .flatten()
+                            .map(|word| {
+                                let bare = word.split_once("</string>").unwrap_or_default().0;
+                                bare.replace("&lt;", "<")
+                                    .replace("&gt;", ">")
+                                    .replace("&amp;", "&")
+                            })
+                            .collect();
+                            println!("{}", json!({"command": spelled, "kind": each}));
+                        }
+                        return Ok(());
+                    }
+                    unload(&job)?;
+                    if verb == "remove" {
+                        gone(&file);
+                        return Ok(());
+                    }
+                    // what it runs, verbatim; ready once health lists an engine of its kind on
+                    // the first word of its command that is a track
+                    let command = rest.get(2..).unwrap_or_default();
+                    let track = (command.iter())
+                        .find(|word| word.split_once('-').is_some_and(|(of, name)| well(of, name)))
+                        .ok_or_else(|| {
+                            io::Error::other("the command names no track (ear-<name> or mouth-<name>) to wait for")
+                        })?;
+                    let escape = |word: &str| {
+                        word.replace('&', "&amp;")
+                            .replace('<', "&lt;")
+                            .replace('>', "&gt;")
+                    };
+                    let said = (command.iter().skip(1)).fold(String::new(), |mut held, word| {
+                        write!(held, "<string>{}</string>", escape(word)).unwrap_or_default();
+                        held
+                    });
+                    let program = escape(command.first().copied().unwrap_or_default());
+                    let err = format!("engines/{kind}.err");
+                    fs::create_dir_all(root.join("engines"))?;
+                    path.parent().map_or(Ok(()), fs::create_dir_all)?;
+                    write(
+                        &file,
+                        &sheet(&job, Path::new(&program), &said, "<true/>", &err),
+                    )?;
+                    if disabled(&listing()?, &job) {
+                        return Ok(());
+                    }
+                    let listed = |health: &Value| health["engines"][track][kind].is_string();
+                    // the engine it replaces gone from health first; one still listed past
+                    // `$RIFT_BOOTOUT_MS` is another's, which the job takes over once it leaves
+                    if !ready(limit, &|health| !listed(health))
+                        && serving().is_some_and(|health| listed(&health))
+                    {
+                        must(&["bootstrap", &gui, &file.to_string_lossy()])?;
+                        println!(
+                            "{track}'s {kind} engine is another's; {job} takes it over once it leaves"
+                        );
+                        return Ok(());
+                    }
+                    return up(&job, &file, &err, false, &listed);
+                }
                 // 2026-11-22: an earlier build installed under another label and state root. Any
                 // other agent whose program is this binary's `serve` is such an install, retired
                 // here and by --remove; its root moves to this one while this one does not exist,
@@ -3222,12 +3410,16 @@ fn main() -> ExitCode {
                     }
                     Ok(())
                 };
-                if words.contains(&"--remove") {
+                if words == ["setup", "--remove"] {
                     // first: it refuses while a swap runs, before anything is booted out
                     hotswap::forget("rift").map_err(io::Error::other)?;
                     for agent in &older {
                         unload(&agent.1)?;
                         gone(&agent.0);
+                    }
+                    for (file, job) in kinds.map(engine) {
+                        unload(&job)?;
+                        gone(&file);
                     }
                     for (job, file) in [(ear, &heard), (mouth, &mouthfile), (label, &path)] {
                         unload(job)?;
@@ -3390,77 +3582,10 @@ security import "$1/identity.p12" -k "$3" -P "$2" -T /usr/bin/codesign"#,
                     }
                     Ok(())
                 };
-                let write = |file: &Path, text: &str| -> io::Result<()> {
-                    let staged = file.with_extension("plist.new");
-                    fs::write(&staged, text)?;
-                    fs::rename(&staged, file)?;
-                    println!("wrote {}", file.display());
-                    Ok(())
-                };
                 place(&fixed)?;
                 path.parent().map_or(Ok(()), fs::create_dir_all)?;
                 write(&path, &plist)?;
                 write(&heard, &listened)?;
-                // the health of a daemon answering ready on the socket, if one does
-                let serving = || -> Option<Value> {
-                    let mut stream = UnixStream::connect(&sock).ok()?;
-                    stream.set_read_timeout(Some(Duration::from_secs(1))).ok()?;
-                    let hello =
-                        json!({"client": format!("rift/{VERSION}"), "op": "hello", "proto": PROTO});
-                    writeln!(stream, "{hello}\n{}", json!({"op": "health"})).ok()?;
-                    let reply: Value =
-                        serde_json::from_str(&BufReader::new(stream).lines().nth(1)?.ok()?).ok()?;
-                    (reply["state"] == "ready").then_some(reply)
-                };
-                // launchd holds a respawn until ThrottleInterval after the last launch: wait it out
-                let ready = |wait: Duration, done: &dyn Fn(&Value) -> bool| {
-                    let begun = Instant::now();
-                    while !serving().is_some_and(|health| done(&health)) {
-                        if begun.elapsed() > wait {
-                            return false;
-                        }
-                        thread::sleep(Duration::from_millis(100));
-                    }
-                    true
-                };
-                let (first, patience) = (
-                    Duration::from_millis(setting("RIFT_RELOAD_MS", 15_000)),
-                    Duration::from_millis(setting("RIFT_READY_MS", 30_000)),
-                );
-                // `name` kickstarted, else loaded afresh, then waited on until the daemon's
-                // health is `done`; a job launchd refused to spawn stays refused through any
-                // kickstart, so one not done past the first budget is loaded afresh, once
-                let up = |name: &str,
-                          file: &Path,
-                          err: &str,
-                          kick: bool,
-                          done: &dyn Fn(&Value) -> bool| {
-                    let load = || -> io::Result<()> {
-                        unload(name)?;
-                        must(&["bootstrap", &gui, &file.to_string_lossy()])
-                    };
-                    if kick {
-                        must(&["kickstart", "-k", &format!("{gui}/{name}")])?;
-                    } else {
-                        load()?;
-                    }
-                    if ready(first, done) {
-                        return Ok(());
-                    }
-                    println!(
-                        "{name} not ready {} ms after its load; loading it again",
-                        first.as_millis()
-                    );
-                    load()?;
-                    if ready(patience, done) {
-                        return Ok(());
-                    }
-                    Err(io::Error::other(format!(
-                        "{name} not ready {} ms after its load; see {}",
-                        patience.as_millis(),
-                        root.join(err).display()
-                    )))
-                };
                 // the ear and the mouth out first, so the new daemon lists only what loads after it
                 unload(ear)?;
                 unload(mouth)?;
@@ -3473,13 +3598,9 @@ security import "$1/identity.p12" -k "$3" -P "$2" -T /usr/bin/codesign"#,
                 })?;
                 // the ear, then the mouth, only once the daemon is up: whatever fails there leaves
                 // it serving. One disabled in launchd is written, never loaded: the way to opt out
-                let disabled =
-                    String::from_utf8_lossy(&call(&["print-disabled", &gui])?.stdout).into_owned();
+                let listed_off = listing()?;
                 let stand = |job: &str, kind: &str, file: &Path| -> io::Result<()> {
-                    if disabled.contains(&format!("\"{job}\" => disabled")) {
-                        println!(
-                            "{job} is disabled, so written and not loaded; launchctl enable {gui}/{job} stands it"
-                        );
+                    if disabled(&listed_off, job) {
                         return Ok(());
                     }
                     let track = json!(format!("{kind}-{mac}"));
@@ -3518,7 +3639,7 @@ security import "$1/identity.p12" -k "$3" -P "$2" -T /usr/bin/codesign"#,
             };
             install().map_or_else(
                 |cause| {
-                    eprintln!("rift setup: {cause}");
+                    eprintln!("rift {}: {cause}", words.first().unwrap_or(&""));
                     ExitCode::FAILURE
                 },
                 |()| ExitCode::SUCCESS,

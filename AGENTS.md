@@ -25,7 +25,7 @@ hold those lines and nothing else.
 | path | what |
 | --- | --- |
 | `.github/workflows/release.yaml` | a GitHub Release per merge to main, `YYYY.M.N`, `aarch64-apple-darwin` and `x86_64-unknown-linux-gnu`, signed by packslip |
-| `src/main.rs` | the binary: `serve` (its plays and engines included), the clients `status`, `quiet`, `ears`, `keep`, `feed`, `listen`, `read`, `play`, `hush`, the file-fed `device`, then `setup` (its signing included), `upgrade`, `version` |
+| `src/main.rs` | the binary: `serve` (its plays and engines included), the clients `status`, `quiet`, `ears`, `keep`, `feed`, `listen`, `read`, `play`, `hush`, the file-fed `device`, then `setup` and `engine add`/`remove`/`list` (the signing included), `upgrade`, `version` |
 | `src/ear.rs` | macOS: `device ear <name> --mic`, its loop, the Bluetooth rule (`pick`), the 16 kHz converter, and `Fake`, the suite's microphones under `$RIFT_MIC` |
 | `src/mic.rs` | macOS: the cpal lines and coreaudio-rs's transport and built-in lookups alone, exempt from coverage |
 | `src/mouth.rs` | macOS: `device mouth <name> --speaker`, its loop, the given-rate interpolator, the track's cutter, and `Fake`, the suite's outputs under `$RIFT_SPEAKER` |
@@ -272,7 +272,15 @@ After each bootout `launchctl print` is polled every 100 ms until it fails, at m
 first has hotswap forget the layout, its record and the upgrade agent (refused while a swap runs),
 then boots out every earlier install, `dev.gigantic.rift.ear`, `dev.gigantic.rift.mouth` and `dev.gigantic.rift`, removes their plists,
 `~/.local/bin/rift`, the ear's and the mouth's copies and their `~/.local/libexec/rift/`, the keychain and its password as files (never `security delete-keychain`,
-which may ask to unlock it), and leaves the root alone. Idempotent.
+which may ask to unlock it), and leaves the root alone. Idempotent. The engine jobs go first
+(`dev.gigantic.rift.<kind>`, `kinds`); an install never touches them.
+
+`rift engine add|remove|list` runs through the same arm and closures (`ask` under
+`$RIFT_SIGN_MS`, `unload` under `$RIFT_BOOTOUT_MS`, `up`, the one `print-disabled` listing
+`disabled` reads), never reaching hotswap, signing or the host name: `add` writes the plist (the
+command's words XML-escaped, `list` unescaping them), boots the old job out, waits on health
+until no engine of the kind is on the command's track, then `up`; still held past the bootout
+budget, it bootstraps unwaited.
 
 hotswap never re-hashes an installed release (verified 2026-11-25 · `src/lib.rs` at the pinned
 `e980196`): versions are directories, `current` a symlink, `--check` prints, `--back` relinks and
