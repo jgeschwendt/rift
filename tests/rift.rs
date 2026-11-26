@@ -2782,10 +2782,11 @@ mod tests {
         };
         let (mut slow, slow_hi) = device(&root, &track("slow"), 0)?;
         let slow_base = slow_hi["ping"].as_u64().unwrap_or_default() - 40_000_000;
-        let mut streamed = self::placed(&mut slow, slow_base, 0..10)?;
+        // more on disk than its socket holds, so its replay is still under way as the rest come
+        let mut streamed = self::placed(&mut slow, slow_base, 0..100)?;
         let mut behind = greet(&root)?;
         drop(line_after(&mut behind, &from(streamed[0], "slow"))?);
-        streamed.extend(self::placed(&mut slow, slow_base, 10..1500)?);
+        streamed.extend(self::placed(&mut slow, slow_base, 100..1500)?);
         // still replaying, it has not been given the newest frame: a final naming it is refused
         let newest = streamed.last().copied().unwrap_or_default() + 20_000;
         self::send(
