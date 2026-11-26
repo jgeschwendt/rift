@@ -1,9 +1,11 @@
-//! `endpoint <track> [--bar <score>] [--ceiling-ms <ms>] [--silero <file>] [--smart-turn <file>]`:
-//! rift's reference turn engine on the ear (or clean) track `<track>`. Silero VAD opens a voice
-//! and closes it after 256 ms under its offset; Smart Turn scores the turn at each close, over
-//! `--bar` (default 0.5) a turn, else held for the next voice up to `--ceiling-ms` (default
-//! 3000) of silence. Each model's file defaults to its pinned snapshot in the Hugging Face cache
-//! (engines/README.md).
+//! `endpoint <track> [--bar <score>] [--ceiling-ms <ms>] [--grace-ms <ms>] [--short-ms <ms>]
+//! [--silero <file>] [--smart-turn <file>]`: rift's reference turn engine on the ear (or clean)
+//! track `<track>`. Silero VAD opens a voice and closes it after 256 ms under its offset; Smart
+//! Turn scores the turn at each close, over `--bar` (default 0.5) a turn, else held for the next
+//! voice up to `--ceiling-ms` (default 3000) of silence; a turn over the bar spanning under
+//! `--short-ms` (default 1500) of voice is held for `--grace-ms` (default 512) first, so an
+//! opening word and its pause join the rest. Each model's file defaults to its pinned snapshot
+//! in the Hugging Face cache (engines/README.md).
 
 mod models;
 mod turns;
@@ -37,16 +39,20 @@ fn model(args: &[String], name: &str, [repo, revision, file]: [&str; 3]) -> Path
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
-    let (Some(track), Ok(bar), Ok(ceiling)) = (
+    let ms = |name, default| flag(&args, name).unwrap_or(default).parse::<u64>();
+    let (Some(track), Ok(bar), Ok(ceiling), Ok(grace), Ok(short)) = (
         args.first().filter(|held| !held.starts_with('-')),
         flag(&args, "bar").unwrap_or("0.5").parse::<f32>(),
-        flag(&args, "ceiling-ms").unwrap_or("3000").parse::<u64>(),
+        ms("ceiling-ms", "3000"),
+        ms("grace-ms", "512"),
+        ms("short-ms", "1500"),
     ) else {
         eprintln!(
-            "usage: endpoint <track> [--bar <score>] [--ceiling-ms <ms>] [--silero <file>] [--smart-turn <file>]"
+            "usage: endpoint <track> [--bar <score>] [--ceiling-ms <ms>] [--grace-ms <ms>] [--short-ms <ms>] [--silero <file>] [--smart-turn <file>]"
         );
         return ExitCode::from(2);
     };
+    let waits = [ceiling, grace, short].map(|wait| wait.saturating_mul(1000));
     let loaded = Silero::load(&model(&args, "silero", SILERO)).and_then(|prob| {
         Ok((
             prob,
@@ -61,7 +67,7 @@ fn main() -> ExitCode {
         }
     };
     link::stand("endpoint", &mut || {
-        let endpoint = Endpoint::new(&mut prob, &mut score, bar, ceiling.saturating_mul(1000));
+        let endpoint = Endpoint::new(&mut prob, &mut score, bar, waits);
         turns::session(&link::socket(), track, endpoint)
     })
 }
@@ -97,7 +103,8 @@ mod tests {
             return Ok(());
         }
         let (mut prob, mut score) = (Silero::load(&silero)?, SmartTurn::load(&smart)?);
-        let mut endpoint = Endpoint::new(&mut prob, &mut score, 0.5, 3_000_000);
+        let mut endpoint =
+            Endpoint::new(&mut prob, &mut score, 0.5, [3_000_000, 512_000, 1_500_000]);
         let pcm = fs::read(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../fixtures/phrase.pcm"

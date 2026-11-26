@@ -18,7 +18,7 @@ mise run prove-engines   # engines/: all three on a throwaway daemon, the fixtur
 
 The reference engines (`engines/`, a Cargo workspace and a uv project of their own; licences and
 downloads in `engines/README.md`) run as `engines/target/release/endpoint <ear track> [--bar 0.5]
-[--ceiling-ms 3000] [--silero <file>] [--smart-turn <file>]`, `engines/target/release/read-aloud
+[--ceiling-ms 3000] [--grace-ms 512] [--short-ms 1500] [--silero <file>] [--smart-turn <file>]`, `engines/target/release/read-aloud
 <mouth track> [--voice alba] [--pocket <dir>]` and `uv run --project engines/transcribe transcribe
 <ear track> [--model <dir>] [--terms <file>]` (`--terms`: lines `Term` or `Term: heard, heard`,
 your own file, never committed). Each stands, connects with `"from":"through"` so a start or reconnect resumes, and stops on a signal

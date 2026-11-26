@@ -28,6 +28,19 @@ rift engine add words -- ~/.local/libexec/rift/transcribe/bin/transcribe ear-<ho
 rift engine add speech -- ~/.local/libexec/rift/read-aloud mouth-<host>
 ```
 
+`endpoint` commits a turn when Smart Turn scores its close over `--bar` (0.5), else holds it for
+the next voice up to `--ceiling-ms` (3000) of silence. Smart Turn scores a short opening word and
+its pause as a finished turn (0.81–0.99 at those closes, observed 2026-11-26), so a turn over the
+bar spanning under `--short-ms` (1500) of voice is held `--grace-ms` (512) of silence first, and
+a voice reported inside it joins the turn; either flag at 0 turns that off. A voice that starts
+inside the grace but spans the 96 ms that report it only after the grace is due does not join.
+Replayed offline through the engine's segmenter on recordings of one speaker, 75 sentences: turns
+cut mid-sentence 23 → 6, the close's median delay after speech ends 310 ms and p90 350 ms
+unchanged, 3 sentence ends held into the next either way; a 512 ms grace on every turn cuts 2 but
+closes every turn at 830 ms, and a bar of 0.9 still cuts 17 (observed 2026-11-26). A turn under
+1.5 s of voice closes 512 ms later: `prove-engines` logs the fixture's turn 279 ms after its
+speech ends (1.66 s of voice), 770 ms with `--short-ms 2000` (observed 2026-11-26).
+
 `transcribe` transcribes only where a turn engine on its track says there is speech: with no
 `voice` lines it transcribes nothing and holds no more than its 30 s buffer. It takes
 `--terms <file>` (lines `Term` or `Term: heard, heard`), a file of your own, never committed.

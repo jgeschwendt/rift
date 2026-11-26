@@ -78,7 +78,10 @@ pub struct Endpoint<'model, P, S> {
     /// The reply's `through`, none with nothing logged: a voice it covers is logged, and its
     /// reports are dropped.
     floor: Option<u64>,
-    /// A turn held under the bar: its end and when it was held.
+    /// How long a turn over the bar with under `short` of voice waits in silence before it is
+    /// reported: a voice inside it rejoins the turn, an opening word's pause no turn of its own.
+    grace: u64,
+    /// A turn held, until the next voice or its due in silence: its end and that due.
     held: Option<(u64, u64)>,
     /// Where the next frame is due: the end of the last, none before the first.
     next: Option<u64>,
@@ -88,27 +91,37 @@ pub struct Endpoint<'model, P, S> {
     quiet: bool,
     /// The turn model.
     score: &'model mut S,
+    /// The voice a turn spans, summed, under which a score over the bar waits out the grace.
+    short: u64,
     /// The audio since the last turn, its last [`CONTEXT`] samples.
     tail: Vec<f32>,
     /// The start of the turn under way.
     turn: Option<u64>,
     /// The voice under way.
     voice: Option<Voice>,
+    /// The voice the turn under way spans so far, summed.
+    voiced: u64,
 }
 
 impl<'model, P: Prob, S: Score> Endpoint<'model, P, S> {
     /// Closes the voice under way, if one was reported: its end (`edge`, else its last speech)
-    /// reported, the turn scored, committed over the bar, else held. One never reported closes
-    /// with nothing said.
+    /// reported, the turn scored, committed over the bar once it spans `short` of voice or with
+    /// no grace, held for the grace under that, else held for the ceiling. One never reported
+    /// closes with nothing said.
     fn close(&mut self, edge: Option<u64>, said: &mut Vec<Value>) -> io::Result<()> {
         if let Some(voice) = self.voice.take().filter(|voice| voice.said) {
             let end = edge.unwrap_or(voice.last);
             said.push(json!({"on": false, "op": "voice", "start": end}));
-            if self.score.score(&self.tail)? > self.bar {
-                self.commit(end, said);
+            self.voiced = self.voiced.saturating_add(end.saturating_sub(voice.start));
+            let wait = if self.score.score(&self.tail)? <= self.bar {
+                self.ceiling
+            } else if self.voiced < self.short && self.grace > 0 {
+                self.grace
             } else {
-                self.held = Some((end, self.at.max(end)));
-            }
+                self.commit(end, said);
+                return Ok(());
+            };
+            self.held = Some((end, self.at.max(end).saturating_add(wait)));
         }
         Ok(())
     }
@@ -119,6 +132,7 @@ impl<'model, P: Prob, S: Score> Endpoint<'model, P, S> {
         said.push(json!({"end": end, "op": "turn", "start": start}));
         self.tail.clear();
         self.held = None;
+        self.voiced = 0;
     }
 
     /// The reports the frame at `time` holding `pcm` completes, in order. A jump in `time` is a
@@ -218,8 +232,8 @@ impl<'model, P: Prob, S: Score> Endpoint<'model, P, S> {
                 let _: &mut u64 = self.turn.get_or_insert(voice.start);
                 self.held = None;
             }
-            if let Some((end, since)) = self.held
-                && self.at.saturating_sub(since) >= self.ceiling
+            if let Some((end, due)) = self.held
+                && self.at >= due
             {
                 self.commit(end, said);
             }
@@ -228,7 +242,8 @@ impl<'model, P: Prob, S: Score> Endpoint<'model, P, S> {
     }
 
     /// A fresh stream: `bar` the score that commits a turn, `ceiling` µs of silence that close
-    /// one held under it.
+    /// one held under it, `grace` µs of silence that report one over it spanning under `short`
+    /// µs of voice.
     #[inline]
     #[cfg_attr(
         not(test),
@@ -237,7 +252,12 @@ impl<'model, P: Prob, S: Score> Endpoint<'model, P, S> {
             reason = "the constructor, named for its type; the tests call it as often"
         )
     )]
-    pub fn new(prob: &'model mut P, score: &'model mut S, bar: f32, ceiling: u64) -> Self {
+    pub fn new(
+        prob: &'model mut P,
+        score: &'model mut S,
+        bar: f32,
+        [ceiling, grace, short]: [u64; 3],
+    ) -> Self {
         prob.reset();
         Self {
             at: 0,
@@ -247,14 +267,17 @@ impl<'model, P: Prob, S: Score> Endpoint<'model, P, S> {
             clipped: false,
             first: None,
             floor: None,
+            grace,
             held: None,
             next: None,
             prob,
             quiet: false,
             score,
+            short,
             tail: Vec::with_capacity(CONTEXT),
             turn: None,
             voice: None,
+            voiced: 0,
         }
     }
 }
@@ -405,6 +428,17 @@ mod tests {
 
     /// Every report of `frames` through a fresh endpoint scoring from `scores`, ceiling 1 s.
     fn reports(scores: &[f32], frames: &[(u64, Vec<f32>)]) -> io::Result<(Vec<Value>, Scripted)> {
+        let (said, score) = stepped([1_000_000, 0, 0], scores, frames)?;
+        Ok((said.into_iter().map(|(_, report)| report).collect(), score))
+    }
+
+    /// Every report of `frames` through a fresh endpoint waiting `waits` and scoring from
+    /// `scores`, each beside the index of the frame that completed it.
+    fn stepped(
+        waits: [u64; 3],
+        scores: &[f32],
+        frames: &[(u64, Vec<f32>)],
+    ) -> io::Result<(Vec<(usize, Value)>, Scripted)> {
         let (mut prob, mut score) = (
             Loud::default(),
             Scripted {
@@ -412,12 +446,20 @@ mod tests {
                 tails: Vec::new(),
             },
         );
-        let mut endpoint = Endpoint::new(&mut prob, &mut score, 0.5f32, 1_000_000);
+        let mut endpoint = Endpoint::new(&mut prob, &mut score, 0.5f32, waits);
         let mut said = Vec::new();
-        for frame in frames {
-            said.extend(endpoint.frame(frame.0, &frame.1)?);
+        for (step, frame) in frames.iter().enumerate() {
+            let reports = endpoint.frame(frame.0, &frame.1)?;
+            said.extend(reports.into_iter().map(|report| (step, report)));
         }
         Ok((said, score))
+    }
+
+    /// Each stepped report as `step report`, for a compact comparison.
+    fn lines(said: &[(usize, Value)]) -> Vec<String> {
+        said.iter()
+            .map(|pair| format!("{} {}", pair.0, pair.1))
+            .collect()
     }
 
     /// A voice, its close after 256 ms under the offset, a score over the bar: one turn from its
@@ -458,6 +500,119 @@ mod tests {
             ],
             "one turn over both voices, closed by the ceiling"
         );
+        Ok(())
+    }
+
+    /// A turn over the bar spanning under `short` of voice waits out the grace: a voice inside
+    /// it rejoins the turn, scored again on all of it, which spanning `short` now commits at its
+    /// close; a short turn alone is reported in the frame its grace ends, not one before.
+    #[test]
+    fn graced() -> io::Result<()> {
+        let runs = [
+            (1.0f32, 16),
+            (0.0, 30),
+            (1.0, 16),
+            (0.0, 40),
+            (1.0, 16),
+            (0.0, 60),
+        ];
+        let (said, score) = stepped([1_000_000, 512_000, 500_000], &[], &frames(0, &runs))?;
+        // closes at 576, 1504 and 2624 ms, each in its frame; the last grace ends at 3136 ms
+        assert_eq!(
+            lines(&said),
+            [
+                r#"4 {"on":true,"op":"voice","start":0}"#,
+                r#"28 {"on":false,"op":"voice","start":320000}"#,
+                r#"49 {"on":true,"op":"voice","start":896000}"#,
+                r#"75 {"on":false,"op":"voice","start":1248000}"#,
+                r#"75 {"end":1248000,"op":"turn","start":0}"#,
+                r#"105 {"on":true,"op":"voice","start":2016000}"#,
+                r#"131 {"on":false,"op":"voice","start":2368000}"#,
+                r#"156 {"end":2368000,"op":"turn","start":2016000}"#,
+            ],
+            "a word and its rest one turn, committed at the close; a word alone after its grace"
+        );
+        assert_eq!(
+            score.tails,
+            [29 * 320, 76 * 320, 56 * 320],
+            "the rest scored on the word and its pause too"
+        );
+        Ok(())
+    }
+
+    /// A grace across a hole: a voice after a hole inside it joins the turn; a hole past it
+    /// reports the turn at the first window heard after.
+    #[test]
+    fn graced_holes() -> io::Result<()> {
+        let mut heard = frames(0, &[(1.0f32, 16), (0.0, 15)]);
+        heard.extend(frames(900_000, &[(1.0f32, 16), (0.0, 30)]));
+        heard.extend(frames(2_500_000, &[(0.0f32, 5)]));
+        let (said, _) = stepped([1_000_000, 512_000, 1_500_000], &[], &heard)?;
+        // the first grace is due at 1088 ms, the second at 1988
+        assert_eq!(
+            lines(&said),
+            [
+                r#"4 {"on":true,"op":"voice","start":0}"#,
+                r#"28 {"on":false,"op":"voice","start":320000}"#,
+                r#"35 {"on":true,"op":"voice","start":900000}"#,
+                r#"59 {"on":false,"op":"voice","start":1220000}"#,
+                r#"78 {"end":1220000,"op":"turn","start":0}"#,
+            ],
+            "one turn across both holes"
+        );
+        Ok(())
+    }
+
+    /// No grace is no grace whatever `short` is: a voice a hole closes commits in the frame
+    /// that closes it, as with `short` 0.
+    #[test]
+    fn graceless() -> io::Result<()> {
+        let mut heard = frames(0, &[(1.0f32, 16)]);
+        heard.extend(frames(1_000_000, &[(0.0f32, 20)]));
+        let (said, _) = stepped([1_000_000, 0, 1_500_000], &[], &heard)?;
+        assert_eq!(
+            said,
+            stepped([1_000_000, 0, 0], &[], &heard)?.0,
+            "as with short 0"
+        );
+        assert_eq!(
+            lines(&said),
+            [
+                r#"4 {"on":true,"op":"voice","start":0}"#,
+                r#"16 {"on":false,"op":"voice","start":320000}"#,
+                r#"16 {"end":320000,"op":"turn","start":0}"#,
+            ],
+            "the turn in the hole's frame"
+        );
+        Ok(())
+    }
+
+    /// The voice a turn spans is summed over its voices: a close under the bar, then one over
+    /// it whose turn spans `short` commits at its close, and one short of it waits the grace.
+    #[test]
+    fn summed() -> io::Result<()> {
+        let heard = frames(0, &[(1.0f32, 16), (0.0, 20), (1.0, 16), (0.0, 60)]);
+        let at = |short| {
+            stepped([1_000_000, 512_000, short], &[0.2, 0.9], &heard).map(|(said, _)| lines(&said))
+        };
+        let voices = [
+            r#"4 {"on":true,"op":"voice","start":0}"#,
+            r#"28 {"on":false,"op":"voice","start":320000}"#,
+            r#"39 {"on":true,"op":"voice","start":704000}"#,
+            r#"65 {"on":false,"op":"voice","start":1056000}"#,
+        ];
+        // the second close at 1312 ms, its grace due at 1824
+        for (short, step, why) in [
+            (600_000, 65u8, "672 ms of voice commits at the close"),
+            (700_000, 91, "under 700 ms waits the grace"),
+        ] {
+            let turn = format!(r#"{step} {{"end":1056000,"op":"turn","start":0}}"#);
+            assert_eq!(
+                at(short)?,
+                [&voices.map(str::to_owned)[..], &[turn]].concat(),
+                "{why}"
+            );
+        }
         Ok(())
     }
 
@@ -516,7 +671,7 @@ mod tests {
     fn clipped() -> io::Result<()> {
         let runs = [(1.0f32, 25), (0.0, 25), (1.0, 25), (0.0, 25)];
         let (mut prob, mut score) = (Loud::default(), Scripted::default());
-        let mut endpoint = Endpoint::new(&mut prob, &mut score, 0.5f32, 1_000_000);
+        let mut endpoint = Endpoint::new(&mut prob, &mut score, 0.5f32, [1_000_000, 0, 0]);
         // resumed: something was logged before the oldest audio replayed
         endpoint.floor = Some(0);
         let mut said = Vec::new();
@@ -556,7 +711,7 @@ mod tests {
             let (mut prob, mut score) = (Loud::default(), Scripted::default());
             let mut ends = Vec::new();
             for _ in 0u8..2 {
-                let endpoint = Endpoint::new(&mut prob, &mut score, 0.5f32, 1_000_000);
+                let endpoint = Endpoint::new(&mut prob, &mut score, 0.5f32, [1_000_000, 0, 0]);
                 let ended = session(&sock, "ear-desk", endpoint);
                 ends.push(
                     ended
@@ -628,7 +783,7 @@ mod tests {
                 scores: vec![0.9f32, 0.2],
                 tails: Vec::new(),
             };
-            let endpoint = Endpoint::new(&mut prob, &mut score, 0.5f32, 1_000_000);
+            let endpoint = Endpoint::new(&mut prob, &mut score, 0.5f32, [1_000_000, 0, 0]);
             session(&sock, "ear-desk", endpoint)
                 .err()
                 .map(|cause| cause.to_string())
@@ -652,6 +807,41 @@ mod tests {
             conn.line()?,
             json!({"end": 1_728_000u32, "id": 1_728_000u32, "op": "turn", "start": 1_184_000u32}),
             "the held turn rebuilt whole, its voices logged already, closed by the ceiling"
+        );
+        drop(conn);
+        assert_eq!(
+            engine.join().ok().flatten().as_deref(),
+            Some("the connection ended"),
+            "its end"
+        );
+        Ok(())
+    }
+
+    /// A reconnect while a turn waited out its grace: the replay rebuilds it, its voice logged
+    /// already, and the grace's silence after it reports it.
+    #[test]
+    fn resumed_graced() -> io::Result<()> {
+        let fake = Fake::new("endpoint-resumed-graced")?;
+        let sock = fake.sock.clone();
+        let engine = thread::spawn(move || {
+            let (mut prob, mut score) = (Loud::default(), Scripted::default());
+            let waits = [1_000_000, 512_000, 1_500_000];
+            let endpoint = Endpoint::new(&mut prob, &mut score, 0.5f32, waits);
+            session(&sock, "ear-desk", endpoint)
+                .err()
+                .map(|cause| cause.to_string())
+        });
+        let (mut asked, _) = fake.accept()?;
+        asked.send(&json!({"ok": true, "window": 600u16}))?;
+        let (mut conn, _) = fake.accept()?;
+        conn.send(&json!({"ok": true, "seq": 9u8, "through": 704_000u32}))?;
+        for (time, pcm) in frames(0, &[(0.0f32, 10), (1.0, 25), (0.0, 75)]) {
+            conn.send(&json!({"pcm": hex(&pcm), "t": time}))?;
+        }
+        assert_eq!(
+            conn.line()?,
+            json!({"end": 704_000u32, "id": 704_000u32, "op": "turn", "start": 192_000u32}),
+            "the graced turn rebuilt whole, its voice logged already"
         );
         drop(conn);
         assert_eq!(
