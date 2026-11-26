@@ -528,30 +528,36 @@
       it read off what it was given, on the daemon's clock. A report naming a time past the end of
       the last frame it was given, or starting before the latest time its kind of report names on
       that track (logged, any boot: a partial's the last final's end), is
-      <code class="code">bad_request</code> and logs nothing. A mask alone may end past what was
-      heard, since a run's echo is known as it sounds; it starts no earlier than the engine's
-      ruling, which starts where the track ended as it connected, so no mask reaches a frame
-      already passed on.</li>
+      <code class="code">bad_request</code> and logs nothing. A mask's on or off alone may lie up to
+      1 s past what was heard, since a run's echo is known as it sounds, and no earlier than the
+      engine's ruling, which starts where the track's frames passed on reach (any boot) as it
+      connects, so no mask reaches a frame already passed on and none is unbounded.</li>
     <li><strong>What a turn or words engine reads.</strong> Its track's frames,
       <code class="code">{"pcm":"…","t":1764000000000000}</code> as a reader's, from
-      <code class="code">from</code>: replayed from disk, then live, one gapless, duplicate-free
-      sequence as a feed's; a hole sends nothing, seen as a jump in <code class="code">t</code>.
-      A <code class="code">from</code> before now less the window is <code class="code">gone</code>.
+      <code class="code">from</code> (<code class="code">null</code>: where its frames reach as it
+      connects): replayed from disk, a segment the sweep moved read from the archive, until the
+      replay has caught up, then live, one gapless, duplicate-free sequence as a feed's, so an
+      engine slower than its ear is never dropped while it replays; a hole sends nothing, seen as a
+      jump in <code class="code">t</code>. A <code class="code">from</code> before now less the
+      window is <code class="code">gone</code>, and so is a replay meeting a segment in neither
+      place: <code class="code">{"code":"gone","ok":false}</code>, then the end of stream.
       On an ear's track, samples the echo stage marked are zeros and their frame carries
       <code class="code">"masked":true</code>; while an echo engine is connected, a live frame
       waits until it has ruled on it. A words engine also reads each logged
       <code class="code">turn</code> on its track, <code class="code">{"turn":{"end":…,"start":…}}</code>,
       after the frame holding its <code class="code">end</code>, so it may finish a turn knowing it
-      has all of it. 1024 lines unsent drop the engine, as a listener.</li>
+      has all of it. 1024 live lines unsent drop the engine, as a listener.</li>
     <li><strong>What an echo engine reads.</strong> Its ear's frames, live only, and, for every
-      mouth, each play's open (<code class="code">{"play":3,"rate":24000,"track":"mouth-desk"}</code>),
+      mouth, each play's open (those open as it connects, with their runs so far, first) (<code class="code">{"play":3,"rate":24000,"track":"mouth-desk"}</code>),
       each run as its mouth reports it, on the daemon's clock
       (<code class="code">{"from":0,"play":3,"samples":960,"start":…,"track":"mouth-desk"}</code>),
       and its end (<code class="code">{"played":3,"track":"mouth-desk"}</code>). It reports
       <code class="code">mask</code> and <code class="code">ruled</code>, and later may stream a
       clean track (below; not yet served). One 1024 frames behind its ruling is dropped. With none connected, or once one
       leaves, frames go on unruled at once: the stage fails open, and the
-      <code class="code">engine</code> events record where.</li>
+      <code class="code">engine</code> events record where. One leaving with its mask on has it
+      put off at its ruling, logged before its <code class="code">engine</code> off; a boot after
+      a kill puts a mask left on off as it starts.</li>
     <li><strong>What a speech engine reads.</strong> Its mouth's says:
       <code class="code">{"say":5,"text":"…"}</code> per piece of text in order,
       <code class="code">{"end":5}</code> (no more text) and <code class="code">{"hush":5}</code>
@@ -567,8 +573,8 @@
       <tbody>
         <tr><td class="table-mono">done</td><td>speech</td><td class="table-mono">{"op":"done","say":5}</td><td>after the say's <code class="code">end</code>, no play is coming (nothing to sound); the say ends <code class="code">end</code>, <code class="code">spoken</code> 0. Before its <code class="code">end</code> or with its play opened: <code class="code">bad_request</code></td></tr>
         <tr><td class="table-mono">frame</td><td>echo</td><td class="table-mono">{"op":"frame","pcm":"…","t":…}</td><td>the clean track's frame for the ear's frame at <code class="code">t</code>, at most one each; streamed to <code class="code">clean-&lt;name&gt;</code> as a device's frames are, segments and window alike</td></tr>
-        <tr><td class="table-mono">mark</td><td>speech</td><td class="table-mono">{"op":"mark","samples":21600,"say":5,"text":13}</td><td>the say's first <code class="code">text</code> characters (Unicode scalar values) have sounded once the play's sample <code class="code">samples</code> has; both rising; not logged, kept for <code class="code">spoken</code></td></tr>
-        <tr><td class="table-mono">mask</td><td>echo</td><td class="table-mono">{"end":…,"op":"mask","start":…}</td><td>[<code class="code">start</code>, <code class="code">end</code>) of the ear is the machine hearing itself; masks never overlap and rise; <code class="code">mask</code></td></tr>
+        <tr><td class="table-mono">mark</td><td>speech</td><td class="table-mono">{"op":"mark","samples":21600,"say":5,"text":13}</td><td>the say's first <code class="code">text</code> characters (Unicode scalar values) have sounded once the play's sample <code class="code">samples</code> has; each past the last on both; not logged, kept for <code class="code">spoken</code></td></tr>
+        <tr><td class="table-mono">mask</td><td>echo</td><td class="table-mono">{"on":true,"op":"mask","start":…}</td><td>from an on's <code class="code">start</code> to its off's the ear is the machine hearing itself; on and off alternating from on, rising; <code class="code">mask</code></td></tr>
         <tr><td class="table-mono">partial</td><td>words</td><td class="table-mono">{"end":…,"op":"partial","start":…,"words":[…]}</td><td>a hypothesis for audio after the last final, superseding the last partial; not logged, sent to <code class="code">partials</code> readers</td></tr>
         <tr><td class="table-mono">ruled</td><td>echo</td><td class="table-mono">{"op":"ruled","to":…}</td><td>every sample before <code class="code">to</code> is ruled on; rising; releases the frames held for it; not logged</td></tr>
         <tr><td class="table-mono">turn</td><td>turn</td><td class="table-mono">{"end":…,"op":"turn","start":…}</td><td>a turn from the voice that began it to the voice's end that closed it; turns never overlap and rise; <code class="code">turn</code></td></tr>
@@ -584,7 +590,7 @@
         <tr><td class="table-mono">end</td><td class="table-mono">{"op":"end"}</td><td>on a say's connection: <code class="code">{"ok":true}</code>; no more text, and what was given is spoken out</td></tr>
         <tr><td class="table-mono">partials</td><td class="table-mono">{"op":"partials","track":"ear-desk"}</td><td><code class="code">{"ok":true}</code>, then each partial as its engine sends it, <code class="code">{"end":…,"engine":"transcribe","start":…,"track":"ear-desk","words":[…]}</code>, no replay, until the engine leaves (end of stream) or the client falls 1024 behind; <code class="code">absent</code> with no words engine on the track</td></tr>
         <tr><td class="table-mono">say</td><td class="table-mono">{"op":"say","track":"mouth-desk"}</td><td><code class="code">{"ok":true,"say":5,"seq":50}</code>, then the connection is that say's: <code class="code">text</code>s and one <code class="code">end</code>, as a play's <code class="code">give</code>s; it ends in one line, the <code class="code">spoken</code> event's fields and <code class="code">seq</code>, then the end of stream</td></tr>
-        <tr><td class="table-mono">text</td><td class="table-mono">{"op":"text","text":"Hello there. "}</td><td>a say's: <code class="code">{"ok":true,"text":13}</code>, the characters given so far, passed to the speech engine as given</td></tr>
+        <tr><td class="table-mono">text</td><td class="table-mono">{"op":"text","text":"Hello there. "}</td><td>a say's: <code class="code">{"ok":true,"text":13}</code>, the characters given so far, passed to the speech engine as given; withheld while 8 pieces or more are queued for the engine and not yet written to it, so a client faster than its engine is paced by its replies</td></tr>
       </tbody>
     </table>
   </div>
@@ -595,7 +601,8 @@
       the say's own play alone admitted. No speech engine on the mouth, or no playing device
       streaming it, is <code class="code">absent</code>; quiet on, <code class="code">quiet</code>. A
       <code class="code">hush</code> of the mouth ends the say with its play, or alone when it has
-      none yet, the engine told <code class="code">{"hush":5}</code>; the hush's reply then carries
+      none yet, the engine told <code class="code">{"hush":5}</code> at once, as is it whenever its
+      say ends other than at its end; the hush's reply then carries
       <code class="code">"say":5</code> beside the play's fields. A say's connection that ends before
       <code class="code">end</code> hushes it (<code class="code">left</code>); after it, it speaks
       out. A speech engine that leaves ends its open say <code class="code">engine</code>, its play
@@ -603,8 +610,9 @@
       its say the cause.</li>
     <li><strong>What sounded.</strong> A say ends with its play's <code class="code">played</code>
       (or, with no play, at once). <code class="code">spoken</code> is the say's whole text when the
-      play ended <code class="code">end</code>; otherwise the largest mark's
-      <code class="code">text</code> whose <code class="code">samples</code> is at most the play's
+      play, given something, ended <code class="code">end</code> having played all of it; otherwise
+      the largest mark's <code class="code">text</code> whose <code class="code">samples</code> is at
+      most the play's
       <code class="code">played</code>, 0 with no such mark or no play. A client reads which text sounded as the
       first <code class="code">spoken</code> characters of <code class="code">text</code>, never by
       time.</li>
@@ -629,7 +637,7 @@
       <thead><tr><th>kind</th><th>fields</th><th>when</th></tr></thead>
       <tbody>
         <tr><td class="table-mono">engine</td><td class="table-mono">name, on, stage, track</td><td>an engine connected (<code class="code">on</code>) or left, <code class="code">stage</code> its request's <code class="code">kind</code> (the event's own <code class="code">kind</code> is <code class="code">engine</code>); leaving, it ends any voice it left on, at a time not known</td></tr>
-        <tr><td class="table-mono">mask</td><td class="table-mono">end, engine, start, track</td><td>an echo engine's mask of its ear</td></tr>
+        <tr><td class="table-mono">mask</td><td class="table-mono">engine, on, start, track</td><td>an echo engine's mask of its ear going on or off</td></tr>
         <tr><td class="table-mono">play</td><td class="table-mono">[say,] play, rate, track</td><td>as above; <code class="code">say</code> when the play is a say's</td></tr>
         <tr><td class="table-mono">say</td><td class="table-mono">say, track</td><td>a say opened on the mouth <code class="code">track</code></td></tr>
         <tr><td class="table-mono">spoken</td><td class="table-mono">play, reason, say, spoken, text, track</td><td>the say is over: <code class="code">text</code> all it was given, <code class="code">spoken</code> how many of its characters sounded, <code class="code">play</code> its play or <code class="code">null</code></td></tr>
@@ -668,16 +676,19 @@
 ← {"ok":true,"seq":23}
 → {"end":1764000001200000,"op":"turn","start":1764000000300000}
 ← {"ok":true,"seq":24}</pre>
-  <p class="docs-note">An echo engine masking a run as it sounds:</p>
+  <p class="docs-note">An echo engine masking a play as it sounds, the tail heard out:</p>
   <pre class="tree">→ {"kind":"echo","name":"tail","op":"engine","track":"ear-desk"}
 ← {"ok":true,"seq":19}
 ← {"pcm":"…","t":1764000005000000}
 ← {"play":6,"rate":24000,"track":"mouth-desk"}
 ← {"from":0,"play":6,"samples":480,"start":1764000005019000,"track":"mouth-desk"}
-→ {"end":1764000005039000,"op":"mask","start":1764000005019000}
+→ {"on":true,"op":"mask","start":1764000005019000}
 ← {"ok":true,"seq":53}
 → {"op":"ruled","to":1764000005020000}
-← {"ok":true}</pre>
+← {"ok":true}
+← … the play's end, frames until 1764000005239000
+→ {"on":false,"op":"mask","start":1764000005239000}
+← {"ok":true,"seq":55}</pre>
   <p class="docs-note">A speech engine, its play on a second connection; the client's side is
     <code class="code">say</code>, <code class="code">{"op":"text","text":"Hello there. "}</code>,
     <code class="code">{"op":"text","text":"How are you?"}</code>, <code class="code">end</code>, then

@@ -655,7 +655,9 @@
       masked samples as zeros and the frame marked <code class="code">masked</code>, so no engine
       author handles echo, and a later echo engine that cancels instead of masking publishes a clean
       track (<code class="code">clean-&lt;name&gt;</code>, segments and window as any) that
-      downstream names as its track instead. Masks are events, so a replay from disk applies them.
+      downstream names as its track instead. Masks are events, so a replay from disk applies them;
+      a mask goes on and off, each no more than 1 s past what was heard, so a play is two events
+      and no report masks without bound.
       None connected, or one gone, frames flow unruled at once: the stage fails open, since words
       must never wait on an optional stage, and the <code class="code">engine</code> events say
       where it was missing. One 1024 frames behind is dropped, counted, never timed.</li>
@@ -710,7 +712,7 @@ rift status                                   # "engines":{"ear-mac":{"echo":"ta
       <tbody>
         <tr><td class="table-mono">endpoint</td><td>turn</td><td>Silero VAD on 32 ms frames, a voice closing after a 256 ms window (350 to 400 ms after speech ends, observed 2026-11-26), Smart Turn scoring each close, one under its bar held up to a ceiling for the next voice</td><td><code class="code">engines/endpoint/</code>, its own runtime and model fetch</td></tr>
         <tr><td class="table-mono">read-aloud</td><td>speech</td><td>Pocket TTS, its 24 kHz chunks given as they come, a mark at each piece's last chunk</td><td><code class="code">engines/read-aloud/</code></td></tr>
-        <tr><td class="table-mono">tail</td><td>echo</td><td>masks each mouth run from its <code class="code">start</code> to its end plus <code class="code">--tail-ms</code> (default 200), ruling up to the last frame heard while no play is open and up to the earliest open play's last run end while one is</td><td><code class="code">rift engine run tail &lt;ear&gt;</code>: no model, so in rift and its suite</td></tr>
+        <tr><td class="table-mono">tail</td><td>echo</td><td>a mask on at a play's first run's <code class="code">start</code>, off once the ear is heard past the last run's end plus <code class="code">--tail-ms</code> (default 200): two events a play sounding without a longer gap; ruling up to the last frame heard while no play is open or a mask is on, and 200 ms behind it while a play is open unmasked (a run is reported within 20 ms of its output taking it, before it sounds, its start an output latency on, so 200 ms covers a report held up that long; only a busier machine leaks)</td><td><code class="code">rift engine run tail &lt;ear&gt;</code>: no model, so in rift and its suite</td></tr>
         <tr><td class="table-mono">transcribe</td><td>words</td><td>Moonshine v2, fed 20 ms frames, batching 320 ms itself, finishing at each turn line</td><td><code class="code">engines/transcribe/</code></td></tr>
       </tbody>
     </table>
@@ -729,7 +731,7 @@ rift status                                   # "engines":{"ear-mac":{"echo":"ta
         <tr><td>5 · say</td><td><code class="code">say</code>, <code class="code">text</code>, <code class="code">mark</code>, <code class="code">done</code>, <code class="code">spoken</code></td><td>a suite speech engine giving a tone per piece and marking each: a say to its end, <code class="code">spoken</code> its whole text; hushed once the suite's mouth reported a run, <code class="code">spoken</code> the largest mark under the <code class="code">played</code> it reported; <code class="code">busy</code>, <code class="code">absent</code>, <code class="code">quiet</code>, <code class="code">left</code>, <code class="code">engine</code>, a kill's <code class="code">lost</code>; the play event's <code class="code">say</code></td></tr>
         <tr><td>6 · jobs</td><td><code class="code">rift engine add</code>, <code class="code">remove</code>, <code class="code">list</code></td><td>against the <code class="code">launchctl</code> stub: the plist's fields, the old job booted out before the new loads, ready only once health lists the kind, <code class="code">setup --remove</code> removing them</td></tr>
         <tr><td>7 · model engines</td><td><code class="code">endpoint</code>, <code class="code">read-aloud</code>, <code class="code">transcribe</code></td><td>each in its own gate on a recorded fixture through a file-fed ear: the phrase's words among the finals; voice on before off and one turn over a phrase with a pause; a say's play ending <code class="code">end</code> with sound in <code class="code">heard</code> and <code class="code">spoken</code> its text's length</td></tr>
-        <tr><td>8 · the loop</td><td>the jobs on a Mac</td><td>speak, a final <code class="code">words</code> event, a <code class="code">say</code> of a reply, its <code class="code">spoken</code> whole and the ear's track masked across its runs; the same with fixture and fake output as the suite's last case</td></tr>
+        <tr><td>8 · the loop</td><td>the jobs on a Mac</td><td>speak, a final <code class="code">words</code> event, a <code class="code">say</code>, its <code class="code">spoken</code> whole and the ear's track masked across its runs; the same with fixture and fake output as the suite's last case</td></tr>
       </tbody>
     </table>
   </div>

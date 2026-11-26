@@ -1,24 +1,32 @@
 //! `rift engine run tail <ear> [--tail-ms <ms>]`, the reference echo engine
-//! (docs/index.html#engines): each mouth run masked from its start to its end plus the tail, the
-//! ear ruled up to the last frame heard while no play is open and up to the earliest open play's
-//! last run end while one is, so no frame a run may echo into passes before its mask.
+//! (docs/index.html#engines). A mask goes on at a play's first run and off once the ear is heard
+//! past the last run's end plus the tail, so a play sounding without a gap longer than the tail is
+//! two events. It rules up to the last frame heard while no play is open or a mask is on (a frame
+//! under a mask is masked whatever comes), and `GUARD` behind it while a play is open unmasked.
 
+use crate::FORESIGHT;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::os::unix::net::UnixStream;
 
+/// How far behind the last frame heard the ruling stays while a play is open and no mask is on.
+/// A mouth reports a run within one 20 ms period of its output taking it, and its start lies the
+/// output's latency after that, so its report reaches the daemon before its first sample sounds;
+/// 200 ms more covers a report held up that long. A busier machine leaks only past that.
+const GUARD: u64 = 200_000;
+
 /// Reads what the daemon tells `reader`'s engine until the connection ends, masking `tail`
-/// microseconds past each run; the replies, which carry nothing it needs, pass unread.
+/// microseconds past each play's runs; the replies, which carry nothing it needs, pass unread.
 #[expect(
     clippy::single_call_fn,
     reason = "the engine's entry: main calls it once"
 )]
 pub fn run(mut reader: BufReader<UnixStream>, tail: u64) {
-    // where the last frame heard ends, the last mask's end, the ruling, each open play's rate and
-    // its last run's end
+    // where the last frame heard ends, the last mask's time, the ruling, the open mask's planned
+    // off, and each open play's rate
     let (mut heard, mut masked, mut ruled) = (0u64, 0u64, 0u64);
-    let mut open: BTreeMap<u64, (u64, u64)> = BTreeMap::new();
+    let (mut planned, mut open) = (None::<u64>, BTreeMap::<u64, u64>::new());
     let mut line = String::new();
     while reader.read_line(&mut line).unwrap_or_default() > 0 {
         let told: Value = serde_json::from_str(&line).unwrap_or_default();
@@ -29,27 +37,30 @@ pub fn run(mut reader: BufReader<UnixStream>, tail: u64) {
             heard = at("t").saturating_add(20_000);
         }
         if told["rate"].is_u64() {
-            let _: Option<(u64, u64)> = open.insert(at("play"), (at("rate"), 0));
+            let _: Option<u64> = open.insert(at("play"), at("rate"));
         }
-        if let Some(entry) = open
-            .get_mut(&at("play"))
-            .filter(|_| told["samples"].is_u64())
-        {
-            let lasted = at("samples").saturating_mul(1_000_000).checked_div(entry.0);
-            entry.1 = at("start").saturating_add(lasted.unwrap_or_default());
-            let (from, to) = (
-                at("start").max(masked).max(ruled),
-                entry.1.saturating_add(tail),
-            );
-            if to > from {
-                said.push(json!({"end": to, "op": "mask", "start": from}));
-                masked = to;
+        if let Some(&rate) = open.get(&at("play")).filter(|_| told["samples"].is_u64()) {
+            let lasted = at("samples").saturating_mul(1_000_000).checked_div(rate);
+            let end = at("start").saturating_add(lasted.unwrap_or_default());
+            if planned.is_none() {
+                masked = (at("start").max(masked).max(ruled)).min(heard.saturating_add(FORESIGHT));
+                said.push(json!({"on": true, "op": "mask", "start": masked}));
             }
+            planned = Some(planned.unwrap_or_default().max(end.saturating_add(tail)));
         }
         if told["played"].is_u64() {
-            let _: Option<(u64, u64)> = open.remove(&at("played"));
+            let _: Option<u64> = open.remove(&at("played"));
         }
-        let to = (open.values().map(|entry| entry.1).min()).map_or(heard, |end| end.min(heard));
+        // the tail heard out, the mask goes off where it ends
+        if let Some(off) = planned.filter(|&off| heard >= off) {
+            masked = off.max(masked);
+            said.push(json!({"on": false, "op": "mask", "start": masked}));
+            planned = None;
+        }
+        let to = planned.map_or_else(
+            || heard.saturating_sub(if open.is_empty() { 0 } else { GUARD }),
+            |off| heard.min(off),
+        );
         if to > ruled {
             said.push(json!({"op": "ruled", "to": to}));
             ruled = to;

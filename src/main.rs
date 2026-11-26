@@ -36,13 +36,18 @@ use std::panic;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Output, Stdio, exit, id};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
-use std::sync::{Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// A feed client this many events behind is dropped (docs/protocol.html#feed).
 const BEHIND: usize = 1024;
+
+/// How far past the end of the last frame an echo engine was given its mask may go on or off, in
+/// microseconds: a run's echo is known as it sounds, the tail after it (docs/protocol.html#engines).
+const FORESIGHT: u64 = 1_000_000;
 
 /// A frame's bytes: 20 ms of 16 kHz mono 16-bit little-endian PCM.
 const FRAME: usize = 640;
@@ -63,6 +68,10 @@ const REACH: u64 = 32;
 /// The `stopping` state, the one the request handler tests for.
 const STOPPING: &str = "stopping";
 
+/// A say's `text` reply is withheld while its speech engine has this many pieces of text not yet
+/// written to it (docs/protocol.html#engines).
+const UNREAD: usize = 8;
+
 /// Woken at every change to a play: a withheld give, a hush and the drain wait on it with `live`.
 static SLACK: Condvar = Condvar::new();
 
@@ -81,20 +90,49 @@ struct Engine {
     key: u64,
     /// Its name.
     name: String,
+    /// A turn engine's voice, an echo engine's mask: whether it is on.
+    on: bool,
     /// An echo engine's: every sample before it is ruled on; from where its track ended as it
-    /// connected, since frames before then went on unruled.
+    /// connected, any boot, since frames before then went on unruled.
     ruled: u64,
-    /// A turn engine's: whether its voice is on.
-    voice: bool,
+    /// A speech engine's pieces of text queued and not yet written to it, which its writer counts
+    /// down.
+    unread: Arc<AtomicUsize>,
+}
+
+/// One chunk of a replay: its lines, the last (`Err`) ending the engine, and the cursor after it.
+type Chunk = (
+    Box<dyn Iterator<Item = Result<String, String>> + Send>,
+    (u64, u64, (u64, u64)),
+);
+
+/// An engine's writer: its lines from its reply on, then, for a turn or words engine, its replay
+/// from disk chunk by chunk until it has caught up, when it joins its topics under the lock, then
+/// what it is told.
+struct Joining {
+    /// Where the replay stands: the frames from `.0` on, the turns ending after `.1` and past
+    /// `.2`, the last one sent; none once caught up, or for an engine that reads no frames.
+    cursor: Option<(u64, u64, (u64, u64))>,
+    /// Its queue.
+    incoming: Receiver<String>,
+    /// Its lines before any replay: its reply, an echo engine's open plays.
+    lines: Vec<String>,
+    /// Its queue's sender, for the topics it joins.
+    sender: SyncSender<String>,
+    /// Its track and kind.
+    slot: (String, String),
+    /// A speech engine's text pieces not yet written, counted down here.
+    unread: Arc<AtomicUsize>,
 }
 
 /// What a connection does after its reply is written.
 enum Next {
     /// Close it: a refused hello or a line past the limit.
     Close,
-    /// Become a device or an engine: the lines it starts with, then its replies and what it is
-    /// told, through this queue, by a writer of its own.
-    Device(Box<dyn Iterator<Item = String> + Send>, Receiver<String>),
+    /// Become a device: its replies and notices leave through this queue, by a writer of its own.
+    Device(Receiver<String>),
+    /// Become an engine, written by a writer of its own.
+    Engine(Box<Joining>),
     /// Become a feed: the lines it starts with, then every live one until the daemon drops it.
     Feed(Box<dyn Iterator<Item = String> + Send>, Receiver<String>),
     /// Read the next request.
@@ -194,6 +232,8 @@ struct Play {
 /// A say: text a client gives for a mouth, which its speech engine speaks through a play of its
 /// own (docs/protocol.html#engines).
 struct Say {
+    /// How many characters (Unicode scalar values) it was given.
+    chars: u64,
     /// Its client's connection key.
     client: u64,
     /// Whether its client sent `end`.
@@ -201,7 +241,8 @@ struct Say {
     /// Why it ends when not as its play does: a hush, its client or its engine gone, quiet, the
     /// drain or its mouth gone before it had a play.
     hushed: Option<&'static str>,
-    /// Its marks, rising: by its play's sample `.0`, its first `.1` characters had sounded.
+    /// Its marks, each past the last on both: by its play's sample `.0`, its first `.1`
+    /// characters had sounded.
     marks: Vec<(u64, u64)>,
     /// Its number.
     num: u64,
@@ -257,27 +298,30 @@ impl Live {
     }
 
     /// Ends each open say `pick` takes, by its mouth, `reason` its play's (or its own end's) unless
-    /// it was hushed first: `spoken` logged, its whole text when its play ran to its end, else as
-    /// far as its largest mark under `played`; its last line kept for its client, whose read side
-    /// is shut; its engine told to stop unless it spoke to its end.
+    /// it was hushed first: `spoken` logged, its whole text when its play, given something, ran
+    /// to its end and played all of it (`played`: its played and given), else as far as its
+    /// largest mark at or under what played; its last line kept for its client, whose read side
+    /// is shut; its engine told to stop unless it spoke to its end or was told as it was hushed.
     fn conclude(
         &mut self,
         reason: &str,
-        played: Option<u64>,
+        played: Option<(u64, u64)>,
         pick: &mut dyn FnMut(&String, &mut Say) -> bool,
     ) {
         let ended: Vec<(String, Say)> = self.says.extract_if(.., pick).collect();
         for (track, say) in ended {
             let why = say.hushed.unwrap_or(reason);
-            let spoken = if why == "end" && played.is_some() {
-                say.text.chars().count()
-            } else {
-                (say.marks.iter())
-                    .filter(|mark| Some(mark.0) <= played)
-                    .map(|mark| usize::try_from(mark.1).unwrap_or_default())
-                    .max()
-                    .unwrap_or_default()
-            };
+            let sounded = played.map(|counts| counts.0);
+            let spoken =
+                if why == "end" && played.is_some_and(|(sum, given)| given > 0 && sum >= given) {
+                    say.chars
+                } else {
+                    (say.marks.iter())
+                        .filter(|mark| Some(mark.0) <= sounded)
+                        .map(|mark| mark.1)
+                        .max()
+                        .unwrap_or_default()
+                };
             let mut last = json!({"kind": "spoken", "play": say.play, "reason": why, "say": say.num, "spoken": spoken, "text": say.text, "track": track});
             drop(self.emit(&last));
             if let Some(fields) = last.as_object_mut() {
@@ -290,11 +334,12 @@ impl Live {
                     .get(&say.client)
                     .map(|conn| conn.shutdown(Shutdown::Read)),
             );
-            if why != "end" {
+            if why != "end" && say.hushed.is_none() {
                 let line = json!({"hush": say.num});
                 self.fan(&format!("{track} say"), &format!("{line}\n"));
             }
         }
+        SLACK.notify_all();
     }
 
     /// Appends `event` to the log as this boot's next `seq` (the file opened, written whole and
@@ -353,7 +398,7 @@ impl Live {
             &format!("{}\n", json!({"played": num, "track": track})),
         );
         // a say's play over, the say is
-        self.conclude(reason, Some(played), &mut |mouth, say| {
+        self.conclude(reason, Some((played, play.given)), &mut |mouth, say| {
             mouth == track && say.play == Some(num)
         });
         SLACK.notify_all();
@@ -446,7 +491,13 @@ impl Live {
             let partials = format!("{} partial", slot.0);
             self.feeds
                 .retain(|feed| slot.1 != "words" || feed.2 != partials);
-            let name = self.engines.remove(&slot).map(|engine| engine.name);
+            let engine = self.engines.remove(&slot);
+            // an echo engine's mask left on goes off at its ruling: the frames held past it go on
+            // unmasked, live and in a replay alike
+            if let Some(echo) = engine.as_ref().filter(|held| slot.1 == "echo" && held.on) {
+                self.unmask(&slot.0, &echo.name, echo.ruled);
+            }
+            let name = engine.map(|held| held.name);
             drop(self.emit(&json!({"kind": "engine", "name": name, "on": false, "stage": slot.1, "track": slot.0})));
             // an echo engine gone, its held frames go on unruled: the stage fails open
             self.release(&slot.0);
@@ -457,6 +508,8 @@ impl Live {
                 self.hush(&slot.0, "hush");
             }
         }
+        // a say's text reply waiting on a speech engine gone
+        SLACK.notify_all();
     }
 
     /// `wrote`, a write to the log or a segment, as it came; the state `ready` once one
@@ -464,6 +517,21 @@ impl Live {
     const fn mark<T>(&mut self, wrote: io::Result<T>) -> io::Result<T> {
         self.state = if wrote.is_ok() { "ready" } else { "degraded" };
         wrote
+    }
+
+    /// Where `track`'s frames passed on reach, any boot: its first frame held for an echo engine,
+    /// else the end of its last segment on disk.
+    fn reach(&self, track: &str) -> u64 {
+        (self.tracks.get(track).and_then(|held| held.pending.front())).map_or_else(
+            || {
+                self.segments(track)
+                    .iter()
+                    .map(end)
+                    .max()
+                    .unwrap_or_default()
+            },
+            |frame| frame.0,
+        )
     }
 
     /// Passes `track`'s held frames its echo engine has ruled past, all with none connected, to
@@ -489,59 +557,101 @@ impl Live {
         }
     }
 
-    /// `track`'s frames on disk from `from` on, each segment read as the replay reaches it, and
-    /// where the last ends: a turn or words engine's replay, the live frames joined after it. A
-    /// words engine's carries each logged turn ending after `from`, after the frame holding its end.
+    /// One chunk of a turn or words engine's replay at `cursor` (`Joining`): `track`'s frames on
+    /// disk from its first time on, up to the first frame its echo engine holds (which comes live
+    /// once ruled on), each segment read from `audio/` or the archive as the replay reaches it;
+    /// for a words engine each logged turn ending after its second, past its third, after the
+    /// frame holding its end. None once there is nothing to send: caught up. A segment in neither
+    /// place ends it `gone`.
     fn replay(
         &self,
+        live: &'static Mutex<Self>,
         track: &str,
-        from: u64,
         words: bool,
-    ) -> (Box<dyn Iterator<Item = String> + Send>, u64) {
-        let mut spans: Vec<(u64, u64, PathBuf)> = (self.segments(track).iter())
-            .filter(|held| end(held) > from)
+        cursor: (u64, u64, (u64, u64)),
+    ) -> Option<Chunk> {
+        let (from, since, turned) = cursor;
+        let cut = self.reach(track);
+        // each segment's frames in range, by index: past `from`, before `cut`
+        let index = |time: u64, start: u64| {
+            time.saturating_sub(start)
+                .saturating_add(19_999)
+                .checked_div(20_000)
+                .unwrap_or_default()
+        };
+        let mut spans: Vec<(u64, u64, u64, String)> = (self.segments(track).iter())
             .map(|held| {
-                let count = held["samples"].as_u64().unwrap_or_default();
+                let start = held["start"].as_u64().unwrap_or_default();
+                let count = held["samples"]
+                    .as_u64()
+                    .unwrap_or_default()
+                    .checked_div(320);
+                let low = from
+                    .saturating_sub(start)
+                    .checked_div(20_000)
+                    .unwrap_or_default();
+                let high = count.unwrap_or_default().min(index(cut, start));
                 (
-                    held["start"].as_u64().unwrap_or_default(),
-                    count.checked_div(320).unwrap_or_default(),
-                    self.root.join(held["path"].as_str().unwrap_or_default()),
+                    start,
+                    low,
+                    high,
+                    held["path"].as_str().unwrap_or_default().to_owned(),
                 )
             })
+            .filter(|span| span.1 < span.2)
             .collect();
         spans.sort();
-        // up to the first frame its echo engine holds, which comes live once ruled on
-        let kept = self.tracks.get(track);
-        let cut = (kept.and_then(|known| known.pending.front())).map_or(u64::MAX, |frame| frame.0);
-        let given = (spans.iter())
-            .map(|span| span.0.saturating_add(span.1.saturating_mul(20_000)))
-            .max()
-            .unwrap_or_default()
-            .min(cut);
-        let marks = kept.map(|known| known.spans.clone()).unwrap_or_default();
+        let marks = self
+            .tracks
+            .get(track)
+            .map(|held| held.spans.clone())
+            .unwrap_or_default();
         let mut turns: Vec<(u64, u64)> = (marks.get("turn").into_iter().flatten())
-            .filter(|turn| words && turn.1 > from)
+            .filter(|&&turn| words && turn.1 > since && turn > turned)
             .copied()
             .collect();
-        let frames = spans.into_iter().flat_map(move |(start, count, path)| {
-            (fs::read(path).unwrap_or_default().chunks_exact(FRAME))
-                .take(usize::try_from(count).unwrap_or_default())
-                .zip((start..).step_by(20_000))
-                .filter(|&(_, at)| at.saturating_add(20_000) > from && at < cut)
-                .map(|(pcm, at)| (at, masked(&marks, at, &hex(pcm))))
-                .collect::<Vec<_>>()
+        if spans.is_empty() && turns.is_empty() {
+            return None;
+        }
+        let reach = (spans.iter())
+            .map(|span| span.0.saturating_add(span.2.saturating_mul(20_000)))
+            .fold(from, u64::max);
+        let next = (reach, since, turns.last().copied().unwrap_or(turned));
+        let root = self.root.clone();
+        let frames = spans.into_iter().flat_map(move |(start, low, high, path)| {
+            // the archive as it is set when the segment is read, the sweep having moved it
+            let read = fs::read(root.join(&path)).or_else(|cause| {
+                let archive = lock(live).archive.clone();
+                (archive.as_str()).map_or(Err(cause), |dir| fs::read(Path::new(dir).join(&path)))
+            });
+            read.map_or_else(
+                |_| vec![Err(format!("{}\n", error("gone")))],
+                |sound| {
+                    (sound.chunks_exact(FRAME).zip((start..).step_by(20_000)))
+                        .take(usize::try_from(high).unwrap_or_default())
+                        .skip(usize::try_from(low).unwrap_or_default())
+                        .map(|(pcm, at)| Ok((at, masked(&marks, at, &hex(pcm)))))
+                        .collect()
+                },
+            )
         });
         // before each frame the turns that ended by its start, the rest after the last
         let lines = frames.map(Some).chain([None]).flat_map(move |frame| {
-            let due = frame.as_ref().map_or(u64::MAX, |held| held.0);
+            let due = match frame {
+                Some(Ok((at, _))) => at,
+                _ => u64::MAX,
+            };
             (turns.extract_if(.., |turn| turn.1 <= due))
                 .map(|(start, stop)| {
-                    format!("{}\n", json!({"turn": {"end": stop, "start": start}}))
+                    Ok(format!(
+                        "{}\n",
+                        json!({"turn": {"end": stop, "start": start}})
+                    ))
                 })
-                .chain(frame.map(|held| held.1))
+                .chain(frame.map(|held| held.map(|known| known.1)))
                 .collect::<Vec<_>>()
         });
-        (Box::new(lines), given)
+        Some((Box::new(lines), next))
     }
 
     /// `slot`'s engine's report, checked and acted on (docs/protocol.html#engines): its reply, else
@@ -549,38 +659,32 @@ impl Live {
     /// no later than the last frame the engine was given; words rise inside it.
     fn report(&mut self, slot: &(String, String), request: &Value) -> io::Result<Value> {
         let (track, op) = (&slot.0, request["op"].as_str().unwrap_or_default());
-        // a ruling and a voice name one time, `to` and `start`
+        // a ruling, a voice and a mask name one time, `to` and `start`
         let first = request[if op == "ruled" { "to" } else { "start" }].as_u64();
-        let last = if matches!(op, "ruled" | "voice") {
+        let switched = matches!(op, "mask" | "voice");
+        let last = if switched || op == "ruled" {
             first
         } else {
             request["end"].as_u64()
         };
-        let (latest, (given, name, ruled, voice)) = (
+        let (latest, (given, name, on, ruled)) = (
             (self
                 .latest
                 .get(&(track.clone(), op.replace("partial", "words"))))
             .copied()
             .unwrap_or_default(),
             (self.engines.get(slot))
-                .map(|engine| {
-                    (
-                        engine.given,
-                        engine.name.clone(),
-                        engine.ruled,
-                        engine.voice,
-                    )
-                })
+                .map(|engine| (engine.given, engine.name.clone(), engine.on, engine.ruled))
                 .unwrap_or_default(),
         );
-        // a mask starts at or after the ruling, and alone may reach past what was heard: the
-        // echo of a run is known as it sounds
+        // a mask goes on or off at or after the ruling, as far as `FORESIGHT` past what was heard:
+        // the echo of a run is known as it sounds
         let floor = latest.max(if matches!(op, "mask" | "ruled") {
             ruled
         } else {
             0
         });
-        let ceiling = if op == "mask" { u64::MAX } else { given };
+        let ceiling = given.saturating_add(if op == "mask" { FORESIGHT } else { 0 });
         let timed = first
             .zip(last)
             .is_some_and(|(start, end)| floor <= start && start <= end && end <= ceiling);
@@ -598,29 +702,35 @@ impl Live {
                 span.is_some()
             })
         });
-        // the fields its event carries, a partial's line the same but its kind
+        // the fields its event carries, each word's its own three; a partial's line the same but
+        // its kind
         let mut event = json!({"engine": name, "kind": op, "track": track});
-        let fields: &[&str] = match op {
-            "partial" | "words" => &["end", "start", "words"],
-            "voice" => &["on", "start"],
-            _ => &["end", "start"],
+        let fields: &[&str] = if switched {
+            &["on", "start"]
+        } else {
+            &["end", "start"]
         };
         for &field in fields {
             event[field] = request[field].clone();
         }
+        if slot.1 == "words" {
+            event["words"] = (request["words"].as_array().into_iter().flatten())
+                .map(|word| json!({"end": word["end"], "start": word["start"], "text": word["text"]}))
+                .collect();
+        }
         let (begun, reached) = (first.unwrap_or_default(), last.unwrap_or_default());
         // a speech engine's say, open on its mouth: done after its end with no play coming; a
-        // mark rising, no further than the text given
+        // mark past the last on both, no further than the text given
         let saying = (self.says.get(track)).filter(|say| Some(say.num) == request["say"].as_u64());
         let done = saying.is_some_and(|say| say.end && say.play.is_none());
         let mark = (request["samples"].as_u64().zip(request["text"].as_u64())).filter(
             |&(samples, text)| {
                 saying.is_some_and(|say| {
-                    let (low, few) = say.marks.last().copied().unwrap_or_default();
-                    samples >= low
-                        && text >= few
-                        && usize::try_from(text)
-                            .is_ok_and(|count| count <= say.text.chars().count())
+                    text <= say.chars
+                        && say
+                            .marks
+                            .last()
+                            .is_none_or(|&(low, few)| samples > low && text > few)
                 })
             },
         );
@@ -647,24 +757,26 @@ impl Live {
                 self.fan(&format!("{track} partial"), &format!("{event}\n"));
                 Ok(json!({"ok": true}))
             }
-            // voice on and off alternate from on
+            // a voice's and a mask's on and off alternate from on
             ("echo", "mask") | ("turn", "turn" | "voice") | ("words", "words")
                 if timed
                     && (worded || slot.1 != "words")
-                    && (op != "voice" || request["on"] == !voice) =>
+                    && (!switched || request["on"] == !on) =>
             {
                 drop(self.emit(&event)?);
                 let _: Option<u64> = self.latest.insert((track.clone(), op.to_owned()), reached);
                 if let Some(engine) = self.engines.get_mut(slot) {
-                    engine.voice ^= op == "voice";
+                    engine.on ^= switched;
                 }
-                // a mask kept for the frames it covers, a turn for the words engine's replays
+                // a mask kept for the frames it covers, open until its off; a turn for the words
+                // engine's replays
                 if matches!(op, "mask" | "turn") {
                     let held = self.tracks.entry(track.clone()).or_default();
-                    held.spans
-                        .entry(op.to_owned())
-                        .or_default()
-                        .push((begun, reached));
+                    let spans = held.spans.entry(op.to_owned()).or_default();
+                    match spans.last_mut() {
+                        Some(open) if op == "mask" && on => open.1 = begun,
+                        _ => spans.push((begun, if op == "mask" { u64::MAX } else { reached })),
+                    }
                 }
                 // a turn's line to the words engine, after the frame holding its end
                 if op == "turn" {
@@ -734,14 +846,38 @@ impl Live {
         self.fan(&format!("{track}>"), &format!("{line}\n"));
     }
 
+    /// Logs `track`'s open mask, `name`'s, off at `at`, or at its on when that is later: an echo
+    /// engine gone with its mask on, the drain's included, and a boot after a kill left one on.
+    fn unmask(&mut self, track: &str, name: &str, at: u64) {
+        let slot = (track.to_owned(), "mask".to_owned());
+        let off = at.max(self.latest.get(&slot).copied().unwrap_or_default());
+        drop(self.emit(
+            &json!({"engine": name, "kind": "mask", "on": false, "start": off, "track": track}),
+        ));
+        let _: Option<u64> = self.latest.insert(slot, off);
+        let held = self.tracks.entry(track.to_owned()).or_default();
+        if let Some(open) = held.spans.entry("mask".to_owned()).or_default().last_mut() {
+            open.1 = off;
+        }
+    }
+
     /// Ends the open say of `only`, else of every mouth, for `reason`, kept before its play's: at
-    /// once when it has no play, else as its play ends, which the caller hushes.
+    /// once when it has no play, else as its play ends, which the caller hushes; its engine told
+    /// to stop now.
     fn unsay(&mut self, only: Option<&str>, reason: &'static str) {
+        let mut told = Vec::new();
         self.conclude(reason, None, &mut |mouth, say| {
             let picked = only.is_none_or(|one| one == mouth);
-            say.hushed = say.hushed.or_else(|| picked.then_some(reason));
+            if picked && say.hushed.is_none() {
+                say.hushed = Some(reason);
+                told.push((mouth.clone(), say.num));
+            }
             picked && say.play.is_none()
         });
+        for (mouth, num) in told {
+            let line = json!({"hush": num});
+            self.fan(&format!("{mouth} say"), &format!("{line}\n"));
+        }
     }
 }
 
@@ -1513,7 +1649,8 @@ fn main() -> ExitCode {
                     stall: Duration::from_millis(setting("RIFT_STALL_MS", 15_000)),
                     state: "ready",
                     sweeps,
-                    // the logged masks and turns, the sweep cutting those past the window
+                    // the logged masks, each from its on to its off, and turns, the sweep cutting
+                    // those past the window
                     tracks: of("mask").chain(of("turn")).fold(
                         BTreeMap::new(),
                         |mut tracks, span| {
@@ -1522,7 +1659,17 @@ fn main() -> ExitCode {
                             let entry: &mut Track =
                                 tracks.entry(field("track").to_owned()).or_default();
                             let spans = entry.spans.entry(field("kind").to_owned()).or_default();
-                            spans.push((at("start"), at("end")));
+                            match spans.last_mut() {
+                                Some(open) if span["on"] == false => open.1 = at("start"),
+                                _ => spans.push((
+                                    at("start"),
+                                    if span["on"] == true {
+                                        u64::MAX
+                                    } else {
+                                        at("end")
+                                    },
+                                )),
+                            }
                             tracks
                         },
                     ),
@@ -1576,6 +1723,13 @@ fn main() -> ExitCode {
                 }
                 for spoken in unsaid {
                     drop(guard.emit(&spoken)?);
+                }
+                // a mask a kill left on goes off as this boot starts, after every frame before
+                let masks: BTreeMap<&str, &Value> = of("mask")
+                    .map(|mask| (mask["track"].as_str().unwrap_or_default(), mask))
+                    .collect();
+                for (track, mask) in masks.into_iter().filter(|entry| entry.1["on"] == true) {
+                    guard.unmask(track, mask["engine"].as_str().unwrap_or_default(), now());
                 }
                 // a segment a kill left open: cut to whole frames and closed with its event, its
                 // start where its track's last event of that boot ended
@@ -1841,10 +1995,11 @@ fn main() -> ExitCode {
                                 Next::Go,
                             ),
                             (true, Some("engine"))
-                                if request["from"].as_u64().is_some_and(|from| {
-                                    from < now()
-                                        .saturating_sub(guard.window.saturating_mul(1_000_000))
-                                }) =>
+                                if role.is_some()
+                                    && request["from"].as_u64().is_some_and(|from| {
+                                        from < now()
+                                            .saturating_sub(guard.window.saturating_mul(1_000_000))
+                                    }) =>
                             {
                                 (Ok(error("gone")), Next::Go)
                             }
@@ -1864,13 +2019,10 @@ fn main() -> ExitCode {
                                 match on {
                                     Ok(_) => {
                                         let slot = (track.to_owned(), kind.to_owned());
-                                        // a turn or words engine's frames: from disk from its
-                                        // `from` (none for live), then live as each is placed
-                                        let (backlog, reach) = guard.replay(
-                                            track,
-                                            request["from"].as_u64().unwrap_or(u64::MAX),
-                                            kind == "words",
-                                        );
+                                        // where its track's frames passed on reach: a turn or
+                                        // words engine reading live starts there, an echo
+                                        // engine's ruling too
+                                        let reached = guard.reach(track);
                                         let mut reply = json!({"ok": true, "seq": guard.seq});
                                         if !request["id"].is_null() {
                                             reply["id"] = request["id"].clone();
@@ -1887,44 +2039,58 @@ fn main() -> ExitCode {
                                                 .max(latest(&kind.replace("turn", "voice")))
                                                 .into();
                                         }
-                                        // what it reads: an echo engine its ear's frames as a
-                                        // listener does and every mouth's runs; a speech engine
-                                        // its mouth's says; a turn engine the ruled frames; a
-                                        // words engine those and the turns
+                                        // an echo engine reads its ear's frames as a listener
+                                        // does, and every mouth's runs, from the plays open and
+                                        // where each has got to; a speech engine its mouth's
+                                        // says; a turn or words engine joins its topics once its
+                                        // replay has caught up
+                                        let mut lines = vec![format!("{reply}\n")];
                                         let topics = match kind {
                                             "echo" => vec![track.to_owned(), "runs".to_owned()],
                                             "speech" => vec![format!("{track} say")],
-                                            "words" => vec![
-                                                format!("{track} heard"),
-                                                format!("{track} turn"),
-                                            ],
-                                            _ => vec![format!("{track} heard")],
+                                            _ => Vec::new(),
                                         };
                                         for topic in topics {
                                             guard.feeds.push((sender.clone(), key, topic));
                                         }
-                                        let ruled = (guard.tracks.get(track))
-                                            .and_then(|held| held.end)
-                                            .unwrap_or_default();
+                                        for (mouth, play) in
+                                            guard.plays.iter().filter(|_| kind == "echo")
+                                        {
+                                            lines.push(format!("{}\n", json!({"play": play.num, "rate": play.rate, "track": mouth})));
+                                            lines.extend(play.run.map(|(from, samples, start)| {
+                                                format!("{}\n", json!({"from": from, "play": play.num, "samples": samples, "start": start, "track": mouth}))
+                                            }));
+                                        }
+                                        let unread = Arc::new(AtomicUsize::new(0));
                                         drop(guard.engines.insert(
                                             slot.clone(),
                                             Engine {
-                                                given: reach,
+                                                given: 0,
                                                 key,
                                                 name: name.to_owned(),
-                                                ruled,
-                                                voice: false,
+                                                on: false,
+                                                ruled: reached,
+                                                unread: Arc::clone(&unread),
                                             },
                                         ));
-                                        (queue, engaged) = (Some(sender), Some(slot));
+                                        let from = request["from"].as_u64().unwrap_or(reached);
+                                        let cursor = matches!(kind, "turn" | "words").then_some((
+                                            from,
+                                            from,
+                                            (0, 0),
+                                        ));
+                                        (queue, engaged) =
+                                            (Some(sender.clone()), Some(slot.clone()));
                                         (
                                             Ok(Value::Null),
-                                            Next::Device(
-                                                Box::new(
-                                                    iter::once(format!("{reply}\n")).chain(backlog),
-                                                ),
+                                            Next::Engine(Box::new(Joining {
+                                                cursor,
                                                 incoming,
-                                            ),
+                                                lines,
+                                                sender,
+                                                slot,
+                                                unread,
+                                            })),
                                         )
                                     }
                                     Err(cause) => (Err(cause), Next::Go),
@@ -1955,7 +2121,7 @@ fn main() -> ExitCode {
                                 }
                                 queue = Some(sender);
                                 device = Some(name);
-                                (Ok(reply), Next::Device(Box::new(iter::empty()), incoming))
+                                (Ok(reply), Next::Device(incoming))
                             }
                             (true, Some(op @ ("ears" | "quiet"))) if request["on"].is_boolean() => {
                                 let on = request["on"] == true;
@@ -2093,7 +2259,10 @@ fn main() -> ExitCode {
                                                 &name,
                                                 &format!("{}\n", json!({"pcm": sound, "t": start})),
                                             );
-                                            state.hear(&name, start, sound);
+                                            // a mouth's frames go to no turn or words engine
+                                            if name.starts_with("ear-") {
+                                                state.hear(&name, start, sound);
+                                            }
                                             let mut reply = json!({"ok": true, "t": start});
                                             if pinged.elapsed() >= every {
                                                 (reply["ping"], pinged) =
@@ -2171,7 +2340,10 @@ fn main() -> ExitCode {
                                 let count = guard.says.get_mut(&mouth).map_or(0, |say| {
                                     say.end = op == "end";
                                     say.text.push_str(text);
-                                    say.text.chars().count()
+                                    say.chars = say.chars.saturating_add(
+                                        u64::try_from(text.chars().count()).unwrap_or_default(),
+                                    );
+                                    say.chars
                                 });
                                 let (told, reply) = if op == "end" {
                                     (json!({"end": num}), json!({"ok": true}))
@@ -2181,7 +2353,25 @@ fn main() -> ExitCode {
                                         json!({"ok": true, "text": count}),
                                     )
                                 };
+                                // a piece of text counted until its engine's writer has written
+                                // it, its reply withheld while `UNREAD` are
+                                let speech = (mouth.clone(), "speech".to_owned());
+                                let unread = (guard.engines.get(&speech))
+                                    .map(|engine| Arc::clone(&engine.unread))
+                                    .filter(|_| op == "text")
+                                    .inspect(|held| {
+                                        let _queued = held.fetch_add(1, Ordering::Relaxed);
+                                    });
                                 guard.fan(&format!("{mouth} say"), &format!("{told}\n"));
+                                while unread
+                                    .as_ref()
+                                    .is_some_and(|held| held.load(Ordering::Relaxed) >= UNREAD)
+                                    && guard.says.get(&mouth).is_some_and(|say| say.num == num)
+                                    && guard.engines.contains_key(&speech)
+                                {
+                                    guard =
+                                        SLACK.wait(guard).unwrap_or_else(PoisonError::into_inner);
+                                }
                                 (Ok(reply), Next::Go)
                             }
                             // a say's play ends only after the say's `end`
@@ -2228,7 +2418,8 @@ fn main() -> ExitCode {
                             {
                                 // a say's play names the say, open on the mouth and not yet
                                 // played; a say holds the mouth from any other play or say
-                                let say = request.get("say").filter(|_| op == "play");
+                                let say = (request.get("say"))
+                                    .filter(|named_say| op == "play" && !named_say.is_null());
                                 let refused = if say.is_some_and(|claimed| {
                                     !guard.says.get(track).is_some_and(|held| {
                                         *claimed == held.num && held.play.is_none()
@@ -2272,6 +2463,7 @@ fn main() -> ExitCode {
                                             drop(guard.says.insert(
                                                 track.to_owned(),
                                                 Say {
+                                                    chars: 0,
                                                     client: key,
                                                     end: false,
                                                     hushed: None,
@@ -2622,15 +2814,80 @@ fn main() -> ExitCode {
                         }
                         match next {
                             Next::Close => break,
-                            Next::Device(backlog, incoming) => {
-                                drop(writer.try_clone().map(|mut out| {
-                                    thread::spawn(move || {
-                                        backlog
-                                            .chain(incoming)
-                                            .try_for_each(|line| out.write_all(line.as_bytes()))
-                                    })
-                                }));
-                            }
+                            Next::Device(incoming) => drop(writer.try_clone().map(|mut out| {
+                                thread::spawn(move || {
+                                    incoming
+                                        .into_iter()
+                                        .try_for_each(|line| out.write_all(line.as_bytes()))
+                                })
+                            })),
+                            Next::Engine(joining) => drop(writer.try_clone().map(|mut out| {
+                                thread::spawn(move || {
+                                    let Joining {
+                                        mut cursor,
+                                        incoming,
+                                        lines,
+                                        sender,
+                                        slot,
+                                        unread,
+                                    } = *joining;
+                                    let writing = || -> io::Result<()> {
+                                        for line in lines {
+                                            out.write_all(line.as_bytes())?;
+                                        }
+                                        // its replay a chunk at a time, off the lock, so a slow
+                                        // engine holds no queue behind it; one finding nothing
+                                        // more joins its topics under the same lock. One gone
+                                        // meanwhile fails its next write
+                                        while let Some(at) = cursor {
+                                            let mut locked = lock(live);
+                                            let chunk =
+                                                locked.replay(live, &slot.0, slot.1 == "words", at);
+                                            cursor = chunk.as_ref().map(|held| held.1);
+                                            if let Some((engine, onward)) =
+                                                (locked.engines.get_mut(&slot))
+                                                    .filter(|held| held.key == key)
+                                                    .zip(cursor)
+                                            {
+                                                engine.given = onward.0;
+                                            }
+                                            let topics = ["heard", "turn"]
+                                                .iter()
+                                                .take(if slot.1 == "words" { 2 } else { 1 });
+                                            for topic in topics.filter(|_| cursor.is_none()) {
+                                                locked.feeds.push((
+                                                    sender.clone(),
+                                                    key,
+                                                    format!("{} {topic}", slot.0),
+                                                ));
+                                            }
+                                            drop(locked);
+                                            for line in chunk.into_iter().flat_map(|held| held.0) {
+                                                match line {
+                                                    Ok(text) => out.write_all(text.as_bytes())?,
+                                                    // a segment gone from disk and the archive
+                                                    Err(text) => {
+                                                        return out.write_all(text.as_bytes());
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        drop(sender);
+                                        for line in incoming {
+                                            out.write_all(line.as_bytes())?;
+                                            // a say's text written: its withheld reply may go
+                                            if line.starts_with(r#"{"say":"#) {
+                                                let _left = unread.fetch_sub(1, Ordering::Relaxed);
+                                                drop(lock(live));
+                                                SLACK.notify_all();
+                                            }
+                                        }
+                                        Ok(())
+                                    };
+                                    drop(writing());
+                                    drop(out.shutdown(Shutdown::Both));
+                                })
+                            })),
                             Next::Feed(backlog, incoming) => {
                                 // a vanished client drops its queue at once, so `incoming` ends
                                 drop(thread::spawn(move || {

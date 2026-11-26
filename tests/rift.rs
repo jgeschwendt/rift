@@ -24,7 +24,8 @@ mod tests {
     use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _, symlink};
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::process::{Child, ChildStderr, Command, ExitStatus, Output, Stdio, id};
-    use std::sync::mpsc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, mpsc};
     use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -2543,6 +2544,8 @@ mod tests {
             r#"{"from":null,"kind":"words","name":"a","op":"engine","track":"mouth-desk"}"#,
             r#"{"kind":"words","name":"a","op":"engine","track":"ear-desk"}"#,
             r#"{"from":"x","kind":"turn","name":"a","op":"engine","track":"ear-desk"}"#,
+            // checked before its `from`, long gone
+            r#"{"from":1,"kind":"words","name":"a/b","op":"engine","track":"ear-desk"}"#,
             r#"{"from":null,"kind":"echo","name":"a","op":"engine","track":"ear-desk"}"#,
         ] {
             same(&say(&mut probe, line)?, &code("bad_request"))?;
@@ -2688,9 +2691,12 @@ mod tests {
         let report = |op: &str, start: u64, stop: u64, said: &Value| {
             json!({"end": stop, "op": op, "start": start, "words": said}).to_string()
         };
+        // a word's other fields are not logged
+        let noisy =
+            json!([{"end": first + 40_000, "start": first + 10_000, "text": "hello", "x": 1u8}]);
         let logged = serde_json::from_str::<Value>(&say(
             &mut engine,
-            &report("words", first, first + 60_000, &final_words),
+            &report("words", first, first + 60_000, &noisy),
         )?)?;
         for line in [
             report("words", first + 40_000, first + 80_000, &json!([])),
@@ -2751,6 +2757,91 @@ mod tests {
             &(first + 60_000).to_string(),
         )?;
         drop((again, ear, reader));
+        // an engine slower than its ear through its replay: read from disk until caught up,
+        // never dropped behind a queue of live frames
+        let track = |name: &str| json!({"kind": "ear", "name": name, "op": "device"}).to_string();
+        let from = |at: u64, name: &str| {
+            json!({"from": at, "kind": "words", "name": "w", "op": "engine", "track": format!("ear-{name}")})
+                .to_string()
+        };
+        let (mut slow, slow_hi) = device(&root, &track("slow"), 0)?;
+        let slow_base = slow_hi["ping"].as_u64().unwrap_or_default() - 40_000_000;
+        let mut streamed = self::placed(&mut slow, slow_base, 0..10)?;
+        let mut behind = greet(&root)?;
+        drop(line_after(&mut behind, &from(streamed[0], "slow"))?);
+        streamed.extend(self::placed(&mut slow, slow_base, 10..1500)?);
+        let caught: Vec<Value> = iter::repeat_with(|| line(&mut behind))
+            .take(1500)
+            .collect::<Result<_, _>>()?;
+        same(
+            &(caught
+                .iter()
+                .map(|got| got["t"].as_u64().unwrap_or_default())
+                .collect::<Vec<_>>()
+                == streamed)
+                .to_string(),
+            "true",
+        )?;
+        drop((slow, behind));
+        // a segment moved to the archive under a replay is read from there; one deleted ends it
+        // `gone`, after the frames read before
+        let archive = format!("{root}/archive");
+        let keep = |args: &[&str]| -> Outcome {
+            same(
+                &rift(&root, &[], &[&["keep"][..], args].concat())?
+                    .starts_with("0\n")
+                    .to_string(),
+                "true",
+            )
+        };
+        // 200 frames on `name`, an engine replaying them from the first, their segments swept
+        // as `kept` has it once it has begun
+        let swept = |name: &str,
+                     kept: &[&str]|
+         -> Result<(BufReader<UnixStream>, Vec<u64>), Box<dyn Error>> {
+            let (mut fed, fed_hi) = device(&root, &track(name), 0)?;
+            let at = self::placed(
+                &mut fed,
+                fed_hi["ping"].as_u64().unwrap_or_default() - 20_000_000,
+                0..200,
+            )?;
+            drop(fed);
+            let mut reading = greet(&root)?;
+            drop(line_after(&mut reading, &from(at[0], name))?);
+            keep(kept)?;
+            let dir = format!("{root}/audio/1/ear-{name}");
+            until(|| Ok(fs::read_dir(&dir)?.count() == 0))?;
+            Ok((reading, at))
+        };
+        let (mut moved, moved_at) = swept("arch", &["0", &archive])?;
+        let read_back: Vec<Value> = iter::repeat_with(|| line(&mut moved))
+            .take(200)
+            .collect::<Result<_, _>>()?;
+        same(
+            &(read_back
+                .iter()
+                .map(|got| got["t"].as_u64().unwrap_or_default())
+                .collect::<Vec<_>>()
+                == moved_at)
+                .to_string(),
+            "true",
+        )?;
+        keep(&["600"])?;
+        let (mut deleted, deleted_at) = swept("lost", &["0"])?;
+        let mut lost = drain(&mut deleted)?;
+        keep(&["600"])?;
+        same(&lost.pop().unwrap_or_default().to_string(), &code("gone"))?;
+        same(
+            &format!(
+                "{} {}",
+                lost.len() < 200,
+                lost.iter()
+                    .zip(&deleted_at)
+                    .all(|(got, &at)| got["t"] == at)
+            ),
+            "true true",
+        )?;
+        drop(moved);
         // an engine dropped mid-stream takes nothing from a file-fed ear
         let file = format!("{root}/fed.pcm");
         fs::write(&file, vec![7u8; 640 * 250])?;
@@ -2972,17 +3063,22 @@ mod tests {
         };
         same(&say(&mut words, &probe(at[0] + 1))?, &code("bad_request"))?;
         let mask =
-            |start: u64, stop: u64| json!({"end": stop, "op": "mask", "start": start}).to_string();
+            |on: bool, start: u64| json!({"on": on, "op": "mask", "start": start}).to_string();
         let rule = |to: u64| json!({"op": "ruled", "to": to}).to_string();
         let mut verdicts = Vec::new();
+        // on and off alternating from on, rising, at or after the ruling, no more than a second
+        // past what was heard
         for report in [
             rule(at[9] + 20_001),
-            mask(at[2] + 5000, at[3] + 10_000),
-            mask(at[3], at[4]),
-            mask(at[4] + 10_000, at[4]),
+            mask(false, at[2] + 5000),
+            mask(true, at[9] + 1_020_001),
+            mask(true, at[2] + 5000),
+            mask(true, at[3]),
+            mask(false, at[2]),
+            mask(false, at[3] + 10_000),
             rule(at[4] + 20_000),
             rule(at[3]),
-            mask(at[4] + 10_000, at[4] + 15_000),
+            mask(true, at[4] + 10_000),
             r#"{"end":2,"op":"turn","start":1}"#.to_owned(),
         ] {
             let got = line_after(&mut echo, &report)?;
@@ -2990,7 +3086,7 @@ mod tests {
         }
         same(
             &verdicts.join(" "),
-            "bad_request ok bad_request bad_request ok bad_request bad_request bad_request",
+            "bad_request bad_request bad_request ok bad_request bad_request ok ok bad_request bad_request bad_request",
         )?;
         // the ruled frames and no more, the masked samples zeros: F2 from 5 ms in, F3 to 10 ms in
         let live: Vec<Value> = iter::repeat_with(|| line(&mut words))
@@ -3033,6 +3129,8 @@ mod tests {
             .collect::<Result<_, _>>()?;
         same(&json!(replayed).to_string(), &json!(expected).to_string())?;
         same(&say(&mut again, &probe(at[4] + 20_000))?, r#"{"ok":true}"#)?;
+        // gone with its mask on: the daemon puts it off at the ruling, before its end
+        drop(line_after(&mut echo, &mask(true, at[4] + 20_000))?);
         drop(echo);
         let flowed: Vec<Value> = iter::repeat_with(|| line(&mut again))
             .take(5)
@@ -3045,6 +3143,25 @@ mod tests {
                     .collect::<Vec<_>>()
             )
             .to_string(),
+        )?;
+        same(
+            &kinds(&root, "", 3)?,
+            &[
+                json!({"engine": "cancel", "kind": "mask", "on": true, "track": "ear-desk"}),
+                json!({"engine": "cancel", "kind": "mask", "on": false, "track": "ear-desk"}),
+                json!({"kind": "engine", "name": "cancel", "on": false, "stage": "echo", "track": "ear-desk"}),
+            ]
+            .map(|event| event.to_string())
+            .join("\n"),
+        )?;
+        same(
+            &events(&root)?
+                .iter()
+                .rev()
+                .nth(1)
+                .map_or(Value::Null, |event| event["e"]["start"].clone())
+                .to_string(),
+            &(at[4] + 20_000).to_string(),
         )?;
         drop(again);
         // 1024 frames behind its ruling: dropped
@@ -3088,14 +3205,76 @@ mod tests {
                 json!({"played": 1u8, "track": "mouth-desk"})
             ),
         )?;
+        // one joining mid-play is told the play and its run so far as it connects
+        drop(told);
+        until(|| Ok(kinds(&root, "engine", 1)?.contains(r#""on":false"#)))?;
+        let mut second = greet(&root)?;
+        drop(say(
+            &mut second,
+            r#"{"op":"play","rate":16000,"track":"mouth-desk"}"#,
+        )?);
+        send(
+            &mut mouth,
+            r#"{"from":0,"op":"sound","play":2,"samples":160,"t":1000000}"#,
+        )?;
+        // the mouth's next answer comes once its report is taken
+        drop(line_after(&mut mouth, r#"{"op":"health"}"#)?);
+        let mut joined = greet(&root)?;
+        drop(say(&mut joined, cancel)?);
+        let (open_play, its_run) = (line(&mut joined)?, line(&mut joined)?);
+        same(
+            &format!("{open_play}\n{its_run}"),
+            &format!(
+                "{}\n{}",
+                json!({"play": 2u8, "rate": 16_000u16, "track": "mouth-desk"}),
+                json!({"from": 0u8, "play": 2u8, "samples": 160u8, "start": its_run["start"], "track": "mouth-desk"}),
+            ),
+        )?;
         // the masks hold across a restart
-        drop((told, mouth, giver, ear));
+        drop((joined, mouth, giver, second, ear));
         same(
             &say(&mut greet(&root)?, r#"{"op":"shutdown"}"#)?,
             r#"{"ok":true}"#,
         )?;
         same(&format!("{:?}", daemon.0.wait()?.code()), "Some(0)")?;
+        // a fresh boot: the ruling starts where the ear ended last boot, before any frame of this
+        // one, so no mask reaches a frame passed on then
+        let reached = events(&root)?
+            .iter()
+            .map(|event| &event["e"])
+            .filter(|event| event["kind"] == "segment" && event["track"] == "ear-desk")
+            .map(|event| {
+                let field = |key: &str| event[key].as_u64().unwrap_or_default();
+                field("start") + (field("samples") * 125).checked_div(2).unwrap_or_default()
+            })
+            .max()
+            .unwrap_or_default();
+        let killed = serve(&root, &envs)?.0;
+        let mut fresh = greet(&root)?;
+        drop(say(&mut fresh, cancel)?);
+        let (mut anew, anew_hi) =
+            device(&root, r#"{"kind":"ear","name":"desk","op":"device"}"#, 0)?;
+        drop(frame(
+            &mut anew,
+            anew_hi["ping"].as_u64().unwrap_or_default(),
+            3,
+        )?);
+        same(
+            &format!(
+                "{} {}",
+                line_after(&mut fresh, &mask(true, reached - 20_000))?,
+                line_after(&mut fresh, &mask(true, reached))?["ok"]
+            ),
+            &format!("{} true", code("bad_request")),
+        )?;
+        // killed with it on: the next boot puts it off as it starts
+        drop(killed);
+        drop((fresh, anew));
         let (mut restarted, _) = serve(&root, &envs)?;
+        same(
+            &kinds(&root, "mask", 2)?,
+            r#"{"engine":"cancel","kind":"mask","on":false,"track":"ear-desk"}"#,
+        )?;
         let mut later = greet(&root)?;
         drop(line_after(&mut later, &listen(json!(at[0])))?);
         let after: Vec<Value> = iter::repeat_with(|| line(&mut later))
@@ -3109,16 +3288,18 @@ mod tests {
         same(&format!("{:?}", restarted.0.wait()?.code()), "Some(0)")
     }
 
-    /// `rift engine run tail` against a play into the fake output of `$RIFT_SPEAKER`
-    /// (docs/index.html#engines): its masks, merged, each logged run's span plus the tail, merged;
-    /// the daemon gone, it ends `unknown`, exit 1.
+    /// `rift engine run tail` against a play into the fake output of `$RIFT_SPEAKER`, a file-fed ear
+    /// streaming in real time (docs/index.html#engines): its masks, each from its on to its off,
+    /// merged, each logged run's span plus the tail, merged; a play open and idle, the ear ruled on
+    /// still, its frames reaching a words engine; the daemon gone, it ends `unknown`, exit 1.
     #[cfg(target_os = "macos")]
     #[test]
     fn tail() -> Outcome {
         let root = temp("tail")?;
         let fake = format!("{root}/fake");
         fs::create_dir_all(format!("{fake}/outputs"))?;
-        fs::write(format!("{fake}/outputs/Desk"), "48000 1 0")?;
+        // a latency, so a run starts after the frames heard as it is reported
+        fs::write(format!("{fake}/outputs/Desk"), "48000 1 100")?;
         fs::write(format!("{fake}/default"), "Desk\n")?;
         let (mut daemon, _) = serve(&root, &[("RIFT_STALL_MS", "86400000")])?;
         let mut mouth = Daemon(
@@ -3145,34 +3326,50 @@ mod tests {
         );
         let mut printed = BufReader::new(tail.0.stdout.take().ok_or("stdout")?);
         same(&next(&mut printed)?, r#"{"ok":true,"seq":3}"#)?;
-        // the ear heard before the play, so the ruling waits on no run
-        let (mut ear, hi) = device(&root, r#"{"kind":"ear","name":"desk","op":"device"}"#, 0)?;
-        drop(placed(
-            &mut ear,
-            hi["ping"].as_u64().unwrap_or_default() - 2_000_000,
-            0..5,
+        // the ear streaming in real time, a minute of it, ended by the daemon's drain
+        let file = format!("{root}/ear.pcm");
+        fs::write(&file, vec![0u8; 640 * 3000])?;
+        let mut ear = Daemon(
+            Command::new(env!("CARGO_BIN_EXE_rift"))
+                .env("RIFT_ROOT", &root)
+                .args(["device", "ear", "desk", &file])
+                .stdout(Stdio::null())
+                .spawn()?,
+        );
+        until(|| Ok(kinds(&root, "track", usize::MAX)?.contains("ear-desk")))?;
+        let mut words = greet(&root)?;
+        drop(say(
+            &mut words,
+            r#"{"from":null,"kind":"words","name":"w","op":"engine","track":"ear-desk"}"#,
         )?);
         let (_, last) = joined(giver(&root, "mouth-desk", 16_000, tone(16_000, 0.3)))?;
         same(&last["reason"].to_string(), r#""end""#)?;
-        // each kind's spans, merged where they meet or overlap
+        // each kind's spans, a run's plus `reach`, a mask's from its on to its off, merged where
+        // they meet or overlap
         let spans = |kind: &str, reach: u64| -> Result<Vec<(u64, u64)>, Box<dyn Error>> {
-            let mut held: Vec<(u64, u64)> = events(&root)?
+            let held_events = events(&root)?;
+            let picked: Vec<&Value> = held_events
                 .iter()
                 .map(|event| &event["e"])
                 .filter(|event| event["kind"] == kind)
-                .map(|event| {
-                    let at = |key: &str| event[key].as_u64().unwrap_or_default();
-                    let stop = if kind == "sound" {
-                        at("start")
-                            + (at("samples") * 1_000_000)
-                                .checked_div(16_000)
-                                .unwrap_or_default()
-                    } else {
-                        at("end")
-                    };
-                    (at("start"), stop + reach)
-                })
                 .collect();
+            let at = |event: &Value, key: &str| event[key].as_u64().unwrap_or_default();
+            let mut held: Vec<(u64, u64)> = if kind == "sound" {
+                (picked.iter())
+                    .map(|event| {
+                        let lasted = (at(event, "samples") * 1_000_000).checked_div(16_000);
+                        (
+                            at(event, "start"),
+                            at(event, "start") + lasted.unwrap_or_default() + reach,
+                        )
+                    })
+                    .collect()
+            } else {
+                (picked.chunks_exact(2))
+                    .filter_map(|pair| pair.first().zip(pair.last()))
+                    .map(|(on, off)| (at(on, "start"), at(off, "start")))
+                    .collect()
+            };
             held.sort_unstable();
             Ok(held
                 .into_iter()
@@ -3189,8 +3386,25 @@ mod tests {
         until(|| {
             Ok(spans("mask", 0).map_err(|cause| io::Error::other(cause.to_string()))? == runs)
         })?;
+        // a play open and given nothing: the ear ruled on still, its frames passed on
+        let mut idle = greet(&root)?;
+        drop(say(
+            &mut idle,
+            r#"{"op":"play","rate":16000,"track":"mouth-desk"}"#,
+        )?);
+        let opened = now_us();
+        while line(&mut words)?["t"]
+            .as_u64()
+            .is_none_or(|at| at <= opened)
+        {}
+        same(
+            &say(&mut greet(&root)?, r#"{"op":"health"}"#)?
+                .contains(r#""playing":{"mouth-desk""#)
+                .to_string(),
+            "true",
+        )?;
+        drop((idle, words));
         // the daemon gone, its connection ends
-        drop(ear);
         same(
             &say(&mut greet(&root)?, r#"{"op":"shutdown"}"#)?,
             r#"{"ok":true}"#,
@@ -3200,6 +3414,7 @@ mod tests {
             &format!("{} {:?}", next(&mut printed)?, tail.0.wait()?.code()),
             r#"{"code":"unknown","ok":false} Some(1)"#,
         )?;
+        same(&format!("{:?}", ear.0.wait()?.code()), "Some(1)")?;
         same(&signal(&mouth, "TERM")?, "")?;
         same(&format!("{:?}", mouth.0.wait()?.code()), "Some(0)")
     }
@@ -3252,9 +3467,11 @@ mod tests {
         // say 1, spoken to its end
         let mut client = greet(&root)?;
         same(&line_after(&mut client, opening)?["say"].to_string(), "1")?;
+        // a play naming no say, `"say":null` as without one
         for line in [
             opening,
             r#"{"op":"play","rate":16000,"track":"mouth-desk"}"#,
+            r#"{"op":"play","rate":16000,"say":null,"track":"mouth-desk"}"#,
         ] {
             same(&say(&mut probe, line)?, &code("busy"))?;
         }
@@ -3280,10 +3497,10 @@ mod tests {
         let mut verdicts = Vec::new();
         for report in [
             mark(1, 800, 13),
-            mark(1, 700, 13),
-            mark(1, 900, 12),
+            mark(1, 800, 14),
+            mark(1, 900, 13),
             mark(1, 900, 99),
-            mark(9, 900, 13),
+            mark(9, 900, 14),
             done(1),
         ] {
             verdicts.push(
@@ -3338,21 +3555,21 @@ mod tests {
             same(&say(&mut engine, &report)?, r#"{"ok":true}"#)?;
         }
         send(&mut mouth, &sound(2, 800))?;
+        // the engine told at once, before the play has ended
         send(&mut probe, r#"{"op":"hush","track":"mouth-desk"}"#)?;
-        same(&next(&mut mouth)?, r#"{"hush":2}"#)?;
+        same(
+            &format!("{} {}", next(&mut mouth)?, next(&mut engine)?),
+            r#"{"hush":2} {"hush":2}"#,
+        )?;
         send(&mut mouth, r#"{"op":"done","play":2}"#)?;
         let hushed = line(&mut probe)?;
         spoken = line(&mut client)?;
         same(
             &format!(
-                "{} {} {} {} {}",
-                hushed["say"],
-                hushed["played"],
-                spoken["reason"],
-                spoken["spoken"],
-                next(&mut engine)?
+                "{} {} {} {}",
+                hushed["say"], hushed["played"], spoken["reason"], spoken["spoken"]
             ),
-            r#"2 800 "hush" 5 {"hush":2}"#,
+            r#"2 800 "hush" 5"#,
         )?;
         drop((client, giver));
         // say 3, done with no play; say 4, hushed with none
@@ -3394,9 +3611,13 @@ mod tests {
         drop(say(&mut giver, &zeros(1))?);
         drop(next(&mut mouth)?);
         drop(client);
-        same(&next(&mut mouth)?, r#"{"hush":3}"#)?;
+        same(
+            &format!("{} {}", next(&mut mouth)?, next(&mut engine)?),
+            r#"{"hush":3} {"hush":6}"#,
+        )?;
         send(&mut mouth, r#"{"op":"done","play":3}"#)?;
-        same(&next(&mut engine)?, r#"{"hush":6}"#)?;
+        // its giver's last line: the play is over before the giver leaves
+        same(&line(&mut giver)?["reason"].to_string(), r#""hush""#)?;
         drop(giver);
         // quiet (say 7)
         client = greet(&root)?;
@@ -3425,18 +3646,79 @@ mod tests {
         send(&mut mouth, r#"{"op":"done","play":4}"#)?;
         same(&line(&mut client)?["reason"].to_string(), r#""engine""#)?;
         drop(giver);
-        // the mouth gone (say 10)
+        // the mouth gone mid-play (say 10): the play ends `mouth`, and so the say, its engine told
         engine = greet(&root)?;
         drop(say(&mut engine, speech)?);
         client = greet(&root)?;
         drop(say(&mut client, opening)?);
+        giver = greet(&root)?;
+        drop(say(&mut giver, &tagged(10))?);
+        drop(say(&mut giver, &zeros(1))?);
+        drop(next(&mut mouth)?);
         drop(mouth);
         same(
             &format!("{} {}", line(&mut client)?["reason"], next(&mut engine)?),
             r#""mouth" {"hush":10}"#,
         )?;
-        // the drain (say 11): its end, then the engine's, then `stop`
+        // say 11's play given nothing, ended at its end: nothing sounded, so nothing spoken
         (mouth, _) = device(&root, mouthed, 0)?;
+        client = greet(&root)?;
+        drop(say(&mut client, opening)?);
+        drop(say(&mut client, &text("abc"))?);
+        drop(say(&mut client, r#"{"op":"end"}"#)?);
+        giver = greet(&root)?;
+        drop(say(&mut giver, &tagged(11))?);
+        drop(say(&mut giver, r#"{"op":"end"}"#)?);
+        spoken = line(&mut client)?;
+        same(
+            &format!(
+                "{} {} {}",
+                spoken["play"], spoken["reason"], spoken["spoken"]
+            ),
+            r#"6 "end" 0"#,
+        )?;
+        drop(next(&mut engine)?);
+        drop(next(&mut engine)?);
+        // say 12, 20 pieces each longer than a socket holds, given as fast as the client can:
+        // its replies come no more than 8 ahead of the pieces its engine has read, so the
+        // engine's queue never fills, whatever the client's pace
+        client = greet(&root)?;
+        drop(say(&mut client, opening)?);
+        let (mut pushing, mut replies) = (
+            client.get_ref().try_clone()?,
+            BufReader::new(client.get_ref().try_clone()?),
+        );
+        let (piece, counted) = (text(&"x".repeat(32_000)), Arc::new(AtomicUsize::new(0)));
+        let pushed =
+            thread::spawn(move || (0..20u8).try_for_each(|_| writeln!(pushing, "{piece}")));
+        let counting = Arc::clone(&counted);
+        let answered = thread::spawn(move || {
+            while next(&mut replies).is_ok_and(|reply| reply.contains(r#""ok":true"#)) {
+                let _seen = counting.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        // nothing read yet: the eighth reply waits on its engine
+        until(|| Ok(counted.load(Ordering::SeqCst) >= 7))?;
+        let mut ahead = Vec::new();
+        for read in 1..=20usize {
+            same(
+                &line(&mut engine)?["text"]
+                    .as_str()
+                    .map(str::len)
+                    .unwrap_or_default()
+                    .to_string(),
+                "32000",
+            )?;
+            ahead.push(counted.load(Ordering::SeqCst) <= read + 8);
+        }
+        same(&format!("{ahead:?}"), &format!("{:?}", vec![true; 20]))?;
+        drop(pushed.join().map_err(|_panic| "the giver panicked")?);
+        until(|| Ok(counted.load(Ordering::SeqCst) == 20))?;
+        send(&mut client, r#"{"op":"end"}"#)?;
+        drop(next(&mut engine)?);
+        same(&say(&mut engine, &done(12))?, r#"{"ok":true}"#)?;
+        answered.join().map_err(|_panic| "the reader panicked")?;
+        // the drain (say 13): its end, then the engine's, then `stop`
         client = greet(&root)?;
         drop(say(&mut client, opening)?);
         same(&say(&mut probe, r#"{"op":"shutdown"}"#)?, r#"{"ok":true}"#)?;
@@ -3455,27 +3737,27 @@ mod tests {
             .to_string(),
             r#"["stop","engine","spoken"]"#,
         )?;
-        // a kill: the next boot ends say 12 `lost`, with its play; the next say is 13
+        // a kill: the next boot ends say 14 `lost`, with its play; the next say is 15
         let (killed, _) = serve(&root, &[])?;
         (engine, mouth) = (greet(&root)?, device(&root, mouthed, 0)?.0);
         drop(say(&mut engine, speech)?);
         client = greet(&root)?;
         drop(say(&mut client, opening)?);
         giver = greet(&root)?;
-        drop(say(&mut giver, &tagged(12))?);
+        drop(say(&mut giver, &tagged(14))?);
         drop(killed);
         drop((engine, mouth, client, giver));
         let (mut again, _) = serve(&root, &[])?;
         same(
             &kinds(&root, "spoken", 3)?,
-            r#"{"kind":"spoken","play":5,"reason":"lost","say":12,"spoken":0,"track":"mouth-desk"}"#,
+            r#"{"kind":"spoken","play":7,"reason":"lost","say":14,"spoken":0,"track":"mouth-desk"}"#,
         )?;
         engine = greet(&root)?;
         drop(say(&mut engine, speech)?);
         (mouth, _) = device(&root, mouthed, 0)?;
         same(
             &line_after(&mut greet(&root)?, opening)?["say"].to_string(),
-            "13",
+            "15",
         )?;
         drop((engine, mouth));
         same(
@@ -3485,8 +3767,8 @@ mod tests {
         same(&format!("{:?}", again.0.wait()?.code()), "Some(0)")
     }
 
-    /// Frames `range` 20 ms apart from `base` on `ear`'s clock, each of its index's fill; where
-    /// each was placed.
+    /// Frames `range` 20 ms apart from `base` on `ear`'s clock, each of its index's low byte's
+    /// fill; where each was placed.
     fn placed(
         ear: &mut BufReader<UnixStream>,
         base: u64,
@@ -3497,7 +3779,7 @@ mod tests {
                 Ok(frame(
                     ear,
                     base.saturating_add(index.saturating_mul(20_000)),
-                    u8::try_from(index)?,
+                    u8::try_from(index & 0xff)?,
                 )?["t"]
                     .as_u64()
                     .unwrap_or_default())
