@@ -719,10 +719,10 @@ rift status                                   # "engines":{"ear-mac":{"echo":"ta
     <table data-table>
       <thead><tr><th>reference engine</th><th>kind</th><th>what it does</th><th>where</th></tr></thead>
       <tbody>
-        <tr><td class="table-mono">endpoint</td><td>turn</td><td>Silero VAD on 32 ms windows, a voice closing after 256 ms under its offset (logged 274 to 293 ms after speech ends, measured 2026-11-26 · <code class="code">engines/prove.py</code>), Smart Turn v3.2 scoring the turn so far at each close, over <code class="code">--bar</code> (0.5) a turn, else held for the next voice up to <code class="code">--ceiling-ms</code> (3000) of silence</td><td><code class="code">engines/endpoint/</code>, Rust</td></tr>
-        <tr><td class="table-mono">read-aloud</td><td>speech</td><td>Pocket TTS, voice <code class="code">--voice</code> (alba), each say cut clause by clause as its text comes, its 24 kHz chunks given as made, a mark once each clause is given, a hush stopping it at the next chunk (play open 61 ms after the say, measured 2026-11-26 · <code class="code">engines/prove.py</code>)</td><td><code class="code">engines/read-aloud/</code>, Rust</td></tr>
+        <tr><td class="table-mono">endpoint</td><td>turn</td><td>Silero VAD on 32 ms windows, a voice reported once it spans 96 ms of speech and closed after 256 ms under its offset, Smart Turn v3.2 scoring the turn so far at each close, over <code class="code">--bar</code> (0.5) a turn, else held for the next voice up to <code class="code">--ceiling-ms</code> (3000) of silence (voice off and turn logged 270 ms after speech ends, measured 2026-11-26 · <code class="code">engines/prove.py</code>). A hole under 256 ms is heard as silence of its length; a longer one closes the voice at the hole's start and resets Silero, so no hole makes a voice or a turn of its own</td><td><code class="code">engines/endpoint/</code>, Rust</td></tr>
+        <tr><td class="table-mono">read-aloud</td><td>speech</td><td>Pocket TTS, voice <code class="code">--voice</code> (alba), each say cut clause by clause as its text comes, its 24 kHz chunks given as made, a mark once each clause that sounded is given, so marks rise strictly, a hush stopping it at the next chunk (play open 63 ms after the say, measured 2026-11-26 · <code class="code">engines/prove.py</code>)</td><td><code class="code">engines/read-aloud/</code>, Rust</td></tr>
         <tr><td class="table-mono">tail</td><td>echo</td><td>a mask on at a play's first run's <code class="code">start</code>, off once the ear is heard past the last run's end plus <code class="code">--tail-ms</code> (default 200), 200 ms more while its play is open: two events a play sounding without a longer gap; ruling up to the last frame heard while no play is open, up to the mask's planned off while one is on, and 200 ms behind what was heard while a play is open unmasked (a run is reported within 20 ms of its output taking it, before it sounds, its start an output latency on, so 200 ms covers a report held up that long). It starts from the ruling its reply gives, a play already open masked from there, and reads the reply to each report: a mask on refused was never on, and the ruling waits at an on until it is answered. Limit: a run reported later than the guard plus its output's latency lets the start of its echo through unmasked, a busier machine's leak, not one the stage can see</td><td><code class="code">rift engine run tail &lt;ear&gt;</code>: no model, so in rift and its suite</td></tr>
-        <tr><td class="table-mono">transcribe</td><td>words</td><td>Moonshine v2 Medium Streaming, fed 20 ms frames, a partial per 320 ms whose text changed, the final at each turn line (logged 37 ms after the turn, measured 2026-11-26 · <code class="code">engines/prove.py</code>); Moonshine times lines, not words, so a line's words share its span by length; <code class="code">--terms</code> rewrites after decoding</td><td><code class="code">engines/transcribe/</code>, Python under uv: an engine in any language</td></tr>
+        <tr><td class="table-mono">transcribe</td><td>words</td><td>Moonshine v2 Medium Streaming, fed 20 ms frames, a partial per 320 ms whose text changed, the final at each turn line, none for a turn with no words (logged 38 ms after the turn, measured 2026-11-26 · <code class="code">engines/prove.py</code>); Moonshine times lines, not words, so a line's words share its span by length; <code class="code">--terms</code> rewrites after decoding</td><td><code class="code">engines/transcribe/</code>, Python under uv: an engine in any language</td></tr>
       </tbody>
     </table>
   </div>
@@ -730,11 +730,17 @@ rift status                                   # "engines":{"ear-mac":{"echo":"ta
     model in its own cache, never in the repo: <code class="code">engines/README.md</code> names each
     download and licence. <code class="code">mise run check-engines</code> is their gate: each
     engine's protocol logic at 100 % of lines against a stub model, and one test per model over the
-    synthetic fixture (<code class="code">engines/fixtures/phrase.pcm</code>, Pocket TTS's voice, no
-    recording of a person) where its weights are; <code class="code">mise run prove-engines</code>
-    runs all three against a throwaway daemon and a fake output. rift's release carries none of them.
-    On the fixture's pause Smart Turn held both closes under its bar (0.008, then 0.034, observed
-    2026-11-26), so the ceiling closed the turn 3.26 s after speech ended.</p>
+    synthetic fixture (<code class="code">engines/fixtures/phrase.pcm</code>, Pocket TTS saying
+    "Please turn on the kitchen lights.", no recording of a person) where its weights are;
+    <code class="code">mise run prove-engines</code> runs all three against a throwaway daemon and a
+    fake output (<code class="code">PROVE_FAST=1</code> on a loaded machine). rift's release
+    carries none of them. Smart Turn completes a falling sentence (0.988) and holds an unfinished
+    one ("So I was thinking that we...", 0.008, the retired reference's front end agreeing at
+    0.008); the ceiling path is the stub suite's. A file-fed ear paced in real time on a busy
+    machine wakes from its sleep about 200 ms late and plays on from there as a hole, keeping every
+    sample (measured 2026-11-26 · 8 busy loops on 16 cores, 52 holes in 200 frames, replies under
+    50 ms), so the track it places is the fixture stretched with silence; sent fast it places
+    none.</p>
   <div class="table-wrap">
     <table data-table>
       <thead><tr><th>slice</th><th>ships</th><th>its tests decide, by values and order</th></tr></thead>

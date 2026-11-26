@@ -1,7 +1,12 @@
 //! `cargo run --release --example fixture -- <out.pcm> <text>…`: the engines' synthetic fixture,
-//! Pocket TTS's alba saying each text, 0.5 s of silence first, 0.7 s between, 4 s last (past a
-//! held turn's 3 s ceiling), as 16 kHz 16-bit mono little-endian PCM, the file a file-fed ear
-//! plays. No recording of a person.
+//! Pocket TTS's alba saying each text, 0.5 s of silence first, 0.7 s between, 1.5 s last, as
+//! 16 kHz 16-bit mono little-endian PCM, the file a file-fed ear plays. No recording of a person.
+#![expect(
+    clippy::arithmetic_side_effects,
+    clippy::integer_division,
+    clippy::integer_division_remainder_used,
+    reason = "sample counts and the 24 kHz to 16 kHz index map, over a few seconds of audio"
+)]
 #![expect(
     unused_crate_dependencies,
     reason = "the library's, which the example reaches through it"
@@ -11,7 +16,7 @@ use std::{env, fs, io};
 
 use link::hub;
 use read_aloud::pocket::{DIR, Pocket};
-use read_aloud::speak::Voice;
+use read_aloud::speak::Voice as _;
 
 fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -26,7 +31,7 @@ fn main() -> io::Result<()> {
             Ok(true)
         })?;
     }
-    said.resize(said.len() + 96_000, 0.0);
+    said.resize(said.len() + 36_000, 0.0);
     // 24 kHz to 16 kHz: each output sample interpolated between its two neighbours
     let pcm: Vec<u8> = (0..said.len() * 2 / 3)
         .map(|at| {

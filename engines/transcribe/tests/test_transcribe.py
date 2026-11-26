@@ -114,7 +114,7 @@ def test_partials() -> None:
 def test_turns() -> None:
     """The final at a turn line: words inside the span, rising across overlapping lines, none
     starting past the end; the next utterance fed what was kept past the end; a turn already
-    done, or with nothing fed, gives nothing.
+    done, with nothing fed, or with no words heard, gives nothing.
     """
     model = Model(SCRIPT)
     words = Words(model, str.upper, None)
@@ -134,6 +134,8 @@ def test_turns() -> None:
         }
     ]
     assert sum(model.streams[1].fed) == 1_000_000 * 16 // 1000 - 800_000 * 16 // 1000
+    # a turn that heard no words logs nothing, and the next starts after it
+    assert (words.turn(900_000), words.start) == ([], 900_000)
     assert words.turn(700_000) == []
 
 
@@ -197,10 +199,14 @@ def test_sessions(daemon: tuple[str, socket.socket], capsys: pytest.CaptureFixtu
     send(conn, {"turn": {"end": 300_000, "start": 0}})
     assert json.loads(lines.readline())["op"] == "words"
     send(conn, {"ok": True, "seq": 2})
-    send(conn, {"turn": {"end": 320_000, "start": 300_000}})
-    assert json.loads(lines.readline())["end"] == 320_000
+    for at in range(16):
+        send(conn, {"pcm": "0000" * 320, "t": 320_000 + at * 20_000})
+    assert json.loads(lines.readline())["op"] == "partial"
+    send(conn, {"ok": True})
+    send(conn, {"turn": {"end": 640_000, "start": 300_000}})
+    assert json.loads(lines.readline())["end"] == 640_000
     send(conn, {"code": "bad_request", "ok": False})
-    send(conn, {"turn": {"end": 320_000, "start": 300_000}})
+    send(conn, {"turn": {"end": 640_000, "start": 300_000}})
     conn.shutdown(socket.SHUT_RDWR)
     conn, lines, request = serve(sock)
     assert request["from"] == 300_000

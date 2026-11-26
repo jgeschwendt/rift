@@ -35,5 +35,7 @@ select = ["ALL"]
 ignore = ["COM812", "CPY001", "D203", "D205", "D213", "D401", "T201"]
 
 [tool.ruff.lint.per-file-ignores]
+# engines/prove.py, linted under this config: a script, never a package
+"**/prove.py" = ["INP001"]
 # tests assert by design, sit outside the package, and reach into its private parts
-"tests/*" = ["INP001", "PLR2004", "S101", "SLF001"]
+"**/tests/*" = ["INP001", "PLR2004", "S101", "SLF001"]

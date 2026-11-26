@@ -21,6 +21,12 @@ const ONSET: f32 = 0.5;
 const OFFSET: f32 = 0.35;
 /// Windows under [`OFFSET`] in a row that close a voice: 8 × 32 ms = 256 ms.
 const CLOSE: u32 = 8;
+/// The close window in µs: a hole shorter than this is heard as silence of its length, a
+/// longer one closes the voice under way at the hole's start and forgets the model's state.
+const QUIET: u64 = 256_000;
+/// The speech a voice spans before it is reported, 3 windows: a blip, or the first window a
+/// model hears after a hole, is never a voice of its own.
+const VOICED: u64 = 96_000;
 
 /// A speech probability per [`WINDOW`], stateful across a stream.
 pub trait Prob {
@@ -43,11 +49,15 @@ struct Voice {
     last: u64,
     /// Windows under [`OFFSET`] since.
     quiet: u32,
+    /// Whether its start was reported: only once it spans [`VOICED`].
+    said: bool,
+    /// The start of its first window.
+    start: u64,
 }
 
 /// One stream's segmenter and verdicts, every time on the daemon's clock in µs.
 #[derive(Debug)]
-pub struct Endpoint<'m, P, S> {
+pub struct Endpoint<'model, P, S> {
     /// The time of `carry`'s first sample.
     at: u64,
     /// A score over this commits a turn.
@@ -61,9 +71,9 @@ pub struct Endpoint<'m, P, S> {
     /// Where the next frame is due: the end of the last, none before the first.
     next: Option<u64>,
     /// The speech model.
-    prob: &'m mut P,
+    prob: &'model mut P,
     /// The turn model.
-    score: &'m mut S,
+    score: &'model mut S,
     /// The audio since the last turn, its last [`CONTEXT`] samples.
     tail: Vec<f32>,
     /// The start of the turn under way.
@@ -72,10 +82,119 @@ pub struct Endpoint<'m, P, S> {
     voice: Option<Voice>,
 }
 
-impl<'m, P: Prob, S: Score> Endpoint<'m, P, S> {
+impl<'model, P: Prob, S: Score> Endpoint<'model, P, S> {
+    /// Closes the voice under way, if one was reported: its end (`edge`, else its last speech)
+    /// reported, the turn scored, committed over the bar, else held. One never reported closes
+    /// with nothing said.
+    fn close(&mut self, edge: Option<u64>, said: &mut Vec<Value>) -> io::Result<()> {
+        if let Some(voice) = self.voice.take().filter(|voice| voice.said) {
+            let end = edge.unwrap_or(voice.last);
+            said.push(json!({"on": false, "op": "voice", "start": end}));
+            if self.score.score(&self.tail)? > self.bar {
+                self.commit(end, said);
+            } else {
+                self.held = Some((end, self.at.max(end)));
+            }
+        }
+        Ok(())
+    }
+
+    /// Reports the turn under way as ending at `end`; the next starts from silence.
+    fn commit(&mut self, end: u64, said: &mut Vec<Value>) {
+        let start = self.turn.take().unwrap_or(end);
+        said.push(json!({"end": end, "op": "turn", "start": start}));
+        self.tail.clear();
+        self.held = None;
+    }
+
+    /// The reports the frame at `time` holding `pcm` completes, in order. A jump in `time` is a
+    /// hole: one shorter than [`QUIET`] is heard as silence of its length; a longer one (or a
+    /// step back) closes the voice under way at the hole's start and forgets the model's state.
+    #[inline]
+    pub fn frame(&mut self, time: u64, pcm: &[f32]) -> io::Result<Vec<Value>> {
+        let mut said = Vec::new();
+        if let Some(due) = self.next.filter(|&due| due != time) {
+            let gap = time.saturating_sub(due);
+            if (1..QUIET).contains(&gap) {
+                let silence = vec![0.0; gap.saturating_mul(RATE).div_euclid(1_000_000) as usize];
+                self.hear(due, &silence, &mut said)?;
+            } else {
+                self.close(Some(due), &mut said)?;
+                self.prob.reset();
+                self.carry.clear();
+            }
+        }
+        self.hear(time, pcm, &mut said)?;
+        Ok(said)
+    }
+
+    /// Hears `pcm` from `time` on, window by window.
+    fn hear(&mut self, time: u64, pcm: &[f32], said: &mut Vec<Value>) -> io::Result<()> {
+        if self.carry.is_empty() {
+            self.at = time;
+        }
+        self.next = Some(
+            time.saturating_add(
+                (pcm.len() as u64)
+                    .saturating_mul(1_000_000)
+                    .div_euclid(RATE),
+            ),
+        );
+        self.carry.extend_from_slice(pcm);
+        self.tail.extend_from_slice(pcm);
+        drop(self.tail.drain(..self.tail.len().saturating_sub(CONTEXT)));
+        while self.carry.len() >= WINDOW {
+            let speech = self.prob.prob(&self.carry[..WINDOW])?;
+            drop(self.carry.drain(..WINDOW));
+            let start = self.at;
+            self.at = self.at.saturating_add(SPAN);
+            match self.voice.as_mut() {
+                None if speech >= ONSET => {
+                    self.voice = Some(Voice {
+                        last: self.at,
+                        quiet: 0,
+                        said: false,
+                        start,
+                    });
+                }
+                Some(voice) if speech >= OFFSET => (voice.last, voice.quiet) = (self.at, 0),
+                Some(voice) if voice.quiet.saturating_add(1) < CLOSE => {
+                    voice.quiet = voice.quiet.saturating_add(1);
+                }
+                Some(_) => self.close(None, said)?,
+                None => {}
+            }
+            // a voice is reported once it spans enough speech, from its first window
+            if let Some(voice) = self
+                .voice
+                .as_mut()
+                .filter(|voice| !voice.said && voice.last.saturating_sub(voice.start) >= VOICED)
+            {
+                voice.said = true;
+                said.push(json!({"on": true, "op": "voice", "start": voice.start}));
+                let _: &mut u64 = self.turn.get_or_insert(voice.start);
+                self.held = None;
+            }
+            if let Some((end, since)) = self.held
+                && self.at.saturating_sub(since) >= self.ceiling
+            {
+                self.commit(end, said);
+            }
+        }
+        Ok(())
+    }
+
     /// A fresh stream: `bar` the score that commits a turn, `ceiling` µs of silence that close
     /// one held under it.
-    pub fn new(prob: &'m mut P, score: &'m mut S, bar: f32, ceiling: u64) -> Self {
+    #[inline]
+    #[cfg_attr(
+        not(test),
+        expect(
+            clippy::single_call_fn,
+            reason = "the constructor, named for its type; the tests call it as often"
+        )
+    )]
+    pub fn new(prob: &'model mut P, score: &'model mut S, bar: f32, ceiling: u64) -> Self {
         prob.reset();
         Self {
             at: 0,
@@ -91,83 +210,18 @@ impl<'m, P: Prob, S: Score> Endpoint<'m, P, S> {
             voice: None,
         }
     }
-
-    /// The reports the frame at `t` holding `pcm` completes, in order: a jump in `t` is a hole,
-    /// which closes the voice under way where it was last heard.
-    pub fn frame(&mut self, t: u64, pcm: &[f32]) -> io::Result<Vec<Value>> {
-        let mut said = Vec::new();
-        if self.next.is_some_and(|due| due != t) {
-            self.close(&mut said)?;
-            self.prob.reset();
-            self.carry.clear();
-        }
-        if self.carry.is_empty() {
-            self.at = t;
-        }
-        self.next = Some(t + pcm.len() as u64 * 1_000_000 / RATE);
-        self.carry.extend_from_slice(pcm);
-        self.tail.extend_from_slice(pcm);
-        drop(self.tail.drain(..self.tail.len().saturating_sub(CONTEXT)));
-        while self.carry.len() >= WINDOW {
-            let speech = self.prob.prob(&self.carry[..WINDOW])?;
-            drop(self.carry.drain(..WINDOW));
-            let start = self.at;
-            self.at += SPAN;
-            match self.voice.as_mut() {
-                None if speech >= ONSET => {
-                    said.push(json!({"on": true, "op": "voice", "start": start}));
-                    self.voice = Some(Voice {
-                        last: self.at,
-                        quiet: 0,
-                    });
-                    let _: &mut u64 = self.turn.get_or_insert(start);
-                    self.held = None;
-                }
-                Some(voice) if speech >= OFFSET => {
-                    *voice = Voice {
-                        last: self.at,
-                        quiet: 0,
-                    }
-                }
-                Some(voice) if voice.quiet + 1 < CLOSE => voice.quiet += 1,
-                Some(_) => self.close(&mut said)?,
-                None => {}
-            }
-            if let Some((end, since)) = self.held
-                && self.at - since >= self.ceiling
-            {
-                self.commit(end, &mut said);
-            }
-        }
-        Ok(said)
-    }
-
-    /// Closes the voice under way, if any: its end reported, the turn scored, committed over
-    /// the bar, else held.
-    fn close(&mut self, said: &mut Vec<Value>) -> io::Result<()> {
-        if let Some(voice) = self.voice.take() {
-            said.push(json!({"on": false, "op": "voice", "start": voice.last}));
-            if self.score.score(&self.tail)? > self.bar {
-                self.commit(voice.last, said);
-            } else {
-                self.held = Some((voice.last, self.at));
-            }
-        }
-        Ok(())
-    }
-
-    /// Reports the turn under way as ending at `end`; the next starts from silence.
-    fn commit(&mut self, end: u64, said: &mut Vec<Value>) {
-        let start = self.turn.take().unwrap_or(end);
-        said.push(json!({"end": end, "op": "turn", "start": start}));
-        self.tail.clear();
-        self.held = None;
-    }
 }
 
 /// One connection to `sock` as the turn engine of `track`: its frames from `through` (live when
 /// none) through `endpoint`, each report sent, each the daemon logs moving `through`; ends with
 /// the connection, an error. A `from` gone from the window resumes live next time.
+#[cfg_attr(
+    not(test),
+    expect(
+        clippy::single_call_fn,
+        reason = "the session's own function; the tests call it as often"
+    )
+)]
 pub fn session<P: Prob, S: Score>(
     sock: &Path,
     track: &str,
@@ -208,8 +262,13 @@ pub fn session<P: Prob, S: Score>(
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "a test asserts, and propagates its setup with ?"
+)]
 mod tests {
     use std::io;
+    use std::iter::repeat_n;
     use std::thread;
 
     use link::fake::Fake;
@@ -229,18 +288,18 @@ mod tests {
         fn prob(&mut self, window: &[f32]) -> io::Result<f32> {
             let peak = window
                 .iter()
-                .fold(0.0_f32, |held, sample| held.max(sample.abs()));
-            Ok(if peak > 0.5 {
-                1.0
-            } else if peak > 0.05 {
-                0.4
+                .fold(0.0f32, |held, sample| held.max(sample.abs()));
+            Ok(if peak > 0.5f32 {
+                1.0f32
+            } else if peak > 0.05f32 {
+                0.4f32
             } else {
-                0.0
+                0.0f32
             })
         }
 
         fn reset(&mut self) {
-            self.resets += 1;
+            self.resets = self.resets.saturating_add(1);
         }
     }
 
@@ -257,7 +316,7 @@ mod tests {
         fn score(&mut self, tail: &[f32]) -> io::Result<f32> {
             self.tails.push(tail.len());
             Ok(if self.scores.is_empty() {
-                1.0
+                1.0f32
             } else {
                 self.scores.remove(0)
             })
@@ -265,13 +324,15 @@ mod tests {
     }
 
     /// 20 ms frames from `at` µs, each `(level, frames)` a run of that sample value.
-    fn frames(at: u64, runs: &[(f32, u64)]) -> Vec<(u64, Vec<f32>)> {
-        let mut t = at;
+    fn frames(at: u64, runs: &[(f32, usize)]) -> Vec<(u64, Vec<f32>)> {
         runs.iter()
-            .flat_map(|&(level, count)| (0..count).map(move |_| level))
-            .map(|level| {
-                t += 20_000;
-                (t - 20_000, vec![level; 320])
+            .flat_map(|&(level, count)| repeat_n(level, count))
+            .zip(0u64..)
+            .map(|(level, step)| {
+                (
+                    at.saturating_add(step.saturating_mul(20_000)),
+                    vec![level; 320],
+                )
             })
             .collect()
     }
@@ -285,10 +346,10 @@ mod tests {
                 tails: Vec::new(),
             },
         );
-        let mut endpoint = Endpoint::new(&mut prob, &mut score, 0.5, 1_000_000);
+        let mut endpoint = Endpoint::new(&mut prob, &mut score, 0.5f32, 1_000_000);
         let mut said = Vec::new();
-        for (t, pcm) in frames {
-            said.extend(endpoint.frame(*t, pcm)?);
+        for frame in frames {
+            said.extend(endpoint.frame(frame.0, &frame.1)?);
         }
         Ok((said, score))
     }
@@ -298,13 +359,14 @@ mod tests {
     #[test]
     fn committed() -> io::Result<()> {
         // windows of 32 ms: speech covers [0, 640 ms) in frames, a dip, then silence
-        let (said, score) = reports(&[0.9], &frames(0, &[(1.0, 16), (0.1, 8), (0.0, 20)]))?;
+        let heard = frames(0, &[(1.0f32, 16), (0.1f32, 8), (0.0f32, 20)]);
+        let (said, score) = reports(&[0.9f32], &heard)?;
         assert_eq!(
             said,
             [
-                json!({"on": true, "op": "voice", "start": 0}),
-                json!({"on": false, "op": "voice", "start": 480_000}),
-                json!({"end": 480_000, "op": "turn", "start": 0}),
+                json!({"on": true, "op": "voice", "start": 0u64}),
+                json!({"on": false, "op": "voice", "start": 480_000u64}),
+                json!({"end": 480_000u64, "op": "turn", "start": 0u64}),
             ],
             "on, off, the turn"
         );
@@ -316,8 +378,8 @@ mod tests {
     /// outlasts closes it at the last voice's end.
     #[test]
     fn held() -> io::Result<()> {
-        let heard = frames(0, &[(1.0, 16), (0.0, 20), (1.0, 16), (0.0, 80)]);
-        let (said, _) = reports(&[0.2, 0.2], &heard)?;
+        let heard = frames(0, &[(1.0f32, 16), (0.0f32, 20), (1.0f32, 16), (0.0f32, 80)]);
+        let (said, _) = reports(&[0.2f32, 0.2f32], &heard)?;
         let kinds: Vec<String> = said.iter().map(Value::to_string).collect();
         assert_eq!(
             kinds,
@@ -333,21 +395,60 @@ mod tests {
         Ok(())
     }
 
-    /// A hole closes the voice under way where it was last heard and resets the model; the
-    /// tail never holds more than the context.
+    /// A hole past the close window closes the voice under way at the hole's start, the tail
+    /// never more than the context; a loud frame alone between such holes, or a hole in
+    /// silence, says nothing.
     #[test]
-    fn holes() -> io::Result<()> {
-        let mut heard = frames(0, &[(1.0, 460)]);
-        heard.extend(frames(20_000_000, &[(0.0, 2)]));
-        // a hole in silence closes nothing
-        heard.extend(frames(30_000_000, &[(0.0, 1)]));
-        let (said, score) = reports(&[0.9], &heard)?;
+    fn long_holes() -> io::Result<()> {
+        let mut heard = frames(0, &[(1.0f32, 460)]);
+        for at in 0u64..20 {
+            heard.extend(frames(
+                at.saturating_mul(400_000).saturating_add(20_000_000),
+                &[(1.0f32, 2)],
+            ));
+        }
+        heard.extend(frames(30_000_000, &[(0.0f32, 20)]));
+        heard.extend(frames(40_000_000, &[(0.0f32, 1)]));
+        let (said, score) = reports(&[0.9f32], &heard)?;
         assert_eq!(
-            said.last(),
-            Some(&json!({"end": 9_184_000, "op": "turn", "start": 0})),
-            "closed at the last window before the hole"
+            said,
+            [
+                json!({"on": true, "op": "voice", "start": 0u64}),
+                json!({"on": false, "op": "voice", "start": 9_200_000u64}),
+                json!({"end": 9_200_000u64, "op": "turn", "start": 0u64}),
+            ],
+            "the voice closed at the hole, and nothing of the blips between holes"
         );
         assert_eq!(score.tails, [CONTEXT], "the last 8 s");
+        Ok(())
+    }
+
+    /// A hole under the close window is heard as silence of its length: a voice runs on across
+    /// it, one voice and one turn; such holes in silence say nothing.
+    #[test]
+    fn short_holes() -> io::Result<()> {
+        let mut heard = frames(0, &[(0.0f32, 5)]);
+        heard.extend(frames(200_000, &[(0.0f32, 5)]));
+        heard.extend(frames(400_000, &[(1.0f32, 10)]));
+        heard.extend(frames(700_000, &[(1.0f32, 10), (0.0f32, 20)]));
+        let (said, _) = reports(&[0.9f32], &heard)?;
+        assert_eq!(
+            said,
+            [
+                json!({"on": true, "op": "voice", "start": 384_000u64}),
+                json!({"on": false, "op": "voice", "start": 928_000u64}),
+                json!({"end": 928_000u64, "op": "turn", "start": 384_000u64}),
+            ],
+            "one voice across the hole"
+        );
+        Ok(())
+    }
+
+    /// A blip shorter than a voice, one window loud, is no voice.
+    #[test]
+    fn blips() -> io::Result<()> {
+        let heard = frames(0, &[(0.0f32, 10), (1.0f32, 1), (0.0f32, 30)]);
+        assert_eq!(reports(&[], &heard)?.0, Vec::<Value>::new(), "nothing said");
         Ok(())
     }
 
@@ -359,10 +460,10 @@ mod tests {
         let sock = fake.sock.clone();
         let engine = thread::spawn(move || {
             let (mut prob, mut score) = (Loud::default(), Scripted::default());
-            let mut through = Some(5);
+            let mut through = Some(5u64);
             let mut ends = Vec::new();
-            for _ in 0..3 {
-                let endpoint = Endpoint::new(&mut prob, &mut score, 0.5, 1_000_000);
+            for _ in 0u8..3 {
+                let endpoint = Endpoint::new(&mut prob, &mut score, 0.5f32, 1_000_000);
                 let ended = session(&sock, "ear-desk", &mut through, endpoint);
                 ends.push(format!(
                     "{through:?} {}",
@@ -377,16 +478,16 @@ mod tests {
         let (mut conn, request) = fake.accept()?;
         assert_eq!(
             request,
-            json!({"from": 5, "kind": "turn", "name": "endpoint", "op": "engine", "track": "ear-desk"}),
+            json!({"from": 5u8, "kind": "turn", "name": "endpoint", "op": "engine", "track": "ear-desk"}),
             "from the through it held"
         );
-        conn.send(&json!({"ok": true, "seq": 1, "through": 7}))?;
+        conn.send(&json!({"ok": true, "seq": 1u8, "through": 7u8}))?;
         let mut lines = Vec::new();
-        for (t, pcm) in frames(1_000_000, &[(1.0, 16), (0.0, 13)]) {
-            conn.send(&json!({"pcm": hex(&pcm), "t": t}))?;
+        for (time, pcm) in frames(1_000_000, &[(1.0f32, 16), (0.0f32, 13)]) {
+            conn.send(&json!({"pcm": hex(&pcm), "t": time}))?;
         }
         for reply in [
-            json!({"ok": true, "seq": 2}),
+            json!({"ok": true, "seq": 2u8}),
             json!({"code": "bad_request", "ok": false}),
         ] {
             lines.push(conn.line()?);
@@ -394,15 +495,15 @@ mod tests {
         }
         lines.push(conn.line()?);
         drop(conn);
-        let (mut conn, request) = fake.accept()?;
+        let (mut again, second) = fake.accept()?;
         assert_eq!(
-            request["from"], 1_000_000,
+            second["from"], 1_000_000u32,
             "the voice logged; the voice's end refused"
         );
-        conn.send(&json!({"code": "gone", "ok": false}))?;
-        drop(conn);
-        let (_, request) = fake.accept()?;
-        assert_eq!(request["from"], Value::Null, "live after gone");
+        again.send(&json!({"code": "gone", "ok": false}))?;
+        drop(again);
+        let (_, third) = fake.accept()?;
+        assert_eq!(third["from"], Value::Null, "live after gone");
         assert_eq!(lines.len(), 3, "voice on, off, the turn");
         assert_eq!(
             engine.join().unwrap_or_default(),

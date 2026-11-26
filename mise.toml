@@ -23,9 +23,10 @@ dir = "{{config_root}}/engines"
 run = [
   "cargo fmt --check",
   "cargo clippy --all-targets --locked -- -D warnings",
-  "cargo llvm-cov --locked --fail-under-lines 100 --ignore-filename-regex '/(main|models|pocket)\\.rs$' --show-missing-lines",
-  "uv run --project transcribe --locked ruff format --check transcribe",
-  "uv run --project transcribe --locked ruff check transcribe",
+  # --show-output: a model test's `skipped: …` line shows where its weights are missing
+  "cargo llvm-cov --locked --fail-under-lines 100 --ignore-filename-regex '/(main|models|pocket)\\.rs$' --show-missing-lines -- --show-output",
+  "uv run --project transcribe --locked ruff format --check --config transcribe/pyproject.toml transcribe prove.py",
+  "uv run --project transcribe --locked ruff check --config transcribe/pyproject.toml transcribe prove.py",
   "uv run --project transcribe --locked pytest transcribe -p no:cacheprovider -rs --cov=transcribe/src --cov-config=transcribe/pyproject.toml",
 ]
 
@@ -54,9 +55,11 @@ run = "cargo build --release && mkdir -p ~/.local/bin && install -m 755 target/r
 
 [tasks.prove-engines]
 description = "the reference engines end to end: a throwaway daemon, the fixture, a fake output; needs every model (engines/README.md) and $TRANSCRIBE_MODEL"
-# out of target/: the build cache may sweep it mid-run
+# copied out of target/ first: the build cache may sweep it mid-run; PROVE_FAST=1 sends the
+# fixture as fast as answered, for a machine under load (engines/prove.py)
 run = [
   "cargo build",
   "cargo build --release --manifest-path engines/Cargo.toml",
-  "uv run --project engines/transcribe --locked python engines/prove.py target/debug/rift engines/target/release /tmp/rift-prove",
+  "mkdir -p /tmp/rift-prove/bin && cp target/debug/rift engines/target/release/endpoint engines/target/release/read-aloud /tmp/rift-prove/bin/",
+  "uv run --project engines/transcribe --locked python engines/prove.py /tmp/rift-prove/bin/rift /tmp/rift-prove/bin /tmp/rift-prove ${PROVE_FAST:+--fast}",
 ]

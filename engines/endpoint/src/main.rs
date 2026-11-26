@@ -37,12 +37,10 @@ fn model(args: &[String], name: &str, [repo, revision, file]: [&str; 3]) -> Path
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
-    let bar = flag(&args, "bar").unwrap_or("0.5").parse::<f32>();
-    let ceiling = flag(&args, "ceiling-ms").unwrap_or("3000").parse::<u64>();
     let (Some(track), Ok(bar), Ok(ceiling)) = (
         args.first().filter(|held| !held.starts_with('-')),
-        bar,
-        ceiling,
+        flag(&args, "bar").unwrap_or("0.5").parse::<f32>(),
+        flag(&args, "ceiling-ms").unwrap_or("3000").parse::<u64>(),
     ) else {
         eprintln!(
             "usage: endpoint <track> [--bar <score>] [--ceiling-ms <ms>] [--silero <file>] [--smart-turn <file>]"
@@ -64,12 +62,16 @@ fn main() -> ExitCode {
     };
     let mut through = None;
     link::stand("endpoint", || {
-        let endpoint = Endpoint::new(&mut prob, &mut score, bar, ceiling * 1000);
+        let endpoint = Endpoint::new(&mut prob, &mut score, bar, ceiling.saturating_mul(1000));
         turns::session(&link::socket(), track, &mut through, endpoint)
     })
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "a test asserts, and propagates its setup with ?"
+)]
 mod tests {
     use std::{fs, io};
 
@@ -79,11 +81,11 @@ mod tests {
     use crate::models::{Silero, SmartTurn};
     use crate::turns::Endpoint;
 
-    /// The models over the fixture (engines/fixtures/phrase.pcm, Pocket TTS's voice saying "So
-    /// I was thinking that we..." then, after a pause, "could go for a walk."): voice on and off
-    /// alternating from on, and one turn, from the first voice's start to the last one's end
-    /// (Smart Turn holds both closes under the bar, observed 2026-11-26 · 0.008 and 0.034, so
-    /// the ceiling closes it). Skipped, saying so, without the models.
+    /// The models over the fixture (engines/fixtures/phrase.pcm, Pocket TTS's voice saying
+    /// "Please turn on the kitchen lights."): voice on and off alternating from on, and one
+    /// turn, from the first voice's start to the last one's end, committed at the close (Smart
+    /// Turn 0.988, observed 2026-11-26), well inside the ceiling. Skipped, saying so, without
+    /// the models.
     #[test]
     fn fixture() -> io::Result<()> {
         let (silero, smart) = (model(&[], "", SILERO), model(&[], "", SMART_TURN));
@@ -105,9 +107,13 @@ mod tests {
         for (at, frame) in pcm.chunks_exact(640).enumerate() {
             let samples: Vec<f32> = frame
                 .chunks_exact(2)
-                .map(|pair| f32::from(i16::from_le_bytes([pair[0], pair[1]])) / 32768.0)
+                .map(|pair| {
+                    f32::from(i16::from_le_bytes(
+                        <[u8; 2]>::try_from(pair).unwrap_or_default(),
+                    )) / 32768.0
+                })
                 .collect();
-            said.extend(endpoint.frame(at as u64 * 20_000, &samples)?);
+            said.extend(endpoint.frame((at as u64).saturating_mul(20_000), &samples)?);
         }
         eprintln!(
             "{}",
@@ -137,8 +143,11 @@ mod tests {
         );
         assert_eq!(turns.len(), 1, "one turn over the phrase and its pause");
         assert_eq!(
-            (&turns[0]["start"], &turns[0]["end"]),
-            (&voices[0]["start"], &voices[voices.len() - 1]["start"]),
+            turns.first().map(|turn| (&turn["start"], &turn["end"])),
+            voices
+                .first()
+                .zip(voices.last())
+                .map(|(first, last)| (&first["start"], &last["start"])),
             "from the first voice to the last"
         );
         Ok(())

@@ -109,16 +109,16 @@ class Words:
             return []
         self.fed, end = 0, t + len(pcm) * 1_000_000 // RATE
         lines = self.stream.lines()
-        text = " ".join(line[0] for line in lines)
-        if not text or text == self.said:
+        text, words = " ".join(line[0] for line in lines), self._timed(lines, end)
+        if not words or text == self.said:
             return []
         self.said = text
-        return [
-            {"end": end, "op": "partial", "start": self.start, "words": self._timed(lines, end)}
-        ]
+        return [{"end": end, "op": "partial", "start": self.start, "words": words}]
 
     def turn(self, end: int) -> list[dict]:
-        """The final words up to a turn's `end`; the next utterance from there, fed what is kept."""
+        """The final words up to a turn's `end`, none when it holds no words; the next utterance
+        from there, fed what is kept.
+        """
         if self.stream is None or self.start is None or end <= self.start:
             return []
         final = {"end": end, "op": "words", "start": self.start}
@@ -126,7 +126,7 @@ class Words:
         self.stream, self.start, self.fed, self.said = None, end, 0, ""
         for t, pcm in self.kept:
             self._feed(t, pcm)
-        return [final]
+        return [final] if final["words"] else []
 
     def _timed(self, lines: list[tuple[str, float, float]], end: int) -> list[dict]:
         """Each line's words, rewritten, sharing its span by length, rising, none past `end`."""

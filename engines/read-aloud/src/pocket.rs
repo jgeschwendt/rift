@@ -1,23 +1,23 @@
 //! Pocket TTS behind [`Voice`], through ptts on xn's CPU backend: the checkpoint without voice
 //! cloning, one preset voice's embedding prompted once at load and its state reused per clause.
 
+use std::fmt::{self, Debug, Display, Formatter};
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
 
+use ptts::Tokenizer;
+use ptts::flow_lm::Rng;
 use ptts::tts_model::{
     TTSConfig, TTSModel, TTSState, prepare_text_prompt, split_into_best_sentences,
 };
-use rand::SeedableRng;
+use rand::SeedableRng as _;
 use rand::rngs::StdRng;
-use rand_distr::{Distribution, Normal};
+use rand_distr::{Distribution as _, Normal};
 use xn::Tensor;
 use xn::nn::VB;
 
 use crate::speak::Voice;
-
-/// The model on xn's CPU device, unquantized.
-type Q = xn::Unquantized<f32, xn::CpuDevice>;
 
 /// The checkpoint's Hugging Face repo and revision, its snapshot the default `--pocket`.
 pub const DIR: [&str; 2] = [
@@ -33,29 +33,13 @@ const BUDGET: usize = 1024;
 /// The audio decoder's context, the reference CLI's.
 const CONTEXT: usize = 250;
 
-/// The tokenizer, `tokenizer.json`, as ptts reads one.
-#[derive(Clone)]
-struct Words(Arc<tokenizers::Tokenizer>);
-
-impl ptts::Tokenizer for Words {
-    fn encode(&self, text: &str) -> xn::Result<Vec<u32>> {
-        Ok(self
-            .0
-            .encode(text, false)
-            .map_err(xn::Error::wrap)?
-            .get_ids()
-            .to_vec())
-    }
-
-    fn decode(&self, tokens: &[u32]) -> xn::Result<String> {
-        self.0.decode(tokens, false).map_err(xn::Error::wrap)
-    }
-}
+/// The model on xn's CPU device, unquantized.
+type Backend = xn::Unquantized<f32, xn::CpuDevice>;
 
 /// The latents' noise: a seeded normal of variance the temperature.
 struct Noise(StdRng, Normal<f32>);
 
-impl ptts::flow_lm::Rng for Noise {
+impl Rng for Noise {
     fn sample(&mut self) -> f32 {
         self.1.sample(&mut self.0)
     }
@@ -66,29 +50,26 @@ pub struct Pocket {
     /// The latent's width.
     latent: usize,
     /// The model.
-    model: TTSModel<Q>,
+    model: TTSModel<Backend>,
     /// The noise.
     noise: Noise,
     /// The flow model's state with the voice prompted.
-    voiced: TTSState<Q>,
+    voiced: TTSState<Backend>,
     /// The tokenizer, for cutting long text.
     words: Words,
 }
 
-impl std::fmt::Debug for Pocket {
-    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        out.debug_struct("Pocket").finish_non_exhaustive()
+impl Debug for Pocket {
+    #[inline]
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Pocket").finish_non_exhaustive()
     }
-}
-
-/// An xn error as an I/O one.
-fn failed(cause: impl std::fmt::Display) -> io::Error {
-    io::Error::other(cause.to_string())
 }
 
 impl Pocket {
     /// Loads the checkpoint in `dir` with the preset `voice` (`embeddings/<voice>.safetensors`),
     /// then speaks one short clause, so the first say pays no first-run stall.
+    #[inline]
     pub fn load(dir: &Path, voice: &str) -> io::Result<Self> {
         let words = Words(Arc::new(
             tokenizers::Tokenizer::from_file(dir.join("tokenizer.json")).map_err(failed)?,
@@ -96,7 +77,7 @@ impl Pocket {
         let cfg = TTSConfig::v202601(TEMPERATURE);
         let weights =
             VB::load_with_key_map(&[dir.join(WEIGHTS)], xn::CPU, rename).map_err(failed)?;
-        let model: TTSModel<Q> =
+        let model: TTSModel<Backend> =
             TTSModel::load(&weights.root(), Box::new(words.clone()), &cfg).map_err(failed)?;
         let embedding = VB::load(
             &[dir.join(format!("embeddings/{voice}.safetensors"))],
@@ -112,12 +93,12 @@ impl Pocket {
             .shape(&key)
             .map(|shape| shape.dims().to_vec())
             .unwrap_or_default();
-        let prompt: Tensor<f32, xn::CpuDevice> =
+        let raw: Tensor<f32, xn::CpuDevice> =
             embedding.tensor(&key, dims.clone()).map_err(failed)?;
         // a voice file holds `[T, dim]` or `[1, T, dim]`
         let prompt = match *dims.as_slice() {
-            [frames, width] => prompt.reshape((1, frames, width)).map_err(failed)?,
-            _ => prompt,
+            [frames, width] => raw.reshape((1, frames, width)).map_err(failed)?,
+            _ => raw,
         };
         let mut voiced = model.init_flow_lm_state(1, BUDGET).map_err(failed)?;
         model.prompt_audio(&mut voiced, &prompt).map_err(failed)?;
@@ -137,33 +118,13 @@ impl Pocket {
     }
 }
 
-/// The checkpoint's names as ptts's modules name them, the tensors it never reads dropped.
-fn rename(name: &str) -> Option<String> {
-    let unread = ["flow.w_s_t", "quantizer.vq", "quantizer.logvar_proj"];
-    (!unread.iter().any(|part| name.contains(part))).then(|| {
-        [
-            (
-                "flow_lm.condition_provider.conditioners.speaker_wavs.output_proj.weight",
-                "flow_lm.speaker_proj_weight",
-            ),
-            (
-                "flow_lm.condition_provider.conditioners.transcript_in_segment.",
-                "flow_lm.conditioner.",
-            ),
-            ("flow_lm.backbone.", "flow_lm.transformer."),
-            ("flow_lm.flow.", "flow_lm.flow_net."),
-            ("mimi.model.", "mimi."),
-        ]
-        .iter()
-        .fold(name.to_owned(), |held, (from, to)| held.replace(from, to))
-    })
-}
-
 impl Voice for Pocket {
+    #[inline]
     fn rate(&self) -> u32 {
         self.model.sample_rate() as u32
     }
 
+    #[inline]
     fn speak(
         &mut self,
         text: &str,
@@ -214,12 +175,66 @@ impl Voice for Pocket {
     }
 }
 
+/// The tokenizer, `tokenizer.json`, as ptts reads one.
+#[derive(Clone)]
+struct Words(Arc<tokenizers::Tokenizer>);
+
+impl Tokenizer for Words {
+    fn decode(&self, tokens: &[u32]) -> xn::Result<String> {
+        self.0.decode(tokens, false).map_err(xn::Error::wrap)
+    }
+
+    fn encode(&self, text: &str) -> xn::Result<Vec<u32>> {
+        Ok(self
+            .0
+            .encode(text, false)
+            .map_err(xn::Error::wrap)?
+            .get_ids()
+            .to_vec())
+    }
+}
+
+/// An xn error as an I/O one.
+fn failed(cause: impl Display) -> io::Error {
+    io::Error::other(cause.to_string())
+}
+
+/// The checkpoint's names as ptts's modules name them, the tensors it never reads dropped.
+#[expect(
+    clippy::single_call_fn,
+    reason = "the key map the loader hands xn, named for what it renames"
+)]
+fn rename(name: &str) -> Option<String> {
+    let unread = ["flow.w_s_t", "quantizer.vq", "quantizer.logvar_proj"];
+    (!unread.iter().any(|part| name.contains(part))).then(|| {
+        [
+            (
+                "flow_lm.condition_provider.conditioners.speaker_wavs.output_proj.weight",
+                "flow_lm.speaker_proj_weight",
+            ),
+            (
+                "flow_lm.condition_provider.conditioners.transcript_in_segment.",
+                "flow_lm.conditioner.",
+            ),
+            ("flow_lm.backbone.", "flow_lm.transformer."),
+            ("flow_lm.flow.", "flow_lm.flow_net."),
+            ("mimi.model.", "mimi."),
+        ]
+        .iter()
+        .fold(name.to_owned(), |held, pair| held.replace(pair.0, pair.1))
+    })
+}
+
 #[cfg(test)]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "a test asserts, and propagates its setup with ?"
+)]
 mod tests {
     use std::io;
 
     use super::{DIR, Pocket};
-    use crate::speak::Voice;
+    use crate::speak::Voice as _;
 
     /// The model speaks a clause at 24 kHz in 80 ms chunks, stopping when told. Skipped, saying
     /// so, without the weights.
@@ -236,9 +251,9 @@ mod tests {
             chunks.push(chunk.len());
             Ok(true)
         })?;
-        let mut stopped = 0;
+        let mut stopped = 0u8;
         pocket.speak("Hello there, how are you?", &mut |_| {
-            stopped += 1;
+            stopped = stopped.saturating_add(1);
             Ok(false)
         })?;
         assert_eq!(pocket.rate(), 24_000, "its rate");

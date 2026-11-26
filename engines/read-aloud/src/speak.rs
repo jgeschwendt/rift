@@ -30,22 +30,14 @@ pub trait Voice {
     ) -> io::Result<()>;
 }
 
-/// Where the next clause of `rest` ends: just past a clause's mark that a space follows; with
-/// `all`, at the end of what is left.
-fn cut(rest: &str, all: bool) -> Option<usize> {
-    rest.char_indices()
-        .find(|&(at, mark)| {
-            ".!?;:,".contains(mark) && rest[at + 1..].starts_with(char::is_whitespace)
-        })
-        .map(|(at, _)| at + 1)
-        .or_else(|| (all && !rest.is_empty()).then_some(rest.len()))
-}
-
 /// A say under way.
 #[derive(Debug, Default)]
 struct Say {
     /// Samples its play has been given.
     given: u64,
+    /// The samples its last mark named: marks rise strictly, so a clause that gave no audio
+    /// marks nothing.
+    marked: u64,
     /// Its number.
     num: u64,
     /// Hushed, refused or ended: nothing more is spoken.
@@ -82,7 +74,7 @@ impl Say {
                 .and_then(|()| play.line())
                 .is_ok_and(|reply| reply["ok"] == true)
             {
-                self.given += piece.len() as u64;
+                self.given = self.given.saturating_add(piece.len() as u64);
             } else {
                 self.over = true;
             }
@@ -92,17 +84,17 @@ impl Say {
 }
 
 /// One engine connection's speaking.
-struct Speaker<'a> {
+struct Speaker<'run> {
     /// The highest say a hush has named, seen by the reader as it comes.
-    hushed: &'a AtomicU64,
+    hushed: &'run AtomicU64,
     /// The say under way.
     say: Option<Say>,
     /// The daemon's socket, for the plays.
-    sock: &'a Path,
+    sock: &'run Path,
     /// The mouth.
-    track: &'a str,
+    track: &'run str,
     /// The model.
-    voice: &'a mut dyn Voice,
+    voice: &'run mut dyn Voice,
     /// The engine connection's write side, for marks and `done`.
     write: Conn,
 }
@@ -146,17 +138,31 @@ impl Speaker<'_> {
     fn speak(&mut self, say: &mut Say, all: bool) -> io::Result<()> {
         let request =
             json!({"op": "play", "rate": self.voice.rate(), "say": say.num, "track": self.track});
-        while let Some(at) = cut(&say.text[say.spoken..], all).filter(|_| !say.over) {
-            let clause = say.text[say.spoken..say.spoken + at].trim().to_owned();
-            say.spoken += at;
+        while let Some(at) =
+            cut(say.text.get(say.spoken..).unwrap_or_default(), all).filter(|_| !say.over)
+        {
+            let end = say.spoken.saturating_add(at);
+            let clause = say
+                .text
+                .get(say.spoken..end)
+                .unwrap_or_default()
+                .trim()
+                .to_owned();
+            say.spoken = end;
             if clause.is_empty() {
                 continue;
             }
             let (hushed, sock) = (self.hushed, self.sock);
             let mut give = |chunk: &[f32]| Ok(say.give(chunk, hushed, &request, sock));
             self.voice.speak(&clause, &mut give)?;
-            if !say.over && say.play.is_some() {
-                let text = say.text[..say.spoken].chars().count();
+            if !say.over && say.given > say.marked {
+                say.marked = say.given;
+                let text = say
+                    .text
+                    .get(..say.spoken)
+                    .unwrap_or_default()
+                    .chars()
+                    .count();
                 let mark =
                     json!({"op": "mark", "samples": say.given, "say": say.num, "text": text});
                 self.write.send(&mark)?;
@@ -166,8 +172,26 @@ impl Speaker<'_> {
     }
 }
 
+/// Where the next clause of `rest` ends: just past a clause's mark that a space follows; with
+/// `all`, at the end of what is left.
+#[cfg_attr(
+    not(test),
+    expect(
+        clippy::single_call_fn,
+        reason = "the clause cut, named for what it decides; the tests call it as often"
+    )
+)]
+fn cut(rest: &str, all: bool) -> Option<usize> {
+    rest.char_indices()
+        .zip(rest.chars().skip(1))
+        .find(|&((_, mark), next)| ".!?;:,".contains(mark) && next.is_whitespace())
+        .map(|((at, _), _)| at.saturating_add(1))
+        .or_else(|| (all && !rest.is_empty()).then_some(rest.len()))
+}
+
 /// One connection to `sock` as the speech engine of the mouth `track`, speaking through
 /// `voice`; ends with the connection, an error.
+#[inline]
 pub fn session(sock: &Path, track: &str, voice: &mut dyn Voice) -> io::Result<()> {
     let request = json!({"kind": "speech", "name": "read-aloud", "op": "engine", "track": track});
     let (mut conn, _) = Conn::open(sock, CLIENT, &request)?;
@@ -179,7 +203,7 @@ pub fn session(sock: &Path, track: &str, voice: &mut dyn Voice) -> io::Result<()
         loop {
             let line = conn.line()?;
             // a hush is seen at once, so a clause being made stops at its next chunk
-            let _: u64 =
+            let _prior =
                 hearing.fetch_max(line["hush"].as_u64().unwrap_or_default(), Ordering::Relaxed);
             lines.send(line).map_err(io::Error::other)?;
         }
@@ -194,10 +218,15 @@ pub fn session(sock: &Path, track: &str, voice: &mut dyn Voice) -> io::Result<()
     };
     let worked = heard.iter().try_for_each(|line| speaker.line(&line));
     speaker.write.shutdown();
-    worked.and_then(|()| reader.join().unwrap_or(Ok(())))
+    worked?;
+    reader.join().unwrap_or(Ok(()))
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "a test asserts, and propagates its setup with ?"
+)]
 mod tests {
     use std::io;
     use std::thread;
@@ -222,8 +251,12 @@ mod tests {
             text: &str,
             give: &mut dyn FnMut(&[f32]) -> io::Result<bool>,
         ) -> io::Result<()> {
-            for len in [text.len() * 1000, 10] {
-                if !give(&vec![0.25; len])? {
+            // a clause of a dash alone makes no sound
+            for len in [text.len().saturating_mul(1000), 10]
+                .into_iter()
+                .filter(|_| text != "-.")
+            {
+                if !give(&vec![0.25f32; len])? {
                     break;
                 }
             }
@@ -243,9 +276,12 @@ mod tests {
 
     /// Answers each give of `play` until `refuse`, then refuses; the samples given.
     fn plays(play: &mut Conn, gives: usize, refuse: bool) -> io::Result<u64> {
-        let mut taken = 0;
+        let mut taken = 0u64;
         for at in 0..gives {
-            taken += play.line()?["pcm"].as_str().unwrap_or_default().len() as u64 / 4;
+            let pcm = play.line()?;
+            taken = taken.saturating_add(
+                (pcm["pcm"].as_str().unwrap_or_default().len() as u64).div_euclid(4),
+            );
             let reply = if refuse && at == 0 {
                 json!({"code": "bad_request", "ok": false})
             } else {
@@ -257,7 +293,7 @@ mod tests {
     }
 
     /// A session: a say spoken clause by clause through its play, gives of at most 8192
-    /// samples, a mark per clause, the play ended after the say's; a give refused stopping the
+    /// samples, a mark per clause that sounded (none for one silent), the play ended after the say's; a give refused stopping the
     /// say; a play refused, then `done`; a clause of spaces skipped; a hush; a refused report
     /// said; the connection's end an error.
     #[test]
@@ -273,29 +309,29 @@ mod tests {
             json!({"kind": "speech", "name": "read-aloud", "op": "engine", "track": "mouth-desk"}),
             "the engine request"
         );
-        conn.send(&json!({"ok": true, "seq": 1}))?;
-        conn.send(&json!({"say": 1, "text": "Hello there. How"}))?;
-        let (mut play, request) = fake.accept()?;
+        conn.send(&json!({"ok": true, "seq": 1u8}))?;
+        conn.send(&json!({"say": 1u8, "text": "Hello there. -. How"}))?;
+        let (mut play, tagged) = fake.accept()?;
         assert_eq!(
-            request,
-            json!({"op": "play", "rate": 24_000, "say": 1, "track": "mouth-desk"}),
+            tagged,
+            json!({"op": "play", "rate": 24_000u32, "say": 1u8, "track": "mouth-desk"}),
             "tagged"
         );
-        play.send(&json!({"ok": true, "play": 1, "seq": 2}))?;
+        play.send(&json!({"ok": true, "play": 1u8, "seq": 2u8}))?;
         let given = plays(&mut play, 3, false)?;
         assert_eq!(given, 12_010, "the clause, in pieces of at most 8192");
         assert_eq!(
             conn.line()?,
-            json!({"op": "mark", "samples": 12_010, "say": 1, "text": 12}),
+            json!({"op": "mark", "samples": 12_010u32, "say": 1u8, "text": 12u8}),
             "marked"
         );
         conn.send(&json!({"code": "bad_request", "ok": false}))?;
-        conn.send(&json!({"say": 1, "text": " are you?"}))?;
-        conn.send(&json!({"end": 1}))?;
+        conn.send(&json!({"say": 1u8, "text": " are you?"}))?;
+        conn.send(&json!({"end": 1u8}))?;
         let more = plays(&mut play, 3, false)?;
         assert_eq!(
             conn.line()?,
-            json!({"op": "mark", "samples": 12_010 + more, "say": 1, "text": 25}),
+            json!({"op": "mark", "samples": 12_010u64.saturating_add(more), "say": 1u8, "text": 28u8}),
             "all"
         );
         conn.send(&json!({"ok": true}))?;
@@ -305,20 +341,20 @@ mod tests {
             "the play's end after the say's"
         );
         play.send(&json!({"ok": true}))?;
-        play.send(&json!({"play": 1, "reason": "end"}))?;
+        play.send(&json!({"play": 1u8, "reason": "end"}))?;
         // say 2: its first give refused, so nothing more of it is spoken
-        conn.send(&json!({"say": 2, "text": "Stop now, please. "}))?;
-        let (mut play, _) = fake.accept()?;
-        play.send(&json!({"ok": true, "play": 2, "seq": 3}))?;
-        assert_eq!(plays(&mut play, 1, true)?, 8192, "one give, refused");
-        conn.send(&json!({"hush": 2}))?;
+        conn.send(&json!({"say": 2u8, "text": "Stop now, please. "}))?;
+        let (mut stopped, _) = fake.accept()?;
+        stopped.send(&json!({"ok": true, "play": 2u8, "seq": 3u8}))?;
+        assert_eq!(plays(&mut stopped, 1, true)?, 8192, "one give, refused");
+        conn.send(&json!({"hush": 2u8}))?;
         // say 3: its play refused; say 4: only spaces; both end in `done`
-        for (num, text) in [(3, "Hi."), (4, " ")] {
+        for (num, text) in [(3u8, "Hi."), (4u8, " ")] {
             conn.send(&json!({"say": num, "text": text}))?;
             conn.send(&json!({"end": num}))?;
             if num == 3 {
-                let (mut play, _) = fake.accept()?;
-                play.send(&json!({"code": "busy", "ok": false}))?;
+                let (mut busy, _) = fake.accept()?;
+                busy.send(&json!({"code": "busy", "ok": false}))?;
             }
             assert_eq!(
                 conn.line()?,
@@ -327,12 +363,12 @@ mod tests {
             );
         }
         // say 5, hushed before its text: no play opened
-        conn.send(&json!({"hush": 5}))?;
-        conn.send(&json!({"say": 5, "text": "Gone. "}))?;
-        conn.send(&json!({"end": 5}))?;
+        conn.send(&json!({"hush": 5u8}))?;
+        conn.send(&json!({"say": 5u8, "text": "Gone. "}))?;
+        conn.send(&json!({"end": 5u8}))?;
         assert_eq!(
             conn.line()?,
-            json!({"op": "done", "say": 5}),
+            json!({"op": "done", "say": 5u8}),
             "hushed: nothing sounded"
         );
         drop(conn);
