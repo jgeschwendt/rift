@@ -69,9 +69,9 @@
     that will turn the sound its devices hear into an append-only log of which words were said when,
     and play speech back. Today: one instance, its socket, the event log, and the stream, every
     connected device's sound on one clock, kept on disk for a window, then archived. A device plays
-    a file or, on macOS, hears a microphone, under an identity of rift's own that keeps the
-    microphone's grant across upgrades; on a Mac one ear stands beside the daemon, a launchd job of
-    its own, idle until the ears are on.</p>
+    a file or, on macOS, hears a microphone; on a Mac one ear stands beside the daemon, a launchd
+    job of its own, idle until the ears are on, run from one path and signed by an identity of
+    rift's own, so the microphone is asked for once and the grant holds across upgrades.</p>
   <nav class="row docs-toc" aria-label="sections">
     <a class="pill" href="#today">today</a>
     <a class="pill" href="#stream">the stream</a>
@@ -264,7 +264,7 @@
       segment as the connection goes.</li>
     <li><strong>The standing ear.</strong> On a Mac, <code class="code">rift setup</code> installs
       <code class="code">dev.gigantic.rift.ear</code> beside the daemon: <code class="code">rift device
-      ear &lt;host&gt; --mic</code> on the same link, <code class="code">&lt;host&gt;</code> the Mac's
+      ear &lt;host&gt; --mic</code> run from <a href="#identity">its fixed copy</a>, <code class="code">&lt;host&gt;</code> the Mac's
       local host name (<code class="code">scutil --get LocalHostName</code>, set in Sharing and never
       renamed by a network) lowercased, so its track, <code class="code">ear-&lt;host&gt;</code>, is
       the Mac's for good; renaming the Mac starts a new track at the next setup. It follows the
@@ -278,12 +278,23 @@
 <section class="docs-section" id="identity" data-component="identity">
   <header>
     <h2 class="h2">Identity</h2>
-    <p class="docs-note">macOS grants the microphone to a program by its code signature: an ad-hoc
-      signature changes with every build, so every upgrade would ask again. rift signs itself with a
-      certificate of its own, and the grant, which names the identifier and the certificate,
-      survives.</p>
+    <p class="docs-note">macOS grants the microphone to a program outside an app bundle by its
+      path, and checks the program's code signature against the grant: a new path is asked again,
+      and so is a new signature at the same path. The microphone's grant belongs to the standing
+      ear's program, <code class="code">~/.local/libexec/rift/rift</code>, one path every release
+      shares, signed by a certificate of rift's own, so it is asked for once. A
+      <code class="code">rift device ear --mic</code> run by hand from a terminal is the terminal's
+      to grant, not rift's.</p>
   </header>
   <ul class="stack">
+    <li><strong>The ear's fixed copy.</strong> Each release lives at its own path under hotswap
+      (<code class="code">~/.local/share/hotswap/rift/&lt;version&gt;/rift</code>), which an upgrade
+      changes and the prune deletes, so the ear never runs from there (observed 2026-11-26: an
+      upgrade, same identity, was asked again for the new path). Once the release is signed, setup
+      copies it to <code class="code">~/.local/libexec/rift/rift</code>, outside hotswap's tree and
+      named <code class="code">rift</code>, the name System Settings shows, by a temp file renamed
+      over it so a running ear keeps the file it mapped; when the copy is already the release byte
+      for byte it is left as it is. The daemon opens no microphone and runs from the link.</li>
     <li><strong>The Info.plist.</strong> Linked into the binary on macOS
       (<code class="code">__TEXT,__info_plist</code>): <code class="code">CFBundleIdentifier</code>
       <code class="code">dev.gigantic.rift</code>, <code class="code">CFBundleName</code>
@@ -311,8 +322,9 @@
       already holds there is said in a line, the ear loaded to take it over once that one leaves,
       with no wait; a failure is named and exits 1 with the daemon serving.</li>
     <li><strong>What <code class="code">--remove</code> deletes.</strong> The keychain and its
-      password file, as files; the root is left. The next <code class="code">setup</code> makes a new
-      certificate, so the microphone is asked for again.</li>
+      password file, as files, and the ear's copy; the root is left. The next
+      <code class="code">setup</code> makes a new certificate, so the microphone is asked for
+      again.</li>
   </ul>
 </section>
 
@@ -402,10 +414,11 @@
         <tr><td class="table-mono">&lt;root&gt;/run/rift.sock</td><td>the socket, in <code class="code">run/</code> (0700) beside <code class="code">serve.lock</code> (the <code class="code">flock</code> that admits one instance), <code class="code">serve.pid</code> (a hint) and <code class="code">serve.log</code> (start, refused, accept, degraded, exit and panic lines)</td></tr>
         <tr><td class="table-mono">&lt;root&gt;/serve.err</td><td>launchd's stderr, for a failure before the daemon's log</td></tr>
         <tr><td class="table-mono">&lt;archive&gt;/audio/…, &lt;archive&gt;/index.ndjson</td><td>the archive, when one is set: every segment that left the window at its path, and its <code class="code">segment</code> event, one line each (<a href="protocol.html#audio">a repeated line</a> after a kill); nothing deletes there</td></tr>
+        <tr><td class="table-mono">~/.local/libexec/rift/rift</td><td>the standing ear's program: the signed release copied to one path every release shares, the one the microphone's grant belongs to (<a href="#identity">identity</a>)</td></tr>
         <tr><td class="table-mono">~/.local/bin/rift</td><td>the binary: <a class="link" href="https://gigantic.dev/hotswap/">hotswap</a>'s link through <code class="code">~/.local/share/hotswap/rift/current</code>, the release installed; hotswap's record is under <code class="code">~/.local/state/hotswap/</code></td></tr>
         <tr><td class="table-mono">~/Library/LaunchAgents/dev.gigantic.rift.upgrade.plist</td><td>hotswap's upgrade agent: <code class="code">rift upgrade</code> every 900 s</td></tr>
         <tr><td class="table-mono">~/Library/LaunchAgents/dev.gigantic.rift.plist</td><td>the launchd agent: <code class="code">KeepAlive</code> on an unclean exit only, <code class="code">RunAtLoad</code></td></tr>
-        <tr><td class="table-mono">~/Library/LaunchAgents/dev.gigantic.rift.ear.plist</td><td>the standing ear's agent: <code class="code">rift device ear &lt;host&gt; --mic</code>, <code class="code">KeepAlive</code> always, <code class="code">RunAtLoad</code></td></tr>
+        <tr><td class="table-mono">~/Library/LaunchAgents/dev.gigantic.rift.ear.plist</td><td>the standing ear's agent: <code class="code">~/.local/libexec/rift/rift device ear &lt;host&gt; --mic</code>, <code class="code">KeepAlive</code> always, <code class="code">RunAtLoad</code></td></tr>
       </tbody>
     </table>
   </div>
@@ -462,7 +475,7 @@ mise run dist                           # a checkout: this host's release archiv
         <tr><td class="table-mono">rift read &lt;track&gt; &lt;from us&gt; &lt;to us&gt;</td><td>prints the range's frames, silence where nothing is held</td></tr>
         <tr><td class="table-mono">rift device ear|mouth &lt;name&gt; &lt;file.pcm&gt; [--fast]</td><td>a device, its own process: plays a raw PCM file (16 kHz, mono, 16-bit little-endian) as the track's frames, a short tail dropped, answering every ping, paced in real time and stamped from now, a pause or clock step of over 100 ms playing on from the clock as a hole, or with <code class="code">--fast</code> sent as fast as each is answered and stamped as if captured ending now; prints its reply, then each notice and refusal; exit 0 once every frame is answered, <code class="code">{"code":"unknown","ok":false}</code> and exit 1 if the connection ends first; an unreadable file is <code class="code">rift device: &lt;cause&gt;</code>, exit 1</td></tr>
         <tr><td class="table-mono">rift device ear &lt;name&gt; --mic [&lt;microphone&gt;]</td><td>a device, its own process, macOS only: hears the default input (the built-in in place of a Bluetooth one, when there is one), or the one named, whatever its transport, while the ears are open (<a href="#microphone">the microphone</a>); prints its reply, then each notice and refusal; when the connection ends (<code class="code">{"code":"unknown","ok":false}</code>) or the daemon is down, it waits a poll and connects again; SIGTERM, SIGINT or SIGHUP, its only exit: <code class="code">rift device: stopped by SIG&lt;name&gt;</code>, exit 0; a withheld grant or a failed open is one stderr line, and it keeps trying; on Linux exit 2</td></tr>
-        <tr><td class="table-mono">rift setup [--print | --remove]</td><td>brings the release into hotswap's layout and links <code class="code">~/.local/bin/rift</code> (with none installed, the latest, through packslip), signs the release with <a href="#identity">rift's identity</a>, then writes both agents' plists on that link, boots the ear's out, loads the daemon's, or swaps it with one <code class="code">kickstart -k</code> (a bootout then a bootstrap when it re-signed the release), and waits for the new daemon to answer health ready, then loads the ear's and waits for that daemon to list <code class="code">ear-&lt;host&gt;</code>, loading either afresh once when not ready past <code class="code">$RIFT_RELOAD_MS</code>; the ear's failure is <code class="code">rift setup: &lt;line naming dev.gigantic.rift.ear&gt;</code>, exit 1, the daemon left serving; an ear whose track another device already holds is loaded unwaited, a disabled one left unloaded, each said in a line, exit 0; <code class="code">--print</code> prints both plists (the daemon's alone off macOS), <code class="code">--remove</code> has hotswap forget the layout and the upgrade agent, unloads both agents and removes their plists, the link, the keychain and its password</td></tr>
+        <tr><td class="table-mono">rift setup [--print | --remove]</td><td>brings the release into hotswap's layout and links <code class="code">~/.local/bin/rift</code> (with none installed, the latest, through packslip), signs the release with <a href="#identity">rift's identity</a> and copies it to the ear's fixed path unless already there, then writes both agents' plists, the daemon's on the link and the ear's on that copy, boots the ear's out, loads the daemon's, or swaps it with one <code class="code">kickstart -k</code> (a bootout then a bootstrap when it re-signed the release), and waits for the new daemon to answer health ready, then loads the ear's and waits for that daemon to list <code class="code">ear-&lt;host&gt;</code>, loading either afresh once when not ready past <code class="code">$RIFT_RELOAD_MS</code>; the ear's failure is <code class="code">rift setup: &lt;line naming dev.gigantic.rift.ear&gt;</code>, exit 1, the daemon left serving; an ear whose track another device already holds is loaded unwaited, a disabled one left unloaded, each said in a line, exit 0; <code class="code">--print</code> prints both plists (the daemon's alone off macOS), <code class="code">--remove</code> has hotswap forget the layout and the upgrade agent, unloads both agents and removes their plists, the link, the ear's copy, the keychain and its password</td></tr>
         <tr><td class="table-mono">rift upgrade [--check | --back | --retry]</td><td>hotswap's swap onto a newer release: installed beside the running one, <code class="code">current</code> moved, <code class="code">rift setup</code>, then the smoke (<code class="code">rift version</code>, <code class="code">rift status</code> until the daemon answers with it); a failure rolls back. Exit 0 green or settled, 1 red, 2 unable to try</td></tr>
         <tr><td class="table-mono">rift version</td><td>the build, as the hello reports it</td></tr>
       </tbody>

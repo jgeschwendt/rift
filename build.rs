@@ -1,7 +1,7 @@
 //! The build identity `rift version` prints and the daemon's hello carries: the release (else the
 //! crate version), then the short commit, `-dirty` over uncommitted work in this crate, `unknown`
 //! outside a git checkout; it never fails the build. On macOS, the Info.plist the binary carries
-//! in `__TEXT,__info_plist`, which names it to the microphone's grant (docs/index.html#identity).
+//! in `__TEXT,__info_plist`, which names it in the microphone's prompt (docs/index.html#identity).
 
 use std::{env, fs, path::Path, process::Command};
 

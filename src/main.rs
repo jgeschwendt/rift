@@ -1454,9 +1454,13 @@ fn main() -> ExitCode {
             // hotswap's link through its `current`, never this executable: a checkout's setup
             // wires the installed release
             let exe = home.join(".local/bin/rift");
+            // the ear's program: the signed release copied to one path every release shares,
+            // since macOS keys a bare program's microphone grant by its path (observed
+            // 2026-11-26 · tccd prompting anew for each `hotswap/rift/<version>/rift`)
+            let fixed = home.join(".local/libexec/rift/rift");
             let (label, ear) = ("dev.gigantic.rift", "dev.gigantic.rift.ear");
-            // an agent's plist: the link run with `said`, `keep` its KeepAlive, `err` its stderr
-            let sheet = |name: &str, said: &str, keep: &str, err: &str| {
+            // an agent's plist: `program` run with `said`, `keep` its KeepAlive, `err` its stderr
+            let sheet = |name: &str, program: &Path, said: &str, keep: &str, err: &str| {
                 format!(
                     r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -1482,7 +1486,7 @@ fn main() -> ExitCode {
 </plist>
 "#,
                     root.display(),
-                    exe.display(),
+                    program.display(),
                     // beside run/, not in it: launchd creates the parent of this path 0744, which serve refuses
                     root.join(err).display()
                 )
@@ -1532,6 +1536,7 @@ fn main() -> ExitCode {
                 };
                 let plist = sheet(
                     label,
+                    &exe,
                     "<string>serve</string>",
                     "<dict><key>SuccessfulExit</key><false/></dict>",
                     "serve.err",
@@ -1539,6 +1544,7 @@ fn main() -> ExitCode {
                 let standing = |mac: &str| {
                     sheet(
                         ear,
+                        &fixed,
                         &format!(
                             "<string>device</string><string>ear</string><string>{mac}</string><string>--mic</string>"
                         ),
@@ -1633,7 +1639,7 @@ fn main() -> ExitCode {
                     .collect();
                 older.sort();
                 // rift's own keychain and code-signing identity (docs/index.html#identity), so a
-                // rebuild keeps the microphone's grant
+                // rebuild at the ear's fixed path keeps the microphone's grant
                 let keychain = root.join("rift.keychain-db");
                 let (kc, pass) = (keychain.to_string_lossy(), root.join("rift.keychain-pass"));
                 let need = |name: &str, line: &[&str]| -> io::Result<()> {
@@ -1659,6 +1665,8 @@ fn main() -> ExitCode {
                     unload(label)?;
                     gone(&path);
                     gone(&exe);
+                    gone(&fixed);
+                    drop(fixed.parent().map(fs::remove_dir));
                     // files, never `security delete-keychain`, which might ask at the screen to
                     // unlock it; setup never puts it on the search list
                     gone(&keychain);
@@ -1796,6 +1804,15 @@ security import "$1/identity.p12" -k "$3" -P "$2" -T /usr/bin/codesign"#,
                     .and_then(|()| fs::rename(&copy, &target))
                     .inspect_err(|_| drop(fs::remove_file(&copy)))?;
                     println!("signed {} as {label} by {hash}", target.display());
+                }
+                // the signed release at the ear's fixed path, unless already there byte for byte;
+                // renamed over it, so a running ear keeps the file it mapped
+                if fs::read(&fixed).ok() != Some(fs::read(&target)?) {
+                    let staged = fixed.with_added_extension("new");
+                    fixed.parent().map_or(Ok(()), fs::create_dir_all)?;
+                    let _: u64 = fs::copy(&target, &staged)?;
+                    fs::rename(&staged, &fixed)?;
+                    println!("installed {} as {}", target.display(), fixed.display());
                 }
                 path.parent().map_or(Ok(()), fs::create_dir_all)?;
                 for (file, text) in [(&path, &plist), (&heard, &listened)] {

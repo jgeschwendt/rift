@@ -2077,6 +2077,8 @@ mod tests {
         let (home, bin) = (format!("{root}/home"), format!("{root}/bin"));
         let file = format!("{home}/Library/LaunchAgents/dev.gigantic.rift.plist");
         let exe = format!("{home}/.local/bin/rift");
+        // the ear's program: the signed release at one path every release shares
+        let fixed = format!("{home}/.local/libexec/rift/rift");
         let plist = |data: &str| {
             format!(
                 r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -2114,6 +2116,7 @@ mod tests {
                     "<string>device</string><string>ear</string><string>test-mac</string><string>--mic</string>",
                 )
                 .replace("serve.err", "ear.err")
+                .replace(&exe, &fixed)
         };
         // scutil's stub: the name, or with `fail-scutil` none set
         let host = format!("{root}/host");
@@ -2259,6 +2262,7 @@ esac
         lay()?;
         let release = format!("{layout}/1/rift");
         let linked = format!("linked {exe} \u{2192} {release}\n");
+        let installed = format!("installed {release} as {fixed}\n");
         let signs = || -> Result<String, Box<dyn Error>> {
             let log = fs::read_to_string(format!("{root}/sign.log")).unwrap_or_default();
             drop(fs::remove_file(format!("{root}/sign.log")));
@@ -2336,7 +2340,7 @@ esac
         same(
             &first,
             &format!(
-                "0\nlaunchctl bootout {former}\nmoved {old} to {data}\nremoved {earlier}\n{linked}{}{wrote}launchctl bootstrap {gui} {file}\n{heard}print {job}\nprint {former}\nbootout {former}\nprint {former}\nprint {former}\n{tended}{unheard}print {job}\nprint {job}\nbootstrap {gui} {file}\nroot 0700\n{hear}{fresh}",
+                "0\nlaunchctl bootout {former}\nmoved {old} to {data}\nremoved {earlier}\n{linked}{}{installed}{wrote}launchctl bootstrap {gui} {file}\n{heard}print {job}\nprint {former}\nbootout {former}\nprint {former}\nprint {former}\n{tended}{unheard}print {job}\nprint {job}\nbootstrap {gui} {file}\nroot 0700\n{hear}{fresh}",
                 made(&data, &id(&data)?)
             ),
         )?;
@@ -2362,6 +2366,20 @@ esac
             ),
             "the log false false true",
         )?;
+        // the ear's copy: the release byte for byte, its staging file gone; its inode tells a
+        // rerun that left it alone from a release that replaced it
+        let copied = || -> Result<(String, u64), Box<dyn Error>> {
+            Ok((
+                format!(
+                    "{} {}",
+                    fs::read(&fixed)? == fs::read(&release)?,
+                    fs::exists(format!("{fixed}.new"))?
+                ),
+                fs::metadata(&fixed)?.ino(),
+            ))
+        };
+        let (copy, inode) = copied()?;
+        same(&copy, "true false")?;
         same(
             &format!(
                 "{}{}{}",
@@ -2389,6 +2407,11 @@ esac
                 r#"{"op":"health"}"#,
             )?)?)
         };
+        // the rerun left the ear's copy as it was
+        same(
+            &format!("{:?}", copied()?),
+            &format!("(\"true false\", {inode})"),
+        )?;
         let now = health()?;
         same(
             &format!("{} {} {}", now["state"], now["devices"], now["ears"]),
@@ -2446,12 +2469,16 @@ esac
             &rift(&data, &[("HOME", home.as_str())], &["upgrade", "--x"])?,
             "2\nusage: rift upgrade [--check | --back | --retry]\n",
         )?;
-        // a rebuilt release (its signature gone) under a locked keychain: unlocked, signed, then
-        // loaded afresh rather than kickstarted
+        // a rebuilt release (its bytes changed, its signature gone) under a locked keychain:
+        // unlocked, signed, copied over the ear's, then loaded afresh rather than kickstarted;
         // and a hand-run ear already holding the track (`held`) once the new daemon is up: the
         // standing ear loaded unwaited, to take the track over once that one leaves
         let hash = id(&data)?;
         fs::remove_file(format!("{root}/signature"))?;
+        OpenOptions::new()
+            .append(true)
+            .open(&release)?
+            .write_all(b"rebuilt")?;
         for marker in ["held", "locked"] {
             fs::write(format!("{root}/{marker}"), "")?;
         }
@@ -2464,8 +2491,13 @@ esac
                 fs::exists(format!("{root}/locked"))?
             ),
             &format!(
-                "0\n{linked}signed {release} as dev.gigantic.rift by {hash}\n{wrote}{muted}launchctl bootout {job}\nlaunchctl bootstrap {gui} {file}\n{heard}ear-test-mac is held by another device; dev.gigantic.rift.ear takes it over once it leaves\nprint {job}\n{tended}{deafen}print {job}\nbootout {job}\nprint {job}\nprint {job}\nbootstrap {gui} {file}\nroot 0700\nprint-disabled {gui}\nbootstrap {gui} {earfile}\nroot 0700\n{steady}codesign -f {release}.new\n false"
+                "0\n{linked}signed {release} as dev.gigantic.rift by {hash}\n{installed}{wrote}{muted}launchctl bootout {job}\nlaunchctl bootstrap {gui} {file}\n{heard}ear-test-mac is held by another device; dev.gigantic.rift.ear takes it over once it leaves\nprint {job}\n{tended}{deafen}print {job}\nbootout {job}\nprint {job}\nprint {job}\nbootstrap {gui} {file}\nroot 0700\nprint-disabled {gui}\nbootstrap {gui} {earfile}\nroot 0700\n{steady}codesign -f {release}.new\n false"
             ),
+        )?;
+        let recopied = copied()?;
+        same(
+            &format!("{} {}", recopied.0, recopied.1 != inode),
+            "true false true",
         )?;
         fs::remove_file(format!("{root}/held"))?;
         let holder = fs::read_to_string(format!("{root}/holder"))?;
@@ -2670,7 +2702,7 @@ esac
         same(
             &format!("{}{}{}", rerun(&["--remove"], &[])?, calls()?, signs()?),
             &format!(
-                "0\nremoved {earlier}\n{muted}removed {earfile}\nlaunchctl bootout {job}\nremoved {file}\nremoved {exe}\nremoved {moved}/rift.keychain-db\nremoved {moved}/rift.keychain-pass\nprint {gui}/dev.gigantic.rift.upgrade\nprint {former}\nprint {former}\n{deafen}print {job}\nbootout {job}\nprint {job}\nprint {job}\n"
+                "0\nremoved {earlier}\n{muted}removed {earfile}\nlaunchctl bootout {job}\nremoved {file}\nremoved {exe}\nremoved {fixed}\nremoved {moved}/rift.keychain-db\nremoved {moved}/rift.keychain-pass\nprint {gui}/dev.gigantic.rift.upgrade\nprint {former}\nprint {former}\n{deafen}print {job}\nbootout {job}\nprint {job}\nprint {job}\n"
             ),
         )?;
         same(
@@ -2681,13 +2713,14 @@ esac
         )?;
         same(
             &format!(
-                "{} {} {} {}",
+                "{} {} {} {} {}",
                 fs::exists(&moved)?,
                 fs::exists(&upgrade)?,
                 fs::exists(&layout)?,
-                fs::exists(&earfile)?
+                fs::exists(&earfile)?,
+                fs::exists(format!("{home}/.local/libexec/rift"))?
             ),
-            "true false false false",
+            "true false false false false",
         )
     }
 

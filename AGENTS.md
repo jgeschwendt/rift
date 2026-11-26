@@ -78,8 +78,10 @@ The plist for `dev.gigantic.rift`: `ProgramArguments` `~/.local/bin/rift serve`,
 `EnvironmentVariables` the root it ran with, `KeepAlive` on an unclean exit only (a drain's exit 0,
 as after `shutdown`, stays down), `RunAtLoad`, `ThrottleInterval` 10,
 `ExitTimeOut` 3, `StandardErrorPath` `<root>/serve.err`. Beside it the standing ear's,
-`dev.gigantic.rift.ear`: the same but `ProgramArguments` `~/.local/bin/rift device ear <host>
---mic`, `KeepAlive` true, `StandardErrorPath` `<root>/ear.err`; `<host>` is `scutil --get
+`dev.gigantic.rift.ear`: the same but `ProgramArguments` `~/.local/libexec/rift/rift device ear
+<host> --mic` (the signed release's copy at one path every release shares, since the microphone's
+grant is keyed by the program's path; the daemon opens no microphone and stays on the link),
+`KeepAlive` true, `StandardErrorPath` `<root>/ear.err`; `<host>` is `scutil --get
 LocalHostName` (resolved from `PATH`, under `$RIFT_SIGN_MS`) lowercased, asked only by `--print`
 and an install: `setup --print` prints both and writes nothing, the daemon's alone when there is no
 name (no `scutil`, off macOS); an install refuses one that is no track name (unset, or past
@@ -123,8 +125,14 @@ printed:
    unlock first and the deadline; the linker's ad-hoc signature leaves `Info.plist=not bound`, the
    re-sign binds it (`Info.plist entries=3`). On a Mac (observed 2026-11-25): a signed copy run
    as `device ear <name> --mic` under launchd is asked once, and while the prompt waits the open
-   blocks, and the device waits on it; a rebuild under another version, signed by the same
-   identity, records with no prompt; `ears off` stops the segments. Each run left one hole of
+   blocks, and the device waits on it; a rebuild under another version at the same path, signed
+   by the same identity, records with no prompt; `ears off` stops the segments. A release at a
+   new path, the same identity and designated requirement, is asked again (observed 2026-11-26 ·
+   v2026.11.5's upgrade: tccd prompting with `subject=…/hotswap/rift/2026.11.5/rift`, its
+   `TCCDAccessIdentity` an identifier that is that path, `type: 1`): a program outside an app
+   bundle is granted by its path, its signature checked against the grant. Hence the ear's fixed
+   copy (step 5); no Apple document or header on this Mac states the keying (`man tccutil` speaks
+   only of bundle identifiers). Each run left one hole of
    about 25 ms ending its first segment early (158400 samples): the reply's pong waited on two
    input listings (about 50 ms), and the next ping, 10 s on, moved placement by half that. With
    pongs on the reader thread a run still lost 20 ms at a ping (one late round trip re-placing
@@ -134,7 +142,10 @@ printed:
    where the callback hands them over, and an offset a pong moves only when its span proves it
    wrong, end both (`mic` and `late` in the suite; verified 2026-11-25 · a 200 s run, twenty
    full segments, then a restart, its one hole, and a 300 ms freeze with none);
-5. both plists by temp + rename (`wrote <path>`);
+5. the signed release copied to the ear's fixed path, `~/.local/libexec/rift/rift`, by temp +
+   rename unless it is already there byte for byte (`installed <release> as <path>`), so a
+   running ear keeps the file it mapped and a rerun changes nothing; then both plists by temp +
+   rename (`wrote <path>`);
 6. the ear booted out when loaded, before the daemon is touched;
 7. the same daemon plist already loaded and the release not re-signed this run: `kickstart -k`,
    the swap; else the reload: booted out when loaded, then `bootstrap`;
@@ -172,14 +183,15 @@ After each bootout `launchctl print` is polled every 100 ms until it fails, at m
 `$RIFT_BOOTOUT_MS`: `<label> still loaded <ms> ms after its bootout`, exit 1. `setup --remove`
 first has hotswap forget the layout, its record and the upgrade agent (refused while a swap runs),
 then boots out every earlier install, `dev.gigantic.rift.ear` and `dev.gigantic.rift`, removes their plists,
-`~/.local/bin/rift`, the keychain and its password as files (never `security delete-keychain`,
+`~/.local/bin/rift`, the ear's copy and its `~/.local/libexec/rift/`, the keychain and its password as files (never `security delete-keychain`,
 which may ask to unlock it), and leaves the root alone. Idempotent.
 
 hotswap never re-hashes an installed release (verified 2026-11-25 · `src/lib.rs` at the pinned
 `e980196`): versions are directories, `current` a symlink, `--check` prints, `--back` relinks and
 runs `rift setup`, the prune removes directories; a re-signed binary changes none of it. A rollback
 onto a release older than this signing runs that release's setup, which signs nothing, so its
-grant is its own.
+grant is its own. The prune never reaches the ear's copy, which lives outside hotswap's tree; a
+rollback onto a release older than the copy leaves it, and the ear job, as they were.
 
 ### `rift upgrade [--check | --back | --retry]`
 
