@@ -2,6 +2,8 @@
 //! system's default output, followed as it changes, open while a play is and `$RIFT_LINGER_MS`
 //! after the output last took one; reports what the output took as runs and, while the ears are
 //! open, sends it as the track's frames, each once it has sounded (docs/protocol.html#plays). The
+//! output's callback only copies samples the loop converted and records what it rendered, under
+//! one mutex each side holds only for that copy; the loop converts, accounts, cuts and writes. The
 //! cpal lines are `speaker.rs`; this file runs in the suite against `Fake`.
 
 use crate::ear::Convert;
@@ -14,25 +16,33 @@ use std::f64::consts::PI;
 use std::fs;
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::iter;
+use std::mem;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// Given samples read each side of an output sample's position.
-const TAPS: i64 = 16;
+/// Phases between two given samples the interpolator's window is precomputed at.
+const PHASES: usize = 256;
 
-/// A frame of the track: its start on this device's clock, its 640 bytes and its output's name.
-type Frame = (u64, Vec<u8>, String);
+/// Given samples read each side of an output sample's position.
+const TAPS: usize = 16;
 
 /// Fills each buffer of an open output, interleaved, given its rate, its channels and the
 /// microseconds until its first sample sounds.
 pub type Fill = Box<dyn FnMut(&mut [f32], u32, u16, u64) + Send>;
 
-/// Called once an open returns: nothing, else why it failed.
-pub type Ready = Box<dyn FnOnce(Result<(), String>) + Send>;
+/// A frame of the track: its start on this device's clock, its 640 bytes and its output's name.
+type Frame = (u64, Vec<u8>, String);
+
+/// Called once an open returns: the output's rate, else why it failed.
+pub type Ready = Box<dyn FnOnce(Result<u32, String>) + Send>;
+
+/// What a callback rendered: the sample, its position among the play's given samples (none for
+/// silence), and when it sounds on this device's clock.
+type Rendered = (f32, Option<f64>, u64);
 
 /// The outputs as one listing found them.
 #[derive(Default)]
@@ -46,17 +56,18 @@ pub struct Outputs {
 /// Where the outputs come from: the system's (`speaker.rs`), else the suite's `Fake`.
 pub trait Sink: Sync {
     /// Opens the output `name` and says so on `ready`, then has `fill` fill each buffer until
-    /// `stop` is dropped, and closes it.
+    /// `stop` is dropped or the output fails, and closes it.
     fn hold(&self, name: &str, ready: Ready, fill: Fill, stop: Receiver<()>);
     /// The outputs now.
     fn outputs(&self) -> Outputs;
 }
 
 /// The suite's outputs under `$RIFT_SPEAKER`: `default` names the default output; each file
-/// under `outputs/` is an output holding `<rate> <channels> <latency ms>`, or `fail`, gone when
-/// its file goes; `take`, when present, the output samples it may take in all; every sample
-/// taken (channel 0, 16-bit little-endian) appended to `heard/<output>`, an `open` and a `close`
-/// line per open to `log`.
+/// under `outputs/` is an output holding `<rate> <channels> <latency ms>`, or `fail` (an open
+/// refused, or an open one failing as its file comes to say so), unlisted when its file goes;
+/// with a `take` file it takes no more output samples in all than that names, so it stalls; every
+/// sample taken (channel 0, 16-bit little-endian) appended to `heard/<output>`, an `open` and a
+/// `close` line per open to `log`.
 struct Fake {
     /// The directory.
     dir: PathBuf,
@@ -73,25 +84,26 @@ impl Sink for Fake {
     )]
     fn hold(&self, name: &str, ready: Ready, mut fill: Fill, stop: Receiver<()>) {
         let (output, log) = (self.dir.join("outputs").join(name), self.dir.join("log"));
-        let spec = fs::read_to_string(&output).unwrap_or_default();
-        if spec.trim() == "fail" {
+        let spec = || fs::read_to_string(&output).unwrap_or_default();
+        if spec().trim() == "fail" {
             return ready(Err("refused".to_owned()));
         }
-        let words: Vec<u64> = (spec.split_whitespace())
+        let words: Vec<u64> = (spec().split_whitespace())
             .map(|word| word.parse().unwrap_or_default())
             .collect();
         let [rate, channels, latency] =
             [0, 1, 2].map(|at| words.get(at).copied().unwrap_or_default());
-        ready(Ok(()));
+        ready(Ok(u32::try_from(rate).unwrap_or_default()));
         drop(append(&log, format!("open {name}\n").as_bytes()));
         let heard = self.dir.join("heard");
         drop(fs::create_dir_all(&heard));
-        // paced on the clock, as an output's own is, and never past `take`
+        // paced on the clock, as an output's own is, never past `take`, until stopped or failed
         let (begun, mut given) = (Instant::now(), 0u64);
         while matches!(
             stop.recv_timeout(Duration::from_millis(10)),
             Err(RecvTimeoutError::Timeout)
-        ) {
+        ) && spec().trim() != "fail"
+        {
             let due = u64::try_from(begun.elapsed().as_micros())
                 .unwrap_or_default()
                 .saturating_mul(rate)
@@ -183,6 +195,19 @@ impl Cut {
         (self.sent, self.has, self.first) = (self.sent.saturating_add(1), false, None);
     }
 
+    /// One rendered sample, sounding at `when`, a play's when `played`, into the track.
+    fn feed(&mut self, value: f32, played: bool, when: u64, frames: &mut VecDeque<Frame>) {
+        let _: &mut u64 = self.first.get_or_insert(when);
+        self.has |= played;
+        self.convert.feed(iter::once(value), &mut self.pcm);
+        let dropped = self.skip.min(self.pcm.len());
+        drop(self.pcm.drain(..dropped));
+        self.skip = self.skip.saturating_sub(dropped);
+        while self.pcm.len() >= FRAME {
+            self.emit(frames);
+        }
+    }
+
     /// The frame being cut, holding a play's last samples, filled with silence and queued now;
     /// the silence the output gives in its place is dropped as it comes.
     fn pad(&mut self, frames: &mut VecDeque<Frame>) {
@@ -196,13 +221,15 @@ impl Cut {
     }
 }
 
-/// What the device hears, on one channel: a line from the daemon (`None` at its end), each
-/// open's outcome tagged with its number, and the outputs.
+/// What the device hears, on one channel: a line from the daemon (`None` at its end), and each
+/// open's outcome and its end, tagged with its number, and the outputs.
 enum Heard {
+    /// An open's output stopped or failed.
+    Closed(u64),
     /// A line from the daemon, its ping answered already.
     Line(Option<Value>),
-    /// An open returned.
-    Opened(u64, Result<(), String>),
+    /// An open returned: the output's rate, else why it failed.
+    Opened(u64, Result<u32, String>),
     /// A listing of the outputs.
     Outputs(Outputs),
 }
@@ -213,81 +240,12 @@ struct Open {
     _stop: Sender<()>,
     /// Its name.
     name: String,
+    /// Its rate, once it opened.
+    rate: Option<u32>,
 }
 
-/// What the loop and the output's callback share.
-#[derive(Default)]
-struct Shared {
-    /// The track being cut from the open output.
-    cut: Option<Cut>,
-    /// Frames cut, until each has sounded.
-    frames: VecDeque<Frame>,
-    /// When the output last took a play's sample.
-    last: Option<Instant>,
-    /// The open whose callback fills: an earlier open's is ignored.
-    open: u64,
-    /// Reports to send, in order.
-    reports: Vec<Value>,
-    /// The output open now.
-    speaker: String,
-    /// The play under way.
-    speech: Option<Speech>,
-}
-
-impl Shared {
-    /// Fills open `number`'s buffer of `data` at `rate` with `channels`, its first sample
-    /// sounding `latency` microseconds from now: the play's samples, else silence, each taken one
-    /// counted, run and reported, and the track cut from all of it.
-    fn fill(&mut self, number: u64, data: &mut [f32], rate: u32, channels: u16, latency: u64) {
-        let (clock, current) = (now().saturating_add(latency), number == self.open);
-        for (index, frame) in
-            (data.chunks_mut(usize::from(channels).max(1)).enumerate()).take_while(|_| current)
-        {
-            let cut = self.cut.get_or_insert_with(|| Cut {
-                base: 0,
-                convert: Convert::from(rate),
-                first: None,
-                has: false,
-                name: self.speaker.clone(),
-                pcm: Vec::new(),
-                sent: 0,
-                skip: 0,
-            });
-            let when = clock.saturating_add(
-                u64::try_from(index)
-                    .unwrap_or_default()
-                    .saturating_mul(1_000_000)
-                    .checked_div(u64::from(rate))
-                    .unwrap_or_default(),
-            );
-            let sample = (self.speech.as_mut()).and_then(|held| held.take(rate, when));
-            frame.fill(sample.unwrap_or_default());
-            // a run reported each 20 ms of output, and as it ends
-            if let Some(held) = self.speech.as_mut() {
-                let closing = sample.is_none();
-                if closing || held.since >= u64::from(rate).checked_div(50).unwrap_or_default() {
-                    self.reports.extend(held.report(closing));
-                }
-            }
-            if sample.is_some() {
-                self.last = Some(Instant::now());
-            }
-            let _: &mut u64 = cut.first.get_or_insert(when);
-            cut.has |= sample.is_some();
-            cut.convert
-                .feed(iter::once(sample.unwrap_or_default()), &mut cut.pcm);
-            let dropped = cut.skip.min(cut.pcm.len());
-            drop(cut.pcm.drain(..dropped));
-            cut.skip = cut.skip.saturating_sub(dropped);
-            while cut.pcm.len() >= FRAME {
-                cut.emit(&mut self.frames);
-            }
-        }
-    }
-}
-
-/// The play under way: what is queued of it and how far its output has taken it.
-struct Speech {
+/// The play under way: what is held of it, how far it is converted and how far its output took it.
+struct Play {
     /// The next output sample's position among the given samples.
     at: f64,
     /// Whether nothing more will be given: its `end`, or a hush.
@@ -296,7 +254,7 @@ struct Speech {
     front: u64,
     /// Its samples given.
     given: u64,
-    /// The given samples held, from `front`.
+    /// The given samples held, from `front`, as far back as the output has not taken.
     held: VecDeque<f32>,
     /// Its number.
     num: u64,
@@ -315,16 +273,58 @@ struct Speech {
 #[expect(
     clippy::as_conversions,
     clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
     clippy::cast_precision_loss,
     clippy::cast_sign_loss,
     clippy::float_arithmetic,
     reason = "signal math in floating point over sample counts far below 2^52"
 )]
-impl Speech {
-    /// Whether the output has taken all of it that it will.
-    fn finished(&self) -> bool {
-        self.ended && self.at > self.given as f64 - 1.0f64
+impl Play {
+    /// The next output sample at `rate`, and its position: the window's taps over the given
+    /// samples around it, its phase the nearest precomputed; none once converted to the end or
+    /// while what it needs is not yet given.
+    fn convert(&mut self, rate: u32, window: &[f64]) -> Option<(f32, f64)> {
+        let base = self.at.floor();
+        let ahead = (base as u64).saturating_add(TAPS as u64);
+        if self.at > self.given as f64 - 1.0f64 && self.ended || !self.ended && ahead >= self.given
+        {
+            return None;
+        }
+        let phase = ((self.at - base) * PHASES as f64).round() as usize;
+        let taps = window
+            .get(phase.saturating_mul(2 * TAPS)..)
+            .unwrap_or_default();
+        let first = (base as u64).saturating_add(1).saturating_sub(TAPS as u64);
+        let skip = usize::try_from(first.saturating_sub(self.front)).unwrap_or_default();
+        // taps before the first given sample read silence
+        let before = (TAPS as u64).saturating_sub((base as u64).saturating_add(1));
+        let sum: f64 = (iter::repeat_n(0.0f32, usize::try_from(before).unwrap_or_default()))
+            .chain(
+                self.held
+                    .iter()
+                    .skip(skip)
+                    .copied()
+                    .chain(iter::repeat(0.0f32)),
+            )
+            .zip(taps.iter().take(2 * TAPS))
+            .map(|(held, tap)| f64::from(held) * tap)
+            .sum();
+        let at = self.at;
+        self.at += f64::from(self.rate) / f64::from(rate);
+        // the last sample of an ended play stands for the given samples past it, so that taken,
+        // every given sample counts played
+        let last = self.ended && self.at > self.given as f64 - 1.0f64;
+        let counted = if last {
+            at.max(self.given as f64 - 1.0f64)
+        } else {
+            at
+        };
+        Some((sum as f32, counted))
+    }
+
+    /// Whether the output has taken all of it that it will: converted to the end, with nothing
+    /// converted left untaken.
+    fn finished(&self, queued: bool) -> bool {
+        self.ended && self.at > self.given as f64 - 1.0f64 && !queued
     }
 
     /// The run under way as a report, `closing` it; none with no run.
@@ -336,65 +336,111 @@ impl Speech {
         )
     }
 
-    /// The next output sample at `rate`, sounding at `when`: a Hann-windowed sinc interpolation
-    /// of the given samples around its position, `TAPS` each side, cut at 0.45 of the lower rate;
-    /// none once finished or while what it needs is not yet given.
-    fn take(&mut self, rate: u32, when: u64) -> Option<f32> {
-        let base = self.at.floor() as i64;
-        // finished, every given sample has gone into the output; else it has run dry
-        if self.finished() {
-            self.played = self.given;
+    /// One rendered sample at `rate`, at `position` among the given samples (none for silence),
+    /// sounding at `when`: counted played, its run begun or reported each 20 ms, or the run ended.
+    fn taken(&mut self, position: Option<f64>, when: u64, rate: u32, reports: &mut Vec<Value>) {
+        if let Some(at) = position {
+            let _: &mut (u64, u64) = self.run.get_or_insert((self.played, when));
+            self.played = self
+                .played
+                .max((at as u64).saturating_add(1))
+                .min(self.given);
+            self.since = self.since.saturating_add(1);
+            // the given samples the output is past, but for the window's reach, let go
+            while self.front.saturating_add(TAPS as u64) < at as u64
+                && self.held.pop_front().is_some()
+            {
+                self.front = self.front.saturating_add(1);
+            }
         }
-        if self.finished() || !self.ended && base.saturating_add(TAPS) >= self.given as i64 {
-            return None;
+        if position.is_none() || self.since >= u64::from(rate).checked_div(50).unwrap_or_default() {
+            reports.extend(self.report(position.is_none()));
         }
-        let (given, output) = (f64::from(self.rate), f64::from(rate));
-        let cut = 0.45f64 * given.min(output) / given;
-        let (mut sum, mut weight) = (0.0f64, 0.0f64);
-        for index in base.saturating_sub(TAPS).saturating_add(1)..=base.saturating_add(TAPS) {
-            let apart = self.at - index as f64;
-            let sinc = if apart.abs() < f64::EPSILON {
-                2.0f64 * cut
-            } else {
-                (2.0f64 * PI * cut * apart).sin() / (PI * apart)
-            };
-            let tap = sinc * 0.5f64.mul_add((PI * apart / (TAPS + 1) as f64).cos(), 0.5f64);
-            let held = u64::try_from(index)
-                .ok()
-                .and_then(|at| at.checked_sub(self.front))
-                .and_then(|at| self.held.get(usize::try_from(at).ok()?));
-            (sum, weight) = (
-                tap.mul_add(f64::from(held.copied().unwrap_or_default()), sum),
-                weight + tap,
-            );
-        }
-        let _: &mut (u64, u64) = self.run.get_or_insert((self.played, when));
-        self.played = self
-            .played
-            .max((base as u64).saturating_add(1))
-            .min(self.given);
-        self.since = self.since.saturating_add(1);
-        self.at += given / output;
-        while self.front.saturating_add(TAPS as u64) < self.at as u64
-            && self.held.pop_front().is_some()
-        {
-            self.front = self.front.saturating_add(1);
-        }
-        Some((sum / weight) as f32)
     }
+}
+
+/// What the output's callback shares with the loop, under one mutex each holds only to copy: the
+/// samples converted for the output, each with its position, and what the callback rendered.
+struct Ring {
+    /// The open whose callback renders: an earlier open's renders silence and records nothing.
+    open: u64,
+    /// Converted for the output, not yet taken.
+    queued: VecDeque<(f32, f64)>,
+    /// Rendered, not yet read by the loop, its capacity never grown.
+    rendered: VecDeque<Rendered>,
+}
+
+/// What the output `rendered` since the last look, at `rate`, copied out of the ring: each sample
+/// accounted to `play` and cut into the track; whether the output took any of a play's.
+fn absorb(
+    rendered: Vec<Rendered>,
+    play: &mut Option<Play>,
+    cut: &mut Option<Cut>,
+    frames: &mut VecDeque<Frame>,
+    reports: &mut Vec<Value>,
+    rate: u32,
+) -> bool {
+    let mut took = false;
+    for (value, position, when) in rendered {
+        if let Some(given) = play.as_mut() {
+            given.taken(position, when, rate, reports);
+        }
+        if let Some(track) = cut.as_mut() {
+            track.feed(value, position.is_some(), when, frames);
+        }
+        took |= position.is_some();
+    }
+    took
+}
+
+/// The interpolator's window for a play at `given` Hz into an output at `rate`: for each of
+/// `PHASES + 1` phases between two given samples, `2 × TAPS` Hann-windowed sinc taps cut at 0.45
+/// of the lower rate, summing to 1.
+#[expect(
+    clippy::as_conversions,
+    clippy::cast_precision_loss,
+    clippy::float_arithmetic,
+    clippy::single_call_fn,
+    reason = "the window computed once a play and output, in floating point, apart from the loop"
+)]
+fn window(given: u32, rate: u32) -> Vec<f64> {
+    let cut = 0.45f64 * f64::from(given.min(rate)) / f64::from(given);
+    (0..=PHASES)
+        .flat_map(|phase| {
+            let fraction = phase as f64 / PHASES as f64;
+            let taps: Vec<f64> = (0..2 * TAPS)
+                .map(|tap| {
+                    let apart = fraction + TAPS as f64 - 1.0f64 - tap as f64;
+                    let sinc = if apart.abs() < f64::EPSILON {
+                        2.0f64 * cut
+                    } else {
+                        (2.0f64 * PI * cut * apart).sin() / (PI * apart)
+                    };
+                    sinc * 0.5f64.mul_add((PI * apart / (TAPS as f64 + 1.0f64)).cos(), 0.5f64)
+                })
+                .collect();
+            let sum: f64 = taps.iter().sum();
+            taps.into_iter().map(move |tap| tap / sum)
+        })
+        .collect()
 }
 
 /// The device after its reply, until the daemon goes (`unknown`, then main waits a poll and
 /// connects again): every ping answered on the reader's thread as it arrives; every line printed
 /// but the plays' own and the replies that are ok; a give queued, an `end` played out, a hush
-/// dropped at once; the outputs listed every `$RIFT_POLL_MS`, the default opened while a play is
-/// open and `$RIFT_LINGER_MS` after, and reopened as it changes; a failed open said once, retried
-/// a poll doubled per failure in a row, 64 at most. Its connection gone, it drops what it holds.
+/// dropped at once, converted or not, and a play's lines once it has ended ignored; the outputs
+/// listed every `$RIFT_POLL_MS`, the default opened while a play is open and `$RIFT_LINGER_MS`
+/// after, and reopened as it changes or fails; a failed open said once, retried a poll doubled
+/// per failure in a row, 64 at most. Its connection gone, it drops what it holds.
 #[expect(
     clippy::single_call_fn,
     reason = "the device's entry: main calls it once, on macOS"
 )]
 pub fn run(reader: BufReader<UnixStream>, reply: &Value) {
+    #[expect(
+        clippy::cognitive_complexity,
+        reason = "the device is one loop over one channel of what it hears, as the ear's"
+    )]
     let hear = || -> Option<()> {
         let sink: &'static dyn Sink = env::var_os("RIFT_SPEAKER").map_or(&Speaker, |dir| {
             Box::leak(Box::new(Fake {
@@ -434,8 +480,13 @@ pub fn run(reader: BufReader<UnixStream>, reply: &Value) {
                 sent
             })
         }));
-        let shared = Arc::new(Mutex::new(Shared::default()));
-        let lock = || shared.lock().unwrap_or_else(PoisonError::into_inner);
+        // two seconds of rendering at 48 kHz, drained every 10 ms
+        let ring = Arc::new(Mutex::new(Ring {
+            open: 0,
+            queued: VecDeque::new(),
+            rendered: VecDeque::with_capacity(96_000),
+        }));
+        let shared = || ring.lock().unwrap_or_else(PoisonError::into_inner);
         let (mut ears, mut failed, mut open, mut outputs, mut retry, mut said) = (
             false,
             0u32,
@@ -444,6 +495,16 @@ pub fn run(reader: BufReader<UnixStream>, reply: &Value) {
             None::<Instant>,
             BTreeSet::new(),
         );
+        let (mut cut, mut frames, mut last, mut play, mut reports) = (
+            None::<Cut>,
+            VecDeque::<Frame>::new(),
+            None::<Instant>,
+            None::<Play>,
+            Vec::new(),
+        );
+        // the last play ended, whose late lines are no one's; the window for a play and rate;
+        // whether the open output failed
+        let (mut finished, mut windowed, mut broken) = (0u64, (0u32, 0u32, Vec::new()), false);
         // each line said once until an output opens
         let say = |seen: &mut BTreeSet<String>, line: String| {
             if seen.insert(line.clone()) {
@@ -451,15 +512,12 @@ pub fn run(reader: BufReader<UnixStream>, reply: &Value) {
             }
         };
         loop {
-            let busy = {
-                let held: MutexGuard<'_, Shared> = lock();
-                held.speech.is_some() || !held.frames.is_empty()
-            };
-            let pause = if busy {
+            let pause = if play.is_some() || !frames.is_empty() {
                 Duration::from_millis(10)
             } else {
                 poll
             };
+            let rate = open.as_ref().and_then(|held| held.rate).unwrap_or(1);
             match hearing.recv_timeout(pause) {
                 Ok(Heard::Line(Some(line))) => {
                     let num = line["play"].as_u64();
@@ -473,11 +531,14 @@ pub fn run(reader: BufReader<UnixStream>, reply: &Value) {
                     {
                         println!("{line}");
                     }
-                    let state = &mut *lock();
-                    let ours = state.speech.as_ref().map(|speech| speech.num);
-                    if let Some(text) = line["pcm"].as_str() {
+                    // a play's lines once it has ended are no one's
+                    let ours = play.as_ref().map(|held| held.num);
+                    if let Some(text) = line["pcm"]
+                        .as_str()
+                        .filter(|_| num.is_some_and(|at| at > finished))
+                    {
                         if num != ours {
-                            state.speech = Some(Speech {
+                            play = Some(Play {
                                 at: 0.0,
                                 ended: false,
                                 front: 0,
@@ -498,7 +559,7 @@ pub fn run(reader: BufReader<UnixStream>, reply: &Value) {
                             clippy::float_arithmetic,
                             reason = "16-bit samples to the output's floating point"
                         )]
-                        let given = text.as_bytes().chunks_exact(4).map(|digits| {
+                        let samples = text.as_bytes().chunks_exact(4).map(|digits| {
                             let byte = |at: usize| {
                                 str::from_utf8(
                                     digits.get(at..at.saturating_add(2)).unwrap_or_default(),
@@ -509,31 +570,63 @@ pub fn run(reader: BufReader<UnixStream>, reply: &Value) {
                             };
                             f32::from(i16::from_le_bytes([byte(0), byte(2)])) / 32768.0f32
                         });
-                        if let Some(speech) = state.speech.as_mut() {
-                            let before = speech.held.len();
-                            speech.held.extend(given);
-                            let count = speech.held.len().saturating_sub(before);
-                            speech.given = speech
+                        if let Some(given) = play.as_mut().filter(|held| !held.ended) {
+                            let before = given.held.len();
+                            given.held.extend(samples);
+                            let count = given.held.len().saturating_sub(before);
+                            given.given = given
                                 .given
                                 .saturating_add(u64::try_from(count).unwrap_or_default());
                         }
                     }
-                    if let Some(speech) = state.speech.as_mut().filter(|speech| {
-                        line["end"].as_u64() == Some(speech.num)
-                            || line["hush"].as_u64() == Some(speech.num)
+                    if let Some(given) = play.as_mut().filter(|held| {
+                        line["end"].as_u64() == Some(held.num)
+                            || line["hush"].as_u64() == Some(held.num)
                     }) {
-                        speech.ended = true;
-                        // a hush drops what is queued at once; what the output took still sounds
+                        given.ended = true;
+                        // a hush drops what is queued at once, converted or not; what the output
+                        // took still sounds and is counted
                         if line["hush"].is_u64() {
-                            speech.held.clear();
-                            speech.given = speech.played;
-                            state.reports.extend(speech.report(true));
+                            let rendered: Vec<Rendered> = {
+                                let mut copying = shared();
+                                copying.queued.clear();
+                                copying.rendered.drain(..).collect()
+                            };
+                            let took = absorb(
+                                rendered,
+                                &mut play,
+                                &mut cut,
+                                &mut frames,
+                                &mut reports,
+                                rate,
+                            );
+                            last = took.then(Instant::now).or(last);
+                            if let Some(hushed) = play.as_mut() {
+                                hushed.held.clear();
+                                (hushed.given, hushed.at) = (hushed.played, f64::MAX);
+                                reports.extend(hushed.report(true));
+                            }
                         }
                     }
                 }
                 Ok(Heard::Line(None)) => return None,
-                Ok(Heard::Opened(at, opened)) if at == lock().open => match opened {
-                    Ok(()) => (failed, said) = (0, BTreeSet::new()),
+                Ok(Heard::Opened(at, opened)) if at == shared().open => match opened {
+                    Ok(hz) => {
+                        (failed, said) = (0, BTreeSet::new());
+                        if let Some(held) = open.as_mut() {
+                            held.rate = Some(hz);
+                            cut = Some(Cut {
+                                base: 0,
+                                convert: Convert::from(hz),
+                                first: None,
+                                has: false,
+                                name: held.name.clone(),
+                                pcm: Vec::new(),
+                                sent: 0,
+                                skip: 0,
+                            });
+                        }
+                    }
                     Err(cause) => {
                         let name = open.as_ref().map(|held| held.name.clone());
                         say(
@@ -548,91 +641,169 @@ pub fn run(reader: BufReader<UnixStream>, reply: &Value) {
                         );
                     }
                 },
-                Ok(Heard::Outputs(listed)) => outputs = listed,
-                Ok(Heard::Opened(..)) | Err(_) => {}
-            }
-            let opening = {
-                let state = &mut *lock();
-                // the reports, then the frames that have sounded (none while the ears are closed),
-                // then a finished play's `done`, once its last frame is sent
-                let mut writer = out.lock().ok()?;
-                for report in state.reports.drain(..) {
-                    writeln!(writer, "{report}").ok()?;
-                }
-                if let Some(speech) = state
-                    .speech
-                    .as_mut()
-                    .filter(|speech| speech.finished() && !speech.padded)
-                {
-                    speech.padded = true;
-                    if let Some(cut) = state.cut.as_mut() {
-                        cut.pad(&mut state.frames);
-                    }
-                }
-                while let Some((start, frame, speaker)) = state
-                    .frames
-                    .pop_front_if(|frame| !ears || frame.0.saturating_add(20_000) <= now())
-                {
-                    if ears {
-                        let sent = json!({"op": "frame", "pcm": hex(&frame), "speaker": speaker, "t": start});
-                        writeln!(writer, "{sent}").ok()?;
-                    }
-                }
-                if let Some(num) = state
-                    .speech
-                    .as_ref()
-                    .filter(|speech| speech.padded && state.frames.is_empty())
-                    .map(|speech| speech.num)
-                {
-                    writeln!(writer, "{}", json!({"op": "done", "play": num})).ok()?;
-                    state.speech = None;
-                }
-                drop(writer);
-                // the output wanted while a play is open and as it lingers, the default if present
-                let wanted = state.speech.is_some()
-                    || state.last.is_some_and(|last| last.elapsed() < linger);
-                let target =
-                    (outputs.default.clone()).filter(|name| wanted && outputs.names.contains(name));
-                if open
-                    .as_ref()
-                    .is_some_and(|current| Some(&current.name) != target.as_ref())
-                {
-                    // a closed output ends the run under way and starts the track's grid afresh
-                    open = None;
-                    state.cut = None;
-                    state.open = state.open.saturating_add(1);
-                    if let Some(speech) = state.speech.as_mut() {
-                        state.reports.extend(speech.report(true));
-                    }
-                }
-                if wanted && target.is_none() {
+                // the open output stopped by itself: failed, so closed and opened again a poll on
+                Ok(Heard::Closed(at)) if open.is_some() && at == shared().open => {
+                    let name = open.as_ref().map(|held| held.name.clone());
                     say(
                         &mut said,
-                        format!(
-                            "waiting for a default output; the outputs present: {}",
-                            outputs.names.join(", ")
-                        ),
+                        format!("{:?} failed; opening it again", name.unwrap_or_default()),
                     );
+                    (broken, retry) = (true, Instant::now().checked_add(poll));
                 }
-                let next = target
-                    .filter(|_| open.is_none() && retry.is_none_or(|at| at <= Instant::now()));
-                next.map(|name| {
-                    (state.open, state.speaker) = (state.open.saturating_add(1), name.clone());
-                    (name, state.open)
-                })
+                Ok(Heard::Outputs(listed)) => outputs = listed,
+                Ok(Heard::Closed(..) | Heard::Opened(..)) | Err(_) => {}
+            }
+            // the output wanted while a play is open and as it lingers, the default if present
+            let wanted = play.is_some() || last.is_some_and(|at| at.elapsed() < linger);
+            let target =
+                (outputs.default.clone()).filter(|name| wanted && outputs.names.contains(name));
+            // under the ring's lock only to copy: what the output rendered out, and, for an
+            // output closed, the open moved on and what it was given and had not taken taken
+            // back, to be converted again for the next
+            let closing = broken
+                || open
+                    .as_ref()
+                    .is_some_and(|current| Some(&current.name) != target.as_ref());
+            let (rendered, untaken, waiting) = {
+                let mut copying = shared();
+                if closing {
+                    copying.open = copying.open.saturating_add(1);
+                }
+                let untaken = closing.then(|| copying.queued.drain(..).next()).flatten();
+                (
+                    copying.rendered.drain(..).collect::<Vec<_>>(),
+                    untaken,
+                    copying.queued.len(),
+                )
             };
-            if let Some((name, number)) = opening {
+            if absorb(
+                rendered,
+                &mut play,
+                &mut cut,
+                &mut frames,
+                &mut reports,
+                rate,
+            ) {
+                last = Some(Instant::now());
+            }
+            if closing {
+                // a closed output ends the run under way and starts the track's grid afresh
+                (open, broken, cut) = (None, false, None);
+                if let Some(given) = play.as_mut() {
+                    given.at = untaken.map_or(given.at, |queued| queued.1);
+                    reports.extend(given.report(true));
+                }
+            }
+            // converted ahead of the output a quarter second, outside the lock, its window made
+            // once a play and rate
+            let mut converted = Vec::new();
+            if let (Some(given), Some(hz)) = (
+                play.as_mut(),
+                open.as_ref().and_then(|current| current.rate),
+            ) {
+                if (windowed.0, windowed.1) != (given.rate, hz) {
+                    windowed = (given.rate, hz, window(given.rate, hz));
+                }
+                let room = usize::try_from(hz)
+                    .unwrap_or_default()
+                    .checked_div(4)
+                    .unwrap_or_default();
+                while waiting.saturating_add(converted.len()) < room
+                    && let Some(next) = given.convert(hz, &windowed.2)
+                {
+                    converted.push(next);
+                }
+            }
+            let (queued, number) = {
+                let mut copying = shared();
+                copying.queued.extend(converted);
+                (!copying.queued.is_empty(), copying.open)
+            };
+            // the reports, then the frames that have sounded (none while the ears are closed),
+            // then a finished play's `done`, once its last frame is sent
+            let mut writer = out.lock().ok()?;
+            if let Some(given) = play
+                .as_mut()
+                .filter(|current| current.finished(queued) && !current.padded)
+            {
+                given.padded = true;
+                reports.extend(given.report(true));
+                if let Some(track) = cut.as_mut() {
+                    track.pad(&mut frames);
+                }
+            }
+            for report in mem::take(&mut reports) {
+                writeln!(writer, "{report}").ok()?;
+            }
+            while let Some((start, frame, speaker)) =
+                frames.pop_front_if(|frame| !ears || frame.0.saturating_add(20_000) <= now())
+            {
+                if ears {
+                    let sent =
+                        json!({"op": "frame", "pcm": hex(&frame), "speaker": speaker, "t": start});
+                    writeln!(writer, "{sent}").ok()?;
+                }
+            }
+            if let Some(num) = play
+                .as_ref()
+                .filter(|current| current.padded && frames.is_empty())
+                .map(|current| current.num)
+            {
+                writeln!(writer, "{}", json!({"op": "done", "play": num})).ok()?;
+                (play, finished) = (None, num);
+            }
+            drop(writer);
+            if wanted && target.is_none() {
+                say(
+                    &mut said,
+                    format!(
+                        "waiting for a default output; the outputs present: {}",
+                        outputs.names.join(", ")
+                    ),
+                );
+            }
+            if let Some(name) =
+                target.filter(|_| open.is_none() && retry.is_none_or(|at| at <= Instant::now()))
+            {
+                let next = number.saturating_add(1);
+                shared().open = next;
                 let (stop, stopped) = mpsc::channel();
-                let (opened, called, filled) = (heard.clone(), name.clone(), Arc::clone(&shared));
+                let (opened, called, filled) = (heard.clone(), name.clone(), Arc::clone(&ring));
                 drop(thread::spawn(move || {
-                    let ready = move |outcome| drop(opened.send(Heard::Opened(number, outcome)));
-                    let fill = move |data: &mut [f32], rate, channels, latency| {
-                        let mut guard = filled.lock().unwrap_or_else(PoisonError::into_inner);
-                        guard.fill(number, data, rate, channels, latency);
+                    let (ended, closed) = (opened.clone(), opened);
+                    let ready = move |outcome| drop(ended.send(Heard::Opened(next, outcome)));
+                    // copies converted samples out and records what it rendered, nothing more
+                    let fill = move |data: &mut [f32], hz: u32, channels: u16, latency: u64| {
+                        let clock = now().saturating_add(latency);
+                        let mut copy = filled.lock().unwrap_or_else(PoisonError::into_inner);
+                        let current = copy.open == next;
+                        for (index, frame) in
+                            data.chunks_mut(usize::from(channels).max(1)).enumerate()
+                        {
+                            let sample = current.then(|| copy.queued.pop_front()).flatten();
+                            let value = sample.map_or(0.0f32, |taken| taken.0);
+                            frame.fill(value);
+                            let when = clock.saturating_add(
+                                u64::try_from(index)
+                                    .unwrap_or_default()
+                                    .saturating_mul(1_000_000)
+                                    .checked_div(u64::from(hz))
+                                    .unwrap_or_default(),
+                            );
+                            if current && copy.rendered.len() < copy.rendered.capacity() {
+                                copy.rendered
+                                    .push_back((value, sample.map(|taken| taken.1), when));
+                            }
+                        }
                     };
                     sink.hold(&called, Box::new(ready), Box::new(fill), stopped);
+                    drop(closed.send(Heard::Closed(next)));
                 }));
-                open = Some(Open { _stop: stop, name });
+                open = Some(Open {
+                    _stop: stop,
+                    name,
+                    rate: None,
+                });
             }
         }
     };

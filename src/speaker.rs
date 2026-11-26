@@ -4,13 +4,18 @@
 use crate::mouth::{Fill, Outputs, Ready, Sink};
 use cpal::traits::{DeviceTrait as _, HostTrait as _, StreamTrait as _};
 use std::error::Error;
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::time::Duration;
 
 /// The system's outputs, by the names cpal gives them.
 pub struct Speaker;
 
 impl Sink for Speaker {
     fn hold(&self, name: &str, ready: Ready, mut fill: Fill, stop: Receiver<()>) {
+        // a stream cpal paused (its device gone, its configuration invalidated by a rate change
+        // or a Bluetooth profile's) ends the hold; a glitch or a refused real-time promotion
+        // plays on
+        let (failing, failed) = mpsc::channel();
         let opened = || -> Result<_, Box<dyn Error>> {
             let device = (cpal::default_host().output_devices()?)
                 .find(|device| device.description().is_ok_and(|held| held.name() == name))
@@ -30,16 +35,27 @@ impl Sink for Speaker {
                         u64::try_from(latency).unwrap_or_default(),
                     );
                 },
-                drop,
+                move |error: cpal::Error| {
+                    if !matches!(
+                        error.kind(),
+                        cpal::ErrorKind::Xrun | cpal::ErrorKind::RealtimeDenied
+                    ) {
+                        failing.send(()).unwrap_or_default();
+                    }
+                },
                 None,
             )?;
             stream.play()?;
-            Ok(stream)
+            Ok((stream, rate))
         };
         match opened() {
-            Ok(stream) => {
-                ready(Ok(()));
-                stop.recv().unwrap_or_default();
+            Ok((stream, rate)) => {
+                ready(Ok(rate));
+                while matches!(
+                    stop.recv_timeout(Duration::from_millis(100)),
+                    Err(RecvTimeoutError::Timeout)
+                ) && failed.try_recv().is_err()
+                {}
                 drop(stream);
             }
             Err(cause) => ready(Err(cause.to_string())),

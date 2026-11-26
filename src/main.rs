@@ -124,6 +124,8 @@ struct Live {
     since: String,
     /// The socket, which the shutdown request connects to so `accept` wakes.
     sock: PathBuf,
+    /// How long a play's mouth may report nothing while it owes progress before it is ended.
+    stall: Duration,
     /// `ready`, `degraded` (the last write to the log or a segment failed) or `stopping`.
     state: &'static str,
     /// The sweep's queue: each batch of segments leaving the window and the archive they move
@@ -144,6 +146,8 @@ struct Play {
     given: u64,
     /// Its giver's connection key.
     giver: u64,
+    /// When its mouth last reported, or it opened: the stall rule's clock.
+    heard: Instant,
     /// Why it is hushed, once the mouth is told.
     hushed: Option<&'static str>,
     /// Its number.
@@ -284,12 +288,19 @@ impl Live {
         json!({"boot": self.boot, "ok": true, "pid": id(), "proto": PROTO, "since": self.since, "state": self.state, "version": VERSION})
     }
 
-    /// Tells `track`'s mouth to drop its open play for `reason`, once.
+    /// Tells `track`'s mouth to drop its open play for `reason`, the first hush's reason kept; one
+    /// given nothing, which the mouth has never heard of, ends at once.
     fn hush(&mut self, track: &str, reason: &'static str) {
-        if let Some(play) = (self.plays.get_mut(track)).filter(|play| play.hushed.is_none()) {
-            play.hushed = Some(reason);
-            let num = play.num;
-            self.tell(track, &json!({"hush": num}));
+        // every caller holds an open play: with none, a hush of play 0 is no one's
+        let (num, empty, hushed) = (self.plays.get_mut(track))
+            .map(|play| {
+                let hushed = *play.hushed.get_or_insert(reason);
+                (play.num, play.given == 0, hushed)
+            })
+            .unwrap_or_default();
+        self.tell(track, &json!({"hush": num}));
+        if empty {
+            self.finish(track, hushed);
         }
     }
 
@@ -298,6 +309,23 @@ impl Live {
     const fn mark<T>(&mut self, wrote: io::Result<T>) -> io::Result<T> {
         self.state = if wrote.is_ok() { "ready" } else { "degraded" };
         wrote
+    }
+
+    /// Ends `mouth` every play whose mouth owes progress (audio it holds untaken, or its play's
+    /// end after `end`) and has reported nothing for `$RIFT_STALL_MS`: an output failed or stuck
+    /// in place, its giver answered; the mouth is told to drop it.
+    fn stalled(&mut self) {
+        let stuck: Vec<String> = (self.plays.iter())
+            .filter(|&(_, play)| {
+                play.heard.elapsed() >= self.stall && (play.end || play.given > play.played())
+            })
+            .map(|(track, _)| track.clone())
+            .collect();
+        for track in stuck {
+            let num = self.plays.get(&track).map(|play| play.num);
+            self.tell(&track, &json!({"hush": num}));
+            self.finish(&track, "mouth");
+        }
     }
 
     /// Hands every closed segment that ended more than the window ago to the sweep's thread,
@@ -1005,6 +1033,7 @@ fn main() -> ExitCode {
                     seq: 0,
                     since: utc(SystemTime::now()),
                     sock: sock.clone(),
+                    stall: Duration::from_millis(setting("RIFT_STALL_MS", 5000)),
                     state: "ready",
                     sweeps,
                     tracks: BTreeMap::new(),
@@ -1043,7 +1072,9 @@ fn main() -> ExitCode {
                 drop(thread::spawn(move || -> ! {
                     loop {
                         thread::sleep(Duration::from_secs(1));
-                        lock(live).sweep();
+                        let mut guard = lock(live);
+                        guard.sweep();
+                        guard.stalled();
                     }
                 }));
                 // the pid file first: past the boot event only a failed append or rename refuses
@@ -1457,12 +1488,13 @@ fn main() -> ExitCode {
                             (true, Some("give")) if giving.is_some() && given.is_none() => {
                                 (Ok(error("bad_frame")), Next::Go)
                             }
+                            // only to a play neither ended nor hushed: a give after either is
+                            // refused, never counted or passed on
                             (true, Some("give"))
                                 if giving.as_ref().is_some_and(|held| {
-                                    guard
-                                        .plays
-                                        .get(&held.0)
-                                        .is_some_and(|play| play.num == held.1)
+                                    guard.plays.get(&held.0).is_some_and(|play| {
+                                        play.num == held.1 && !play.end && play.hushed.is_none()
+                                    })
                                 }) =>
                             {
                                 let (mouth, num) = giving.clone().unwrap_or_default();
@@ -1509,10 +1541,15 @@ fn main() -> ExitCode {
                                 }) =>
                             {
                                 let (mouth, num) = giving.clone().unwrap_or_default();
-                                if let Some(play) = guard.plays.get_mut(&mouth) {
+                                let empty = guard.plays.get_mut(&mouth).is_some_and(|play| {
                                     play.end = true;
-                                }
+                                    play.given == 0
+                                });
                                 guard.tell(&mouth, &json!({"end": num}));
+                                // given nothing, it has played all it was given
+                                if empty {
+                                    guard.finish(&mouth, "end");
+                                }
                                 (Ok(json!({"ok": true})), Next::Go)
                             }
                             (true, Some("hush")) if tracked && track.starts_with("mouth-") => {
@@ -1545,7 +1582,7 @@ fn main() -> ExitCode {
                                 let opened = if refused.is_empty() {
                                     guard.emit(&json!({"kind": "play", "play": num, "rate": rate, "track": track})).map(|_| {
                                         guard.numbered = num;
-                                        let _: Option<Play> = guard.plays.insert(track.to_owned(), Play { end: false, given: 0, giver: key, hushed: None, num, rate, run: None });
+                                        let _: Option<Play> = guard.plays.insert(track.to_owned(), Play { end: false, given: 0, giver: key, heard: Instant::now(), hushed: None, num, rate, run: None });
                                         giving = Some((track.to_owned(), num));
                                         json!({"ok": true, "play": num, "seq": guard.seq})
                                     })
@@ -1595,11 +1632,14 @@ fn main() -> ExitCode {
                                                     play.run.filter(|run| run.0 != from),
                                                     play.run.filter(|run| run.0 == from),
                                                 );
-                                                play.run = Some((
-                                                    from,
-                                                    field("samples"),
-                                                    kept.map_or(start, |run| run.2),
-                                                ));
+                                                (play.run, play.heard) = (
+                                                    Some((
+                                                        from,
+                                                        field("samples"),
+                                                        kept.map_or(start, |run| run.2),
+                                                    )),
+                                                    Instant::now(),
+                                                );
                                                 let played = play.num;
                                                 if let Some((first, samples, begun)) = past {
                                                     drop(state.emit(&json!({"from": first, "kind": "sound", "play": played, "samples": samples, "start": begun, "track": mouth})));
@@ -1945,6 +1985,9 @@ fn main() -> ExitCode {
             // since macOS keys a bare program's microphone grant by its path (observed
             // 2026-11-26 · tccd prompting anew for each `hotswap/rift/<version>/rift`)
             let fixed = home.join(".local/libexec/rift/rift");
+            // the mouth's: a copy of its own beside it, a path no setup older than the mouth
+            // writes, so a rollback leaves the mouth on a release that knows it
+            let mouthcopy = fixed.with_file_name("mouth");
             let (label, ear, mouth) = (
                 "dev.gigantic.rift",
                 "dev.gigantic.rift.ear",
@@ -1984,7 +2027,7 @@ fn main() -> ExitCode {
             };
             let path = home.join(format!("Library/LaunchAgents/{label}.plist"));
             let heard = path.with_file_name(format!("{ear}.plist"));
-            let voiced = path.with_file_name(format!("{mouth}.plist"));
+            let mouthfile = path.with_file_name(format!("{mouth}.plist"));
             let install = || -> io::Result<()> {
                 // a tool call past `$RIFT_SIGN_MS` is killed, since a keychain asking at the
                 // screen, or a launchctl that never answers, would hold setup forever
@@ -2033,11 +2076,11 @@ fn main() -> ExitCode {
                     "<dict><key>SuccessfulExit</key><false/></dict>",
                     "serve.err",
                 );
-                // a standing device's: the ear's, and the mouth's beside it, on the one fixed copy
+                // a standing device's: the ear's on its fixed copy, the mouth's on its own
                 let standing = |job: &str, kind: &str, flag: &str, mac: &str| {
                     sheet(
                         job,
-                        &fixed,
+                        if kind == "ear" { &fixed } else { &mouthcopy },
                         &format!(
                             "<string>device</string><string>{kind}</string><string>{mac}</string><string>{flag}</string>"
                         ),
@@ -2163,12 +2206,13 @@ fn main() -> ExitCode {
                         unload(&agent.1)?;
                         gone(&agent.0);
                     }
-                    for (job, file) in [(ear, &heard), (mouth, &voiced), (label, &path)] {
+                    for (job, file) in [(ear, &heard), (mouth, &mouthfile), (label, &path)] {
                         unload(job)?;
                         gone(file);
                     }
                     gone(&exe);
                     gone(&fixed);
+                    gone(&mouthcopy);
                     drop(fixed.parent().map(fs::remove_dir));
                     // files, never `security delete-keychain`, which might ask at the screen to
                     // unlock it; setup never puts it on the search list
@@ -2180,7 +2224,7 @@ fn main() -> ExitCode {
                 let swap =
                     loaded(label)? && fs::read_to_string(&path).is_ok_and(|held| held == plist);
                 let mac = named()?;
-                let (listened, spoken) = (
+                let (listened, mouthsheet) = (
                     standing(ear, "ear", "--mic", &mac),
                     standing(mouth, "mouth", "--speaker", &mac),
                 );
@@ -2311,22 +2355,29 @@ security import "$1/identity.p12" -k "$3" -P "$2" -T /usr/bin/codesign"#,
                     .inspect_err(|_| drop(fs::remove_file(&copy)))?;
                     println!("signed {} as {label} by {hash}", target.display());
                 }
-                // the signed release at the ear's fixed path, unless already there byte for byte;
-                // renamed over it, so a running ear keeps the file it mapped
-                if fs::read(&fixed).ok() != Some(fs::read(&target)?) {
-                    let staged = fixed.with_added_extension("new");
-                    fixed.parent().map_or(Ok(()), fs::create_dir_all)?;
-                    let _: u64 = fs::copy(&target, &staged)?;
-                    fs::rename(&staged, &fixed)?;
-                    println!("installed {} as {}", target.display(), fixed.display());
-                }
-                path.parent().map_or(Ok(()), fs::create_dir_all)?;
-                for (file, text) in [(&path, &plist), (&heard, &listened), (&voiced, &spoken)] {
+                // the signed release at a fixed path, unless already there byte for byte; renamed
+                // over it, so a running device keeps the file it mapped
+                let place = |at: &Path| -> io::Result<()> {
+                    if fs::read(at).ok() != Some(fs::read(&target)?) {
+                        let staged = at.with_added_extension("new");
+                        at.parent().map_or(Ok(()), fs::create_dir_all)?;
+                        let _: u64 = fs::copy(&target, &staged)?;
+                        fs::rename(&staged, at)?;
+                        println!("installed {} as {}", target.display(), at.display());
+                    }
+                    Ok(())
+                };
+                let write = |file: &Path, text: &str| -> io::Result<()> {
                     let staged = file.with_extension("plist.new");
                     fs::write(&staged, text)?;
                     fs::rename(&staged, file)?;
                     println!("wrote {}", file.display());
-                }
+                    Ok(())
+                };
+                place(&fixed)?;
+                path.parent().map_or(Ok(()), fs::create_dir_all)?;
+                write(&path, &plist)?;
+                write(&heard, &listened)?;
                 // the health of a daemon answering ready on the socket, if one does
                 let serving = || -> Option<Value> {
                     let mut stream = UnixStream::connect(&sock).ok()?;
@@ -2397,9 +2448,8 @@ security import "$1/identity.p12" -k "$3" -P "$2" -T /usr/bin/codesign"#,
                 up(label, &path, "serve.err", swap && !signed, &|health| {
                     Some(&health["pid"]) != before.as_ref()
                 })?;
-                // the ear and the mouth only once the daemon is up: whatever fails there leaves it
-                // serving, each tried whatever the other's outcome. One disabled in launchd is
-                // written, never loaded: the way to opt out
+                // the ear, then the mouth, only once the daemon is up: whatever fails there leaves
+                // it serving. One disabled in launchd is written, never loaded: the way to opt out
                 let disabled =
                     String::from_utf8_lossy(&call(&["print-disabled", &gui])?.stdout).into_owned();
                 let stand = |job: &str, kind: &str, file: &Path| -> io::Result<()> {
@@ -2427,16 +2477,21 @@ security import "$1/identity.p12" -k "$3" -P "$2" -T /usr/bin/codesign"#,
                     }
                     up(job, file, &format!("{kind}.err"), false, &listed)
                 };
-                let failed: Vec<String> =
-                    [stand(ear, "ear", &heard), stand(mouth, "mouth", &voiced)]
-                        .into_iter()
-                        .filter_map(|stood| stood.err().map(|cause| cause.to_string()))
-                        .collect();
-                if failed.is_empty() {
-                    Ok(())
-                } else {
-                    Err(io::Error::other(failed.join("\nrift setup: ")))
-                }
+                stand(ear, "ear", &heard)?;
+                // the mouth's copy and plist written only now, the daemon and the ear good; from
+                // here a failure boots it out and takes both away, so a failed setup, and the
+                // older setup a rollback runs after it, find nothing of the mouth
+                (|| {
+                    place(&mouthcopy)?;
+                    write(&mouthfile, &mouthsheet)?;
+                    stand(mouth, "mouth", &mouthfile)
+                })()
+                .or_else(|cause| {
+                    unload(mouth)?;
+                    gone(&mouthfile);
+                    gone(&mouthcopy);
+                    Err(cause)
+                })
             };
             install().map_or_else(
                 |cause| {

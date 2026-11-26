@@ -2374,6 +2374,8 @@ mod tests {
         // play 4: a mouth that never answers a hush is cut after 1 s
         let mut fourth = greet(&root)?;
         drop(say(&mut fourth, play)?);
+        drop(say(&mut fourth, &zeros(1))?);
+        drop(next(&mut desk)?);
         let begun = Instant::now();
         let cut: Value = serde_json::from_str(&say(&mut probe, hush)?)?;
         same(
@@ -2396,6 +2398,7 @@ mod tests {
         let (gone, _) = device(&root, mouth_line, 0)?;
         let mut fifth = greet(&root)?;
         drop(say(&mut fifth, play)?);
+        drop(say(&mut fifth, &zeros(1))?);
         same(&say(&mut fifth, r#"{"op":"end"}"#)?, r#"{"ok":true}"#)?;
         drop(fifth);
         same(
@@ -2584,12 +2587,15 @@ mod tests {
                 .replace(&exe, &fixed)
         };
         // the standing mouth's, beside it on the same copy
+        // the standing mouth's, on a copy of its own beside the ear's
+        let mouthcopy = format!("{home}/.local/libexec/rift/mouth");
         let mouthed = |data: &str| {
             ear(data)
                 .replace("rift.ear</string>\n", "rift.mouth</string>\n")
                 .replace("<string>ear</string>", "<string>mouth</string>")
                 .replace("--mic", "--speaker")
                 .replace("ear.err", "mouth.err")
+                .replace(&fixed, &mouthcopy)
         };
         let standing = |data: &str| format!("{}{}", ear(data), mouthed(data));
         // scutil's stub: the name, or with `fail-scutil` none set
@@ -2765,10 +2771,18 @@ esac
         let earjob = format!("{gui}/dev.gigantic.rift.ear");
         let mouthfile = format!("{agents}/dev.gigantic.rift.mouth.plist");
         let mouthjob = format!("{gui}/dev.gigantic.rift.mouth");
-        let wrote = format!("wrote {file}\nwrote {earfile}\nwrote {mouthfile}\n");
-        let (muted, heard) = (
+        // the mouth's plist is written only as it is loaded, the daemon and the ear good, its
+        // copy placed first when it is not the release's (`placing` the first time)
+        let wrote = format!("wrote {file}\nwrote {earfile}\n");
+        let (earboot, mouthboot) = (
+            format!("launchctl bootstrap {gui} {earfile}\n"),
+            format!("wrote {mouthfile}\nlaunchctl bootstrap {gui} {mouthfile}\n"),
+        );
+        let placing = format!("installed {release} as {mouthcopy}\n");
+        let (muted, heard, placed) = (
             format!("launchctl bootout {earjob}\nlaunchctl bootout {mouthjob}\n"),
-            format!("launchctl bootstrap {gui} {earfile}\nlaunchctl bootstrap {gui} {mouthfile}\n"),
+            format!("{earboot}{mouthboot}"),
+            format!("{earboot}{placing}{mouthboot}"),
         );
         let absent = |agent: &str| format!("print {agent}\nprint {agent}\n");
         let off = |agent: &str| format!("print {agent}\nbootout {agent}\n{}", absent(agent));
@@ -2777,8 +2791,8 @@ esac
         };
         let unheard = format!("{}{}", absent(&earjob), absent(&mouthjob));
         let deafen = format!("{}{}", off(&earjob), off(&mouthjob));
-        let spoke = on(&mouthjob, &mouthfile);
-        let hear = format!("print-disabled {gui}\n{}{spoke}", on(&earjob, &earfile));
+        let mouthon = on(&mouthjob, &mouthfile);
+        let hear = format!("print-disabled {gui}\n{}{mouthon}", on(&earjob, &earfile));
         let calls = || -> Result<String, Box<dyn Error>> {
             let log = fs::read_to_string(format!("{root}/launchctl.log"))?;
             fs::remove_file(format!("{root}/launchctl.log"))?;
@@ -2826,7 +2840,7 @@ esac
         same(
             &first,
             &format!(
-                "0\nlaunchctl bootout {former}\nmoved {old} to {data}\nremoved {earlier}\n{linked}{}{installed}{wrote}launchctl bootstrap {gui} {file}\n{heard}print {job}\nprint {former}\nbootout {former}\nprint {former}\nprint {former}\n{tended}{unheard}print {job}\nprint {job}\nbootstrap {gui} {file}\nroot 0700\n{hear}{fresh}",
+                "0\nlaunchctl bootout {former}\nmoved {old} to {data}\nremoved {earlier}\n{linked}{}{installed}{wrote}launchctl bootstrap {gui} {file}\n{placed}print {job}\nprint {former}\nbootout {former}\nprint {former}\nprint {former}\n{tended}{unheard}print {job}\nprint {job}\nbootstrap {gui} {file}\nroot 0700\n{hear}{fresh}",
                 made(&data, &id(&data)?)
             ),
         )?;
@@ -2908,15 +2922,11 @@ esac
             &format!("{layout}/current/rift"),
         )?;
         // a kickstart launchd refuses to spawn: loaded afresh past $RIFT_RELOAD_MS, then ready;
-        // an ear (`deaf`) and a mouth (`mute`) that never connect loaded afresh too, each tried
-        // whatever the other's outcome, then both named, the daemon serving on
-        for marker in ["deaf", "mute", "refuse"] {
+        // an ear that never connects (`deaf`) loaded afresh too, then named, the daemon serving
+        // on and the mouth not touched
+        for marker in ["deaf", "refuse"] {
             fs::write(format!("{root}/{marker}"), "")?;
         }
-        let (earboot, mouthboot) = (
-            format!("launchctl bootstrap {gui} {earfile}\n"),
-            format!("launchctl bootstrap {gui} {mouthfile}\n"),
-        );
         same(
             &format!(
                 "{}{}{}",
@@ -2929,15 +2939,34 @@ esac
                 signs()?
             ),
             &format!(
-                "1\n{linked}{wrote}{muted}launchctl kickstart -k {job}\ndev.gigantic.rift not ready 0 ms after its load; loading it again\nlaunchctl bootout {job}\nlaunchctl bootstrap {gui} {file}\n{earboot}dev.gigantic.rift.ear not ready 0 ms after its load; loading it again\n{earboot}{mouthboot}dev.gigantic.rift.mouth not ready 0 ms after its load; loading it again\n{mouthboot}rift setup: dev.gigantic.rift.ear not ready 3000 ms after its load; see {data}/ear.err\nrift setup: dev.gigantic.rift.mouth not ready 3000 ms after its load; see {data}/mouth.err\nprint {job}\n{tended}{deafen}kickstart -k {job}\nprint {job}\nbootout {job}\nprint {job}\nprint {job}\nbootstrap {gui} {file}\nroot 0700\nprint-disabled {gui}\n{0}{0}{1}{1}{steady}",
+                "1\n{linked}{wrote}{muted}launchctl kickstart -k {job}\ndev.gigantic.rift not ready 0 ms after its load; loading it again\nlaunchctl bootout {job}\nlaunchctl bootstrap {gui} {file}\n{earboot}dev.gigantic.rift.ear not ready 0 ms after its load; loading it again\n{earboot}rift setup: dev.gigantic.rift.ear not ready 3000 ms after its load; see {data}/ear.err\nprint {job}\n{tended}{deafen}kickstart -k {job}\nprint {job}\nbootout {job}\nprint {job}\nprint {job}\nbootstrap {gui} {file}\nroot 0700\nprint-disabled {gui}\n{0}{0}{steady}",
                 on(&earjob, &earfile),
-                spoke
             ),
         )?;
         same(&health()?["state"].to_string(), "\"ready\"")?;
-        for marker in ["deaf", "mute", "refuse"] {
+        for marker in ["deaf", "refuse"] {
             fs::remove_file(format!("{root}/{marker}"))?;
         }
+        // a mouth that never connects (`mute`), loaded afresh, then booted out and its plist and
+        // copy taken away before setup fails: nothing of the mouth is left
+        fs::write(format!("{root}/mute"), "")?;
+        same(
+            &format!(
+                "{}{}{}",
+                run(&stubbed, &[("RIFT_READY_MS", "1000")], &[])?,
+                calls()?,
+                signs()?
+            ),
+            &format!(
+                "1\n{linked}{wrote}launchctl kickstart -k {job}\n{heard}dev.gigantic.rift.mouth not ready 15000 ms after its load; loading it again\nlaunchctl bootstrap {gui} {mouthfile}\nremoved {mouthfile}\nremoved {mouthcopy}\nrift setup: dev.gigantic.rift.mouth not ready 1000 ms after its load; see {data}/mouth.err\nprint {job}\n{tended}{unheard}kickstart -k {job}\n{hear}{mouthon}{0}{steady}",
+                absent(&mouthjob)
+            ),
+        )?;
+        fs::remove_file(format!("{root}/mute"))?;
+        same(
+            &format!("{} {}", fs::exists(&mouthfile)?, fs::exists(&mouthcopy)?),
+            "false false",
+        )?;
         // the swap: setup through the link, its kickstart, then the smoke against the new daemon
         same(
             &format!(
@@ -2955,7 +2984,9 @@ esac
                 signs()?
             ),
             &format!(
-                "0\nrift 1: green, 2 smoke probes\nprint {job}\n{tended}{unheard}kickstart -k {job}\n{hear}{steady}"
+                "0\nrift 1: green, 2 smoke probes\nprint {job}\n{tended}{}{}kickstart -k {job}\n{hear}{steady}",
+                off(&earjob),
+                absent(&mouthjob)
             ),
         )?;
         same(
@@ -2984,7 +3015,7 @@ esac
                 fs::exists(format!("{root}/locked"))?
             ),
             &format!(
-                "0\n{linked}signed {release} as dev.gigantic.rift by {hash}\n{installed}{wrote}{muted}launchctl bootout {job}\nlaunchctl bootstrap {gui} {file}\n{earboot}ear-test-mac is held by another device; dev.gigantic.rift.ear takes it over once it leaves\n{mouthboot}print {job}\n{tended}{deafen}print {job}\nbootout {job}\nprint {job}\nprint {job}\nbootstrap {gui} {file}\nroot 0700\nprint-disabled {gui}\nbootstrap {gui} {earfile}\nroot 0700\n{spoke}{steady}codesign -f {release}.new\n false"
+                "0\n{linked}signed {release} as dev.gigantic.rift by {hash}\n{installed}{wrote}{muted}launchctl bootout {job}\nlaunchctl bootstrap {gui} {file}\n{earboot}ear-test-mac is held by another device; dev.gigantic.rift.ear takes it over once it leaves\n{placing}{mouthboot}print {job}\n{tended}{deafen}print {job}\nbootout {job}\nprint {job}\nprint {job}\nbootstrap {gui} {file}\nroot 0700\nprint-disabled {gui}\nbootstrap {gui} {earfile}\nroot 0700\n{mouthon}{steady}codesign -f {release}.new\n false"
             ),
         )?;
         let recopied = copied()?;
@@ -3135,7 +3166,7 @@ esac
         same(
             &moving,
             &format!(
-                "0\n{linked}{}{wrote}{muted}launchctl bootout {job}\nlaunchctl bootstrap {gui} {file}\ndev.gigantic.rift.ear is disabled, so written and not loaded; launchctl enable {earjob} stands it\ndev.gigantic.rift.mouth is disabled, so written and not loaded; launchctl enable {mouthjob} stands it\nprint {job}\n{tended}{deafen}print {job}\nbootout {job}\nprint {job}\nprint {job}\nbootstrap {gui} {file}\nroot 0700\nprint-disabled {gui}\n{fresh}",
+                "0\n{linked}{}{wrote}{muted}launchctl bootout {job}\nlaunchctl bootstrap {gui} {file}\ndev.gigantic.rift.ear is disabled, so written and not loaded; launchctl enable {earjob} stands it\nwrote {mouthfile}\ndev.gigantic.rift.mouth is disabled, so written and not loaded; launchctl enable {mouthjob} stands it\nprint {job}\n{tended}{deafen}print {job}\nbootout {job}\nprint {job}\nprint {job}\nbootstrap {gui} {file}\nroot 0700\nprint-disabled {gui}\n{fresh}",
                 made(&moved, &id(&moved)?)
             ),
         )?;
@@ -3202,7 +3233,7 @@ esac
         same(
             &format!("{}{}{}", rerun(&["--remove"], &[])?, calls()?, signs()?),
             &format!(
-                "0\nremoved {earlier}\nlaunchctl bootout {earjob}\nremoved {earfile}\nlaunchctl bootout {mouthjob}\nremoved {mouthfile}\nlaunchctl bootout {job}\nremoved {file}\nremoved {exe}\nremoved {fixed}\nremoved {moved}/rift.keychain-db\nremoved {moved}/rift.keychain-pass\nprint {gui}/dev.gigantic.rift.upgrade\nprint {former}\nprint {former}\n{deafen}print {job}\nbootout {job}\nprint {job}\nprint {job}\n"
+                "0\nremoved {earlier}\nlaunchctl bootout {earjob}\nremoved {earfile}\nlaunchctl bootout {mouthjob}\nremoved {mouthfile}\nlaunchctl bootout {job}\nremoved {file}\nremoved {exe}\nremoved {fixed}\nremoved {mouthcopy}\nremoved {moved}/rift.keychain-db\nremoved {moved}/rift.keychain-pass\nprint {gui}/dev.gigantic.rift.upgrade\nprint {former}\nprint {former}\n{deafen}print {job}\nbootout {job}\nprint {job}\nprint {job}\n"
             ),
         )?;
         same(
@@ -3425,11 +3456,11 @@ esac
         )?;
         // a second device pinned to an input not yet there
         let mut spare = spawn(&["device", "ear", "spare", "--mic", "Spare Mic"])?;
-        let (mut spoken, mut said) = (
+        let (mut mouthcopy, mut said) = (
             BufReader::new(spare.0.stderr.take().ok_or("stderr")?),
             String::new(),
         );
-        let _: usize = spoken.read_line(&mut said)?;
+        let _: usize = mouthcopy.read_line(&mut said)?;
         same(
             &said,
             "rift device: waiting for \"Spare Mic\"; the inputs present: Desk Mic, Hall Mic\n",
@@ -3521,7 +3552,7 @@ esac
             ),
         )?;
         same(
-            &stop(spare, spoken, "INT")?,
+            &stop(spare, mouthcopy, "INT")?,
             "Some(0) rift device: stopped by SIGINT\n",
         )?;
         let (mut again, _) = serve(&root, &[("RIFT_DRAIN_MS", "200")])?;
@@ -3683,6 +3714,62 @@ esac
             )?;
         }
         Ok(())
+    }
+
+    /// An output that takes nothing (`take` 0) while the mouth holds a play: past
+    /// `$RIFT_STALL_MS` with no report the daemon ends it `mouth`, its giver, its reply withheld,
+    /// answered; the mouth told to drop it, its output taking no sample of it after.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn stuck() -> Outcome {
+        let root = temp("stuck")?;
+        let fake = format!("{root}/fake");
+        fs::create_dir_all(format!("{fake}/outputs"))?;
+        fs::write(format!("{fake}/outputs/Desk"), "48000 1 0")?;
+        fs::write(format!("{fake}/default"), "Desk\n")?;
+        fs::write(format!("{fake}/take"), "0")?;
+        let (mut daemon, _) = serve(&root, &[("RIFT_STALL_MS", "300")])?;
+        let mut mouth = Daemon(
+            Command::new(env!("CARGO_BIN_EXE_rift"))
+                .env("RIFT_ROOT", &root)
+                .env("RIFT_SPEAKER", &fake)
+                .env("RIFT_POLL_MS", "100")
+                .args(["device", "mouth", "desk", "--speaker"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()?,
+        );
+        until(|| {
+            let mut conn = greet(&root).map_err(|cause| io::Error::other(cause.to_string()))?;
+            Ok(say(&mut conn, r#"{"op":"health"}"#)?.contains("mouth-desk"))
+        })?;
+        let (_, stalled) = joined(giver(&root, "mouth-desk", 16_000, tone(16_000, 1.0)))?;
+        same(
+            &format!(
+                "{} {} {}",
+                stalled["reason"], stalled["played"], stalled["given"]
+            ),
+            r#""mouth" 0 8192"#,
+        )?;
+        fs::remove_file(format!("{fake}/take"))?;
+        until(|| {
+            Ok(fs::read_to_string(format!("{fake}/log"))
+                .is_ok_and(|log| log.contains("close Desk")))
+        })?;
+        same(
+            &taken(&fake, "Desk")
+                .iter()
+                .all(|&sample| sample == 0)
+                .to_string(),
+            "true",
+        )?;
+        same(&signal(&mouth, "TERM")?, "")?;
+        same(&format!("{:?}", mouth.0.wait()?.code()), "Some(0)")?;
+        same(
+            &say(&mut greet(&root)?, r#"{"op":"shutdown"}"#)?,
+            r#"{"ok":true}"#,
+        )?;
+        same(&format!("{:?}", daemon.0.wait()?.code()), "Some(0)")
     }
 
     /// `seconds` of a 1 kHz tone at half scale, 16-bit samples at `rate`.
@@ -3924,6 +4011,28 @@ esac
             ),
             "true true",
         )?;
+        // a play given nothing ends at once, at its `end` or its hush, the mouth never told of it
+        same(
+            &rift(&root, &[], &["play", "mouth-desk", "16000", "/dev/null"])?
+                .contains(r#""dropped":0,"given":0,"play":"#)
+                .to_string(),
+            "true",
+        )?;
+        let mut empty = greet(&root)?;
+        drop(say(
+            &mut empty,
+            r#"{"op":"play","rate":16000,"track":"mouth-desk"}"#,
+        )?);
+        let quelled = rift(&root, &[], &["hush", "mouth-desk"])?;
+        same(
+            &format!(
+                "{} {}",
+                quelled.contains(r#""given":0,"ok":true"#)
+                    && quelled.contains(r#""reason":"hush""#),
+                next(&mut empty)?.contains(r#""reason":"hush""#)
+            ),
+            "true true",
+        )?;
         let lasting: Vec<u8> = (tone(16_000, 5.0).iter())
             .flat_map(|sample| sample.to_le_bytes())
             .collect();
@@ -3951,39 +4060,70 @@ esac
                 .last()
                 .is_some_and(|line| line.contains(r#""reason":"left""#)))
         })?;
-        // a hush once Hall has taken 100 ms (4410 samples at 44.1 kHz) and no more: the last
-        // position read is 4409 × 16000 / 44100 = 1599.6, so 1600 of the play's samples played
+        // a hush once Hall has taken 100 ms (4410 samples at 44.1 kHz) and no more, of a play of
+        // one level so its first sample taken shows: `played` is the given samples the output's
+        // last position taken reached, its count from the fake's own record; the give after the
+        // hush is refused and never counts; freed, the output takes only silence
         until(closed)?;
         let all = || {
             taken(&fake, "Desk")
                 .len()
                 .saturating_add(taken(&fake, "Hall").len())
         };
-        let budget = all().saturating_add(4410);
+        let (budget, before) = (all().saturating_add(4410), taken(&fake, "Hall").len());
         fs::write(format!("{fake}/take"), budget.to_string())?;
-        let hushing = giver(&root, "mouth-desk", 16_000, tone(16_000, 1.0));
+        let hushing = giver(&root, "mouth-desk", 16_000, vec![8192i16; 16_000]);
         until(|| Ok(all() == budget))?;
         let hushed: Value = serde_json::from_str(
             rift(&root, &[], &["hush", "mouth-desk"])?
                 .trim_start_matches("0\n")
                 .trim_end(),
         )?;
+        fs::remove_file(format!("{fake}/take"))?;
         let (_, last) = joined(hushing)?;
-        let kept = hushed["given"]
-            .as_u64()
-            .unwrap_or_default()
-            .saturating_sub(1600);
+        let held = taken(&fake, "Hall");
+        let window = held
+            .get(before..before.saturating_add(4410))
+            .unwrap_or_default();
+        let lead = window
+            .iter()
+            .position(|&sample| sample != 0)
+            .unwrap_or_default();
+        // the positions the mouth read, stepped as it steps them
+        #[expect(
+            clippy::as_conversions,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "the interpolator's positions, as the mouth steps them"
+        )]
+        let reached = ((1..4410usize.saturating_sub(lead))
+            .fold(0.0f64, |at, _| at + 16_000.0f64 / 44_100.0f64)
+            .floor() as u64)
+            .saturating_add(1);
         same(
             &format!(
-                "{} {} {}",
-                hushed["played"],
+                "{} {} {} {}",
+                hushed["played"] == reached,
                 hushed["reason"],
-                hushed["dropped"] == kept
+                last["given"],
+                hushed["dropped"]
+                    == last["given"]
+                        .as_u64()
+                        .unwrap_or_default()
+                        .saturating_sub(reached)
             ),
-            r#"1600 "hush" true"#,
+            r#"true "hush" 8192 true"#,
         )?;
-        same(&last["played"].to_string(), "1600")?;
-        fs::remove_file(format!("{fake}/take"))?;
+        until(closed)?;
+        same(
+            &taken(&fake, "Hall")
+                .get(before.saturating_add(4410)..)
+                .unwrap_or_default()
+                .iter()
+                .all(|&sample| sample == 0)
+                .to_string(),
+            "true",
+        )?;
         same(&contiguous()?.to_string(), "true")?;
         // a giver that stalls: the mouth runs dry, its runs split, its track holes
         until(closed)?;
@@ -4056,6 +4196,22 @@ esac
         fs::write(format!("{fake}/default"), "Desk\n")?;
         let (_, waited) = joined(waiting)?;
         same(&waited["reason"].to_string(), r#""end""#)?;
+        // an output failing mid-play while it stays listed: said, closed, its open refused while
+        // it fails, then reopened, the play playing on to its end, every sample counted
+        until(closed)?;
+        let opened = taken(&fake, "Desk").len();
+        let failing = giver(&root, "mouth-desk", 16_000, tone(16_000, 1.0));
+        until(|| Ok(taken(&fake, "Desk").len() >= opened.saturating_add(4800)))?;
+        fs::write(format!("{fake}/outputs/Desk"), "fail")?;
+        said(r#""Desk" failed; opening it again"#)?;
+        said(r#""Desk": refused"#)?;
+        fs::write(format!("{fake}/outputs/Desk"), "48000 2 5")?;
+        let (_, recovered) = joined(failing)?;
+        same(
+            &format!("{} {}", recovered["played"], recovered["reason"]),
+            r#"16000 "end""#,
+        )?;
+        same(&contiguous()?.to_string(), "true")?;
         // it closes once its linger is out; how long that takes is the machine's to stretch
         until(closed)?;
         // the ears closed: it plays, and sends no frames
