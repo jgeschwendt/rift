@@ -28,18 +28,32 @@ pub type Ready = Box<dyn FnOnce(Result<(u32, u16), String>) + Send>;
 /// Where an open input's interleaved buffers go, called from its own thread.
 pub type Sound = Box<dyn FnMut(&[f32]) + Send>;
 
+/// The inputs as one listing found them.
+#[derive(Default)]
+pub struct Inputs {
+    /// The built-in input's name, if the Mac has one.
+    pub built: Option<String>,
+    /// The default input's name, if there is one.
+    pub default: Option<String>,
+    /// Every input's name.
+    pub names: Vec<String>,
+    /// Whether the default input is Bluetooth (or Bluetooth LE).
+    pub wireless: bool,
+}
+
 /// Where the microphones come from: the system's (`mic.rs`), else the suite's `Fake`.
 pub trait Source: Sync {
     /// Opens the input `name` and says so on `ready`, then hands each buffer to `sound` until
     /// `stop` is dropped, and closes it.
     fn hold(&self, name: &str, ready: Ready, sound: Sound, stop: Receiver<()>);
-    /// The default input's name, if there is one, and every input's.
-    fn inputs(&self) -> (Option<String>, Vec<String>);
+    /// The inputs now.
+    fn inputs(&self) -> Inputs;
 }
 
 /// The suite's microphones under `$RIFT_MIC`: `default` names the default input; each file under
-/// `inputs/` is an input, holding `<rate> <channels> <level> <swing>` (channel 0 the level plus and
-/// minus the swing at alternate samples, every other channel full scale), `block` (an open that
+/// `inputs/` is an input, holding `<rate> <channels> <level> <swing> [bluetooth | builtin]` (channel
+/// 0 the level plus and minus the swing at alternate samples, every other channel full scale; the
+/// last word its transport), `block` (an open that
 /// waits, as for a grant's prompt, until the file says otherwise) or `fail`; `log` gets an `ask`
 /// line per open asked for, then an `open` and a `close` line per open that returned; `slow`, the
 /// milliseconds a listing takes. An input whose file goes is unlisted and falls silent.
@@ -103,7 +117,7 @@ impl Source for Fake {
         drop(append(&log, format!("close {name}\n").as_bytes()));
     }
 
-    fn inputs(&self) -> (Option<String>, Vec<String>) {
+    fn inputs(&self) -> Inputs {
         let slow = fs::read_to_string(self.0.join("slow")).unwrap_or_default();
         thread::sleep(Duration::from_millis(
             slow.trim().parse().unwrap_or_default(),
@@ -115,8 +129,27 @@ impl Source for Fake {
             .filter_map(|entry| entry.file_name().into_string().ok())
             .collect();
         names.sort();
-        let default = fs::read_to_string(self.0.join("default")).ok();
-        (default.map(|held| held.trim().to_owned()), names)
+        let default = fs::read_to_string(self.0.join("default"))
+            .ok()
+            .map(|held| held.trim().to_owned());
+        let transport = |name: &String| {
+            let spec = fs::read_to_string(self.0.join("inputs").join(name)).unwrap_or_default();
+            spec.split_whitespace()
+                .nth(4)
+                .unwrap_or_default()
+                .to_owned()
+        };
+        Inputs {
+            built: names
+                .iter()
+                .find(|name| transport(name) == "builtin")
+                .cloned(),
+            wireless: default
+                .as_ref()
+                .is_some_and(|name| transport(name) == "bluetooth"),
+            default,
+            names,
+        }
     }
 }
 
@@ -196,8 +229,8 @@ impl From<u32> for Convert {
 /// What the device hears, on one channel: the inputs, a line from the daemon (`None` at its end),
 /// and each open's outcome and buffers, tagged with its number.
 enum Heard {
-    /// The default input's name, if there is one, and every input's.
-    Inputs((Option<String>, Vec<String>)),
+    /// A listing of the inputs.
+    Inputs(Inputs),
     /// A line from the daemon, its ping answered already.
     Line(Option<Value>),
     /// An open returned.
@@ -274,13 +307,40 @@ pub fn run(reader: BufReader<UnixStream>, reply: &Value, pinned: Option<&str>) {
                     lines.send(Heard::Line(line))
                 })
         }));
+        // the input to hear and, when the Bluetooth rule decided it, why: the pinned one, else
+        // the default, but for a Bluetooth default the built-in, since a headset's microphone open
+        // puts it in call mode
+        let pick = |listed: &Inputs| match (
+            pinned,
+            listed.wireless,
+            listed.built.as_ref(),
+            listed.default.as_ref(),
+        ) {
+            (Some(name), ..) => (Some(name.to_owned()), None),
+            (None, true, Some(built), Some(blue)) => (
+                Some(built.clone()),
+                Some(format!(
+                    "{blue:?} is Bluetooth, which an open microphone puts in call mode; hearing {built:?} instead"
+                )),
+            ),
+            (None, true, None, Some(blue)) => (
+                Some(blue.clone()),
+                Some(format!(
+                    "{blue:?} is Bluetooth and this Mac has no built-in input; hearing it, in call mode while the ears are on"
+                )),
+            ),
+            (None, _, _, default) => (default.cloned(), None),
+        };
         let mut inputs = source.inputs();
-        let wanted = pinned.map(str::to_owned).or_else(|| inputs.0.clone());
-        if !wanted.as_ref().is_some_and(|name| inputs.1.contains(name)) {
+        let wanted = pick(&inputs).0;
+        if !wanted
+            .as_ref()
+            .is_some_and(|name| inputs.names.contains(name))
+        {
             eprintln!(
                 "rift device: waiting for {}; the inputs present: {}",
                 wanted.map_or_else(|| "a default input".to_owned(), |name| format!("{name:?}")),
-                inputs.1.join(", ")
+                inputs.names.join(", ")
             );
         }
         let listing = heard.clone();
@@ -291,13 +351,14 @@ pub fn run(reader: BufReader<UnixStream>, reply: &Value, pinned: Option<&str>) {
             })
             .try_for_each(|listed| listing.send(Heard::Inputs(listed)))
         }));
-        let (mut ears, mut failed, mut number, mut open, mut retry, mut said) = (
+        let (mut ears, mut failed, mut number, mut open, mut retry, mut said, mut told) = (
             false,
             0u32,
             0u64,
             None::<Open>,
             None::<Instant>,
             BTreeSet::new(),
+            None::<String>,
         );
         loop {
             // a line to say once, and whether the open failed
@@ -403,8 +464,15 @@ pub fn run(reader: BufReader<UnixStream>, reply: &Value, pinned: Option<&str>) {
                     );
                 }
             }
-            let want = (pinned.map(str::to_owned).or_else(|| inputs.0.clone()))
-                .filter(|name| ears && inputs.1.contains(name));
+            // the rule's reason said once each time it changes
+            let (chosen, why) = pick(&inputs);
+            if why != told {
+                if let Some(line) = why.as_ref() {
+                    eprintln!("rift device: {line}");
+                }
+                told = why;
+            }
+            let want = chosen.filter(|name| ears && inputs.names.contains(name));
             if open
                 .as_ref()
                 .is_some_and(|held| Some(&held.name) != want.as_ref())

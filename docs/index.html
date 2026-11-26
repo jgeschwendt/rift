@@ -218,7 +218,13 @@
     <li><strong>Which input.</strong> Alone, <code class="code">--mic</code> follows the system's
       default input, listed every <code class="code">$RIFT_POLL_MS</code>; a change closes the
       microphone and opens the new default. With a name it holds that input, matched exactly, and
-      never follows the default. An input not present (the named one, or no default at all) is one
+      never follows the default. A Bluetooth default (CoreAudio's transport type, Bluetooth or
+      Bluetooth LE) is not opened: opening a headset's microphone puts it in call mode, degrading
+      all it plays while the ears are on, so the unpinned ear hears the Mac's built-in input
+      instead, its segments naming it, and the rule is applied again at every change of the
+      default, with the usual hole and new name; a Mac with no built-in input hears the Bluetooth
+      default rather than nothing. Each such choice is one stderr line, said when it starts. A
+      pinned name is opened whatever its transport. An input not present (the named one, or no default at all) is one
       stderr line listing the inputs present, then a wait: it opens when the input appears, and
       closes when it goes, or falls silent a poll long and opens afresh. Two devices, each pinned, record two
       microphones on two tracks at once.</li>
@@ -259,7 +265,7 @@
       local host name (<code class="code">scutil --get LocalHostName</code>, set in Sharing and never
       renamed by a network) lowercased, so its track, <code class="code">ear-&lt;host&gt;</code>, is
       the Mac's for good; renaming the Mac starts a new track at the next setup. It follows the
-      default input, holds no microphone while the ears are off, and shows among the devices of
+      default input by the rule above, holds no microphone while the ears are off, and shows among the devices of
       <code class="code">rift status</code>.</li>
   </ul>
 </section>
@@ -449,7 +455,7 @@ mise run dist                           # a checkout: this host's release archiv
         <tr><td class="table-mono">rift listen &lt;track&gt;</td><td>prints each frame placed on the track, live</td></tr>
         <tr><td class="table-mono">rift read &lt;track&gt; &lt;from us&gt; &lt;to us&gt;</td><td>prints the range's frames, silence where nothing is held</td></tr>
         <tr><td class="table-mono">rift device ear|mouth &lt;name&gt; &lt;file.pcm&gt; [--fast]</td><td>a device, its own process: plays a raw PCM file (16 kHz, mono, 16-bit little-endian) as the track's frames, a short tail dropped, answering every ping, paced in real time and stamped from now, a pause or clock step of over 100 ms playing on from the clock as a hole, or with <code class="code">--fast</code> sent as fast as each is answered and stamped as if captured ending now; prints its reply, then each notice and refusal; exit 0 once every frame is answered, <code class="code">{"code":"unknown","ok":false}</code> and exit 1 if the connection ends first; an unreadable file is <code class="code">rift device: &lt;cause&gt;</code>, exit 1</td></tr>
-        <tr><td class="table-mono">rift device ear &lt;name&gt; --mic [&lt;microphone&gt;]</td><td>a device, its own process, macOS only: hears the default input, or the one named, while the ears are open (<a href="#microphone">the microphone</a>); prints its reply, then each notice and refusal; when the connection ends (<code class="code">{"code":"unknown","ok":false}</code>) or the daemon is down, it waits a poll and connects again; SIGTERM, SIGINT or SIGHUP, its only exit: <code class="code">rift device: stopped by SIG&lt;name&gt;</code>, exit 0; a withheld grant or a failed open is one stderr line, and it keeps trying; on Linux exit 2</td></tr>
+        <tr><td class="table-mono">rift device ear &lt;name&gt; --mic [&lt;microphone&gt;]</td><td>a device, its own process, macOS only: hears the default input (the built-in in place of a Bluetooth one, when there is one), or the one named, whatever its transport, while the ears are open (<a href="#microphone">the microphone</a>); prints its reply, then each notice and refusal; when the connection ends (<code class="code">{"code":"unknown","ok":false}</code>) or the daemon is down, it waits a poll and connects again; SIGTERM, SIGINT or SIGHUP, its only exit: <code class="code">rift device: stopped by SIG&lt;name&gt;</code>, exit 0; a withheld grant or a failed open is one stderr line, and it keeps trying; on Linux exit 2</td></tr>
         <tr><td class="table-mono">rift setup [--print | --remove]</td><td>brings the release into hotswap's layout and links <code class="code">~/.local/bin/rift</code> (with none installed, the latest, through packslip), signs the release with <a href="#identity">rift's identity</a>, then writes both agents' plists on that link, boots the ear's out, loads the daemon's, or swaps it with one <code class="code">kickstart -k</code> (a bootout then a bootstrap when it re-signed the release), and waits for the new daemon to answer health ready, then loads the ear's and waits for that daemon to list <code class="code">ear-&lt;host&gt;</code>, loading either afresh once when not ready past <code class="code">$RIFT_RELOAD_MS</code>; the ear's failure is <code class="code">rift setup: &lt;line naming dev.gigantic.rift.ear&gt;</code>, exit 1, the daemon left serving; <code class="code">--print</code> prints both plists, <code class="code">--remove</code> has hotswap forget the layout and the upgrade agent, unloads both agents and removes their plists, the link, the keychain and its password</td></tr>
         <tr><td class="table-mono">rift upgrade [--check | --back | --retry]</td><td>hotswap's swap onto a newer release: installed beside the running one, <code class="code">current</code> moved, <code class="code">rift setup</code>, then the smoke (<code class="code">rift version</code>, <code class="code">rift status</code> until the daemon answers with it); a failure rolls back. Exit 0 green or settled, 1 red, 2 unable to try</td></tr>
         <tr><td class="table-mono">rift version</td><td>the build, as the hello reports it</td></tr>

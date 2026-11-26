@@ -3,6 +3,8 @@
 
 // the binary's dependencies, unused by the suite
 #[cfg(target_os = "macos")]
+use coreaudio as _;
+#[cfg(target_os = "macos")]
 use cpal as _;
 use hotswap as _;
 use signal_hook as _;
@@ -2665,7 +2667,9 @@ esac
     /// open and exact zeros are each said once and the device kept: the waited open returns when
     /// granted, the others are retried, a poll doubled per failure, until heard. A device outlives
     /// its daemon: it finds it down, waits, and connects again once it is back; SIGTERM, SIGINT
-    /// and SIGHUP each end one at once, exit 0, one stderr line, the daemon down or not.
+    /// and SIGHUP each end one at once, exit 0, one stderr line, the daemon down or not. A
+    /// Bluetooth default is followed only while there is no built-in input, then left for the
+    /// built-in, each reason said once; a device pinned to it hears it.
     #[cfg(target_os = "macos")]
     #[test]
     fn mic() -> Outcome {
@@ -2959,25 +2963,56 @@ esac
             &waiting,
             "rift device: waiting for a default input; the inputs present: Broken, Desk Mic, Hall Mic, Silent, Stuck\n",
         )?;
+        // a Bluetooth default: followed while the Mac has no built-in input, then, once it has,
+        // left for the built-in, a hole opening its segments; a device pinned to it still hears it
+        let recorded = |track: &str, mic: &str| -> io::Result<bool> {
+            Ok(stream(track).is_ok_and(|held| held.iter().any(|event| event["mic"] == mic)))
+        };
+        fs::write(format!("{fake}/inputs/Headset"), "16000 1 0.5 0 bluetooth")?;
+        fs::write(format!("{fake}/default"), "Headset\n")?;
+        until(|| Ok(recorded("ear-desk", "Headset")? && recorded("ear-lost", "Headset")?))?;
+        fs::write(
+            format!("{fake}/inputs/Built-in Mic"),
+            "16000 1 0.25 0 builtin",
+        )?;
+        let mut phone = spawn(&["device", "ear", "phone", "--mic", "Headset"])?;
+        until(|| {
+            Ok(recorded("ear-desk", "Built-in Mic")?
+                && recorded("ear-lost", "Built-in Mic")?
+                && recorded("ear-phone", "Headset")?)
+        })?;
+        same(
+            &stream("ear-lost")?
+                .iter()
+                .find(|event| event["mic"] == "Built-in Mic")
+                .map_or(Value::Null, |event| event["kind"].clone())
+                .to_string(),
+            "\"hole\"",
+        )?;
         same(
             &say(&mut greet(&root)?, r#"{"op":"shutdown"}"#)?,
             r#"{"ok":true}"#,
         )?;
         // the devices wait on with the daemon down, until a stop signal ends each, so their runs
-        // count toward coverage; nothing said twice
+        // count toward coverage; nothing said twice, the rule's reasons once each
         same(&format!("{:?}", again.0.wait()?.code()), "Some(0)")?;
-        let errs = BufReader::new(desk.0.stderr.take().ok_or("stderr")?);
-        for (device, rest, name) in iter::once((desk, errs, "TERM"))
-            .chain(iter::once((lost, astray, "HUP")))
-            .chain(
-                failing
-                    .into_iter()
-                    .map(|(device, rest)| (device, rest, "TERM")),
-            )
-        {
+        let ruled = "rift device: \"Headset\" is Bluetooth and this Mac has no built-in input; hearing it, in call mode while the ears are on\nrift device: \"Headset\" is Bluetooth, which an open microphone puts in call mode; hearing \"Built-in Mic\" instead\n";
+        let mut errs = [&mut desk, &mut phone]
+            .map(|device| device.0.stderr.take().map(BufReader::new))
+            .into_iter();
+        let ending = [
+            (desk, errs.next().flatten().ok_or("stderr")?, ruled, "TERM"),
+            (lost, astray, ruled, "HUP"),
+            (phone, errs.next().flatten().ok_or("stderr")?, "", "TERM"),
+        ];
+        for (device, rest, told, name) in ending.into_iter().chain(
+            failing
+                .into_iter()
+                .map(|(device, rest)| (device, rest, "", "TERM")),
+        ) {
             same(
                 &stop(device, rest, name)?,
-                &format!("Some(0) rift device: stopped by SIG{name}\n"),
+                &format!("Some(0) {told}rift device: stopped by SIG{name}\n"),
             )?;
         }
         Ok(())

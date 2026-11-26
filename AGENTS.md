@@ -25,8 +25,8 @@ its lines open a real microphone, which no test may, so it holds those lines and
 | --- | --- |
 | `.github/workflows/release.yaml` | a GitHub Release per merge to main, `YYYY.M.N`, `aarch64-apple-darwin` and `x86_64-unknown-linux-gnu`, signed by packslip |
 | `src/main.rs` | the binary: `serve`, the clients `status`, `quiet`, `ears`, `keep`, `feed`, `listen`, `read`, the file-fed `device`, then `setup` (its signing included), `upgrade`, `version` |
-| `src/ear.rs` | macOS: `device ear <name> --mic`, its loop, the 16 kHz converter, and `Fake`, the suite's microphones under `$RIFT_MIC` |
-| `src/mic.rs` | macOS: the cpal lines alone, exempt from coverage |
+| `src/ear.rs` | macOS: `device ear <name> --mic`, its loop, the Bluetooth rule (`pick`), the 16 kHz converter, and `Fake`, the suite's microphones under `$RIFT_MIC` |
+| `src/mic.rs` | macOS: the cpal lines and coreaudio-rs's transport and built-in lookups alone, exempt from coverage |
 | `build.rs` | the build identity: `$RIFT_VERSION` (the release workflow's), else the crate version; then the short commit, `-dirty` over uncommitted work, `unknown` outside git; on macOS the Info.plist linked in |
 | `tests/rift.rs` | the end-to-end suite: the built binary over temp roots via `RIFT_ROOT`, stub `launchctl`, `curl`, `security`, `openssl`, `codesign` and `scutil` planted on `PATH` and a temp `HOME` (also `HOTSWAP_TEST_HOME`) hotswap's layout is laid out in, a copy of the build its release, for `setup` and `upgrade`; `$RIFT_MIC`'s fake inputs for `--mic`; a `Daemon` guard kills every process it holds, so one whose lines must count toward coverage ends by itself instead (a daemon by `shutdown`, a file-fed device with its daemon, a `--mic` one by a stop signal): a killed process writes no profile |
 | `docs/index.html` | the design page: what rift is today and what it will be |
@@ -58,7 +58,8 @@ beside the reply. `rift device`, as `docs/index.html#cli` has it, answers the re
 first frame, so the daemon never refuses it `unsynced`. With `--mic` (`src/ear.rs`) one channel
 carries everything the device hears, and the loop that drains it never calls the system: the
 reader thread's lines (the reply first), each ping answered there under the writer's mutex before
-the line is passed on; the inputs, listed on a thread every poll; each open's outcome and buffers,
+the line is passed on; the inputs, listed on a thread every poll, each listing carrying whether the
+default is Bluetooth and the built-in's name, so the loop decides the rule from the listing alone; each open's outcome and buffers,
 tagged with the open's number so a closed open's are dropped, each buffer with the clock as the
 callback handed it over, which alone may rebase its frames. The stream (`hold`) is built, held
 and dropped on a thread of its own, closed by dropping its stop sender; an open abandoned while it
