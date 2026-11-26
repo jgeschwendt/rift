@@ -518,7 +518,8 @@
       <code class="code">{"ok":true,"seq":20,"through":1764000000600000}</code>, logs
       <code class="code">engine</code>; <code class="code">through</code>, a turn's and a words
       engine's, is the latest time a logged report of that kind on that track names, any boot,
-      or <code class="code">null</code>. The connection is then the engine's: its reports, each
+      or <code class="code">null</code>; an echo engine's carries <code class="code">ruled</code>
+      instead, where its ruling starts (below). The connection is then the engine's: its reports, each
       answered <code class="code">{"ok":true}</code> (with <code class="code">seq</code> when
       logged), any other op <code class="code">bad_request</code>. Its end, however it comes, logs
       <code class="code">engine</code> <code class="code">"on":false</code>.</li>
@@ -526,12 +527,15 @@
       kind and track held is refused <code class="code">taken</code>, as a device is.</li>
     <li><strong>No clock of its own.</strong> An engine is never pinged: every time it sends is one
       it read off what it was given, on the daemon's clock. A report naming a time past the end of
-      the last frame it was given, or starting before the latest time its kind of report names on
+      the last frame it was given (an engine still replaying: the frames of its replay so far, never
+      a live one it has not been sent), or starting before the latest time its kind of report names on
       that track (logged, any boot: a partial's the last final's end), is
       <code class="code">bad_request</code> and logs nothing. A mask's on or off alone may lie up to
-      1 s past what was heard, since a run's echo is known as it sounds, and no earlier than the
-      engine's ruling, which starts where the track's frames passed on reach (any boot) as it
-      connects, so no mask reaches a frame already passed on and none is unbounded.</li>
+      1 s past what was heard (before a frame has come, past where its ruling starts), since a
+      run's echo is known as it sounds, and no earlier than the engine's ruling, which starts where
+      the track's frames passed on reach (any boot) as it connects, or past the latest mask when
+      later, as its reply's <code class="code">ruled</code> says; so no mask reaches a frame already
+      passed on and none is unbounded.</li>
     <li><strong>What a turn or words engine reads.</strong> Its track's frames,
       <code class="code">{"pcm":"…","t":1764000000000000}</code> as a reader's, from
       <code class="code">from</code> (<code class="code">null</code>: where its frames reach as it
@@ -678,7 +682,7 @@
 ← {"ok":true,"seq":24}</pre>
   <p class="docs-note">An echo engine masking a play as it sounds, the tail heard out:</p>
   <pre class="tree">→ {"kind":"echo","name":"tail","op":"engine","track":"ear-desk"}
-← {"ok":true,"seq":19}
+← {"ok":true,"ruled":1764000004980000,"seq":19}
 ← {"pcm":"…","t":1764000005000000}
 ← {"play":6,"rate":24000,"track":"mouth-desk"}
 ← {"from":0,"play":6,"samples":480,"start":1764000005019000,"track":"mouth-desk"}

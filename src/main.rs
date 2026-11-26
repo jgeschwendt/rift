@@ -86,6 +86,8 @@ static STOP: OnceLock<String> = OnceLock::new();
 struct Engine {
     /// Where the last frame it was given ends: a report naming a time past it is refused.
     given: u64,
+    /// Whether it reads live: a turn or words engine once its replay has caught up.
+    joined: bool,
     /// Its connection's key, for an echo engine dropped behind its ruling.
     key: u64,
     /// Its name.
@@ -548,8 +550,11 @@ impl Live {
             lines.push((at, masked(&held.spans, at, &pcm)));
         }
         for (at, line) in lines {
+            // a turn or words engine still replaying is given no live frame yet
             for kind in ["turn", "words"] {
-                if let Some(engine) = self.engines.get_mut(&(track.to_owned(), kind.to_owned())) {
+                if let Some(engine) = (self.engines.get_mut(&(track.to_owned(), kind.to_owned())))
+                    .filter(|engine| engine.joined)
+                {
                     engine.given = at.saturating_add(20_000);
                 }
             }
@@ -677,14 +682,16 @@ impl Live {
                 .map(|engine| (engine.given, engine.name.clone(), engine.on, engine.ruled))
                 .unwrap_or_default(),
         );
-        // a mask goes on or off at or after the ruling, as far as `FORESIGHT` past what was heard:
-        // the echo of a run is known as it sounds
-        let floor = latest.max(if matches!(op, "mask" | "ruled") {
-            ruled
+        // a mask goes on or off at or after the ruling, as far as `FORESIGHT` past what was heard
+        // or, before a frame has come, where the ruling starts: the echo of a run is known as it
+        // sounds, a play already open when the echo engine connected included
+        let echoes = matches!(op, "mask" | "ruled");
+        let floor = latest.max(if echoes { ruled } else { 0 });
+        let ceiling = if op == "mask" {
+            given.max(ruled).saturating_add(FORESIGHT)
         } else {
-            0
-        });
-        let ceiling = given.saturating_add(if op == "mask" { FORESIGHT } else { 0 });
+            given
+        };
         let timed = first
             .zip(last)
             .is_some_and(|(start, end)| floor <= start && start <= end && end <= ceiling);
@@ -1423,7 +1430,8 @@ fn main() -> ExitCode {
                             println!("{reply}");
                             drop(reader.get_ref().set_read_timeout(None));
                             let ms = words.get(5).and_then(|held| held.parse().ok());
-                            tail::run(reader, ms.unwrap_or(200u64).saturating_mul(1000));
+                            let tail_us = ms.unwrap_or(200u64).saturating_mul(1000);
+                            tail::run(reader, tail_us, reply["ruled"].as_u64().unwrap_or_default());
                             println!("{}", error("unknown"));
                             return ExitCode::FAILURE;
                         }
@@ -2028,6 +2036,10 @@ fn main() -> ExitCode {
                                         // words engine reading live starts there, an echo
                                         // engine's ruling too
                                         let reached = guard.reach(track);
+                                        // an echo engine's ruling: past the latest mask too
+                                        let ruling = (guard.latest)
+                                            .get(&(track.to_owned(), "mask".to_owned()))
+                                            .map_or(reached, |&mask| mask.max(reached));
                                         let mut reply = json!({"ok": true, "seq": guard.seq});
                                         if !request["id"].is_null() {
                                             reply["id"] = request["id"].clone();
@@ -2043,6 +2055,10 @@ fn main() -> ExitCode {
                                             reply["through"] = latest(kind)
                                                 .max(latest(&kind.replace("turn", "voice")))
                                                 .into();
+                                        }
+                                        // an echo engine's: where its ruling starts
+                                        if kind == "echo" {
+                                            reply["ruled"] = ruling.into();
                                         }
                                         // an echo engine reads its ear's frames as a listener
                                         // does, and every mouth's runs, from the plays open and
@@ -2067,22 +2083,23 @@ fn main() -> ExitCode {
                                             }));
                                         }
                                         let unread = Arc::new(AtomicUsize::new(0));
-                                        drop(guard.engines.insert(
-                                            slot.clone(),
-                                            Engine {
-                                                given: 0,
-                                                key,
-                                                name: name.to_owned(),
-                                                on: false,
-                                                ruled: reached,
-                                                unread: Arc::clone(&unread),
-                                            },
-                                        ));
                                         let from = request["from"].as_u64().unwrap_or(reached);
                                         let cursor = matches!(kind, "turn" | "words").then_some((
                                             from,
                                             from,
                                             (0, 0),
+                                        ));
+                                        drop(guard.engines.insert(
+                                            slot.clone(),
+                                            Engine {
+                                                given: 0,
+                                                joined: cursor.is_none(),
+                                                key,
+                                                name: name.to_owned(),
+                                                on: false,
+                                                ruled: ruling,
+                                                unread: Arc::clone(&unread),
+                                            },
                                         ));
                                         (queue, engaged) =
                                             (Some(sender.clone()), Some(slot.clone()));
@@ -2849,12 +2866,19 @@ fn main() -> ExitCode {
                                             let chunk =
                                                 locked.replay(live, &slot.0, slot.1 == "words", at);
                                             cursor = chunk.as_ref().map(|held| held.1);
+                                            // given what this chunk sends; caught up, what the
+                                            // live frames do from here
                                             if let Some((engine, onward)) =
                                                 (locked.engines.get_mut(&slot))
                                                     .filter(|held| held.key == key)
                                                     .zip(cursor)
                                             {
                                                 engine.given = onward.0;
+                                            }
+                                            if let Some(engine) = (locked.engines.get_mut(&slot))
+                                                .filter(|held| held.key == key && cursor.is_none())
+                                            {
+                                                engine.joined = true;
                                             }
                                             let topics = ["heard", "turn"]
                                                 .iter()

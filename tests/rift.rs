@@ -2770,6 +2770,12 @@ mod tests {
         let mut behind = greet(&root)?;
         drop(line_after(&mut behind, &from(streamed[0], "slow"))?);
         streamed.extend(self::placed(&mut slow, slow_base, 10..1500)?);
+        // still replaying, it has not been given the newest frame: a final naming it is refused
+        let newest = streamed.last().copied().unwrap_or_default() + 20_000;
+        self::send(
+            &mut behind,
+            &json!({"end": newest, "op": "words", "start": newest, "words": []}).to_string(),
+        )?;
         let caught: Vec<Value> = iter::repeat_with(|| line(&mut behind))
             .take(1500)
             .collect::<Result<_, _>>()?;
@@ -2782,6 +2788,7 @@ mod tests {
                 .to_string(),
             "true",
         )?;
+        same(&next(&mut behind)?, &code("bad_request"))?;
         drop((slow, behind));
         // a segment moved to the archive under a replay is read from there; one deleted ends it
         // `gone`, after the frames read before
@@ -3054,7 +3061,7 @@ mod tests {
                 .to_string()
         };
         let (mut echo, mut words) = (greet(&root)?, greet(&root)?);
-        same(&say(&mut echo, cancel)?, r#"{"ok":true,"seq":3}"#)?;
+        same(&say(&mut echo, cancel)?, r#"{"ok":true,"ruled":0,"seq":3}"#)?;
         drop(line_after(&mut words, &listen(Value::Null))?);
         let at = placed(&mut ear, base, 0..10)?;
         // nothing ruled: the words engine's next line is its probe's reply, refused, given nothing
@@ -3325,19 +3332,20 @@ mod tests {
                 .spawn()?,
         );
         let mut printed = BufReader::new(tail.0.stdout.take().ok_or("stdout")?);
-        same(&next(&mut printed)?, r#"{"ok":true,"seq":3}"#)?;
+        same(&next(&mut printed)?, r#"{"ok":true,"ruled":0,"seq":3}"#)?;
         // the suite as the ear, every frame up to a time sent once now is past it: none while
         // the play sounds, so what the tail decides rests on values alone
         let (mut ear, hi) = device(&root, r#"{"kind":"ear","name":"desk","op":"device"}"#, 0)?;
         let (base, mut sent) = (hi["ping"].as_u64().unwrap_or_default() - 1_000_000, 0u64);
-        let mut hear_to = |to: u64| -> Outcome {
-            until(|| Ok(now_us() > to))?;
-            let upto = (to - base).checked_div(20_000).unwrap_or_default();
-            drop(placed(&mut ear, base, sent..upto)?);
-            sent = sent.max(upto);
-            Ok(())
-        };
-        hear_to(now_us())?;
+        let hear_to =
+            |into: &mut BufReader<UnixStream>, from: u64, count: &mut u64, to: u64| -> Outcome {
+                until(|| Ok(now_us() > to))?;
+                let upto = (to - from).checked_div(20_000).unwrap_or_default();
+                drop(placed(into, from, *count..upto)?);
+                *count = (*count).max(upto);
+                Ok(())
+            };
+        hear_to(&mut ear, base, &mut sent, now_us())?;
         let mut words = greet(&root)?;
         drop(say(
             &mut words,
@@ -3361,7 +3369,7 @@ mod tests {
                         .unwrap_or_default(),
             );
         }
-        hear_to(stop + 400_000)?;
+        hear_to(&mut ear, base, &mut sent, stop + 400_000)?;
         until(|| Ok(kinds(&root, "mask", usize::MAX)?.lines().count() == 2))?;
         same(
             &json!(
@@ -3381,7 +3389,7 @@ mod tests {
             r#"{"op":"play","rate":16000,"track":"mouth-desk"}"#,
         )?);
         let opened = now_us();
-        hear_to(opened + 500_000)?;
+        hear_to(&mut ear, base, &mut sent, opened + 500_000)?;
         while line(&mut words)?["t"]
             .as_u64()
             .is_none_or(|at| at <= opened)
@@ -3393,6 +3401,86 @@ mod tests {
             "true",
         )?;
         drop((idle, words, ear));
+        // a second tail on another ear, joining mid-play from the ruling its reply gives: the
+        // rest of the play's frames reach that ear's words engine masked
+        let (mut other, other_hi) =
+            device(&root, r#"{"kind":"ear","name":"other","op":"device"}"#, 0)?;
+        let (other_base, mut other_sent) = (
+            other_hi["ping"].as_u64().unwrap_or_default() - 1_000_000,
+            0u64,
+        );
+        hear_to(&mut other, other_base, &mut other_sent, now_us())?;
+        let mut listening = greet(&root)?;
+        drop(say(
+            &mut listening,
+            r#"{"from":null,"kind":"words","name":"w","op":"engine","track":"ear-other"}"#,
+        )?);
+        let all = || taken(&fake, "Desk").len();
+        let budget = all() + 4800;
+        fs::write(format!("{fake}/take"), budget.to_string())?;
+        let playing = giver(&root, "mouth-desk", 16_000, tone(16_000, 1.0));
+        until(|| Ok(all() == budget))?;
+        let mut late = Daemon(
+            Command::new(env!("CARGO_BIN_EXE_rift"))
+                .env("RIFT_ROOT", &root)
+                .args(["engine", "run", "tail", "ear-other", "--tail-ms", "100"])
+                .stdout(Stdio::piped())
+                .spawn()?,
+        );
+        let mut late_printed = BufReader::new(late.0.stdout.take().ok_or("stdout")?);
+        drop(next(&mut late_printed)?);
+        fs::remove_file(format!("{fake}/take"))?;
+        let (_, ended) = joined(playing)?;
+        same(&ended["reason"].to_string(), r#""end""#)?;
+        let finish = events(&root)?
+            .iter()
+            .map(|event| &event["e"])
+            .filter(|event| event["kind"] == "sound" && event["play"] == ended["play"])
+            .map(|run| {
+                let at = |key: &str| run[key].as_u64().unwrap_or_default();
+                at("start")
+                    + (at("samples") * 1_000_000)
+                        .checked_div(16_000)
+                        .unwrap_or_default()
+            })
+            .max()
+            .unwrap_or_default();
+        hear_to(&mut other, other_base, &mut other_sent, finish + 400_000)?;
+        let masks = || -> io::Result<Vec<u64>> {
+            Ok(events(&root)
+                .map_err(|cause| io::Error::other(cause.to_string()))?
+                .iter()
+                .map(|event| &event["e"])
+                .filter(|event| event["kind"] == "mask" && event["track"] == "ear-other")
+                .filter_map(|event| event["start"].as_u64())
+                .collect())
+        };
+        until(|| Ok(masks()?.len() == 2))?;
+        let span = masks()?;
+        let mut under = Vec::new();
+        while let Ok(got) = line(&mut listening) {
+            let at = got["t"].as_u64().unwrap_or_default();
+            if at >= span[1] {
+                break;
+            }
+            if at >= span[0] && at + 20_000 <= span[1] {
+                under.push(
+                    got["masked"] == true
+                        && got["pcm"]
+                            .as_str()
+                            .is_some_and(|pcm| pcm.bytes().all(|digit| digit == b'0')),
+                );
+            }
+        }
+        same(
+            &format!(
+                "{} {}",
+                !under.is_empty(),
+                under.iter().all(|&masked| masked)
+            ),
+            "true true",
+        )?;
+        drop((other, listening));
         // the daemon gone, its connection ends
         same(
             &say(&mut greet(&root)?, r#"{"op":"shutdown"}"#)?,
@@ -3400,11 +3488,89 @@ mod tests {
         )?;
         same(&format!("{:?}", daemon.0.wait()?.code()), "Some(0)")?;
         same(
-            &format!("{} {:?}", next(&mut printed)?, tail.0.wait()?.code()),
-            r#"{"code":"unknown","ok":false} Some(1)"#,
+            &format!(
+                "{} {:?} {:?}",
+                next(&mut printed)?,
+                tail.0.wait()?.code(),
+                late.0.wait()?.code()
+            ),
+            r#"{"code":"unknown","ok":false} Some(1) Some(1)"#,
         )?;
         same(&signal(&mouth, "TERM")?, "")?;
         same(&format!("{:?}", mouth.0.wait()?.code()), "Some(0)")
+    }
+
+    /// `rift engine run tail` against a stand-in daemon that refuses its mask on: the ruling held
+    /// at the on until it is answered, never taken as on once refused, then on again at the next
+    /// run; the stand-in gone, `unknown`, exit 1.
+    #[test]
+    fn refused() -> Outcome {
+        let root = temp("refused")?;
+        fs::create_dir_all(format!("{root}/run"))?;
+        let listener = UnixListener::bind(format!("{root}/run/rift.sock"))?;
+        let mut tail = Daemon(
+            Command::new(env!("CARGO_BIN_EXE_rift"))
+                .env("RIFT_ROOT", &root)
+                .args(["engine", "run", "tail", "ear-x", "--tail-ms", "100"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()?,
+        );
+        let mut wire = BufReader::new(listener.accept()?.0);
+        let hello = format!(
+            r#"{{"boot":1,"ok":true,"pid":1,"proto":1,"since":"x","state":"ready","version":"{}"}}"#,
+            version()?
+        );
+        let mut told = Vec::new();
+        for answer in [hello.as_str(), r#"{"ok":true,"ruled":1000000,"seq":1}"#] {
+            drop(next(&mut wire)?);
+            send(&mut wire, answer)?;
+        }
+        let run = |samples: u16| {
+            json!({"from": 0u8, "play": 1u8, "samples": samples, "start": 1_100_000u32, "track": "mouth-x"})
+                .to_string()
+        };
+        let heard = |at: u32| json!({"pcm": "00", "t": at}).to_string();
+        // each batch answered by one report
+        for lines in [
+            vec![
+                r#"{"play":1,"rate":16000,"track":"mouth-x"}"#.to_owned(),
+                run(1600),
+            ],
+            vec![heard(1_200_000)],
+            vec![
+                code("bad_request"),
+                r#"{"ok":true}"#.to_owned(),
+                heard(1_500_000),
+            ],
+            vec![r#"{"ok":true}"#.to_owned(), run(3200)],
+        ] {
+            for line in lines {
+                send(&mut wire, &line)?;
+            }
+            told.push(next(&mut wire)?);
+        }
+        same(
+            &told.join("\n"),
+            r#"{"on":true,"op":"mask","start":1100000}
+{"op":"ruled","to":1100000}
+{"op":"ruled","to":1320000}
+{"on":true,"op":"mask","start":1320000}"#,
+        )?;
+        drop((wire, listener));
+        let printed = BufReader::new(tail.0.stdout.take().ok_or("stdout")?);
+        same(
+            &format!(
+                "{} {:?}",
+                printed
+                    .lines()
+                    .map_while(Result::ok)
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                tail.0.wait()?.code()
+            ),
+            r#"{"ok":true,"ruled":1000000,"seq":1} {"code":"unknown","ok":false} Some(1)"#,
+        )
     }
 
     /// Says, the suite as the client, the speech engine, its play's giver and the mouth

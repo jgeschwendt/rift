@@ -7,7 +7,7 @@
 
 use crate::FORESIGHT;
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::os::unix::net::UnixStream;
 
@@ -17,23 +17,31 @@ use std::os::unix::net::UnixStream;
 /// 200 ms more covers a report held up that long. A busier machine leaks only past that.
 const GUARD: u64 = 200_000;
 
-/// Reads what the daemon tells `reader`'s engine until the connection ends, masking `tail`
-/// microseconds past each play's runs; the replies, which carry nothing it needs, pass unread.
+/// Reads what the daemon tells `reader`'s engine until the connection ends, from the ruling its
+/// reply gave, masking `tail` microseconds past each play's runs. Each reply answers the oldest
+/// report not yet answered: a mask on refused was never on, and the ruling waits at an on until
+/// it is answered.
 #[expect(
     clippy::single_call_fn,
     reason = "the engine's entry: main calls it once"
 )]
-pub fn run(mut reader: BufReader<UnixStream>, tail: u64) {
-    // where the last frame heard ends, the last mask's time, the ruling, the open mask's planned
-    // off, and each open play's rate
-    let (mut heard, mut masked, mut ruled) = (0u64, 0u64, 0u64);
+pub fn run(mut reader: BufReader<UnixStream>, tail: u64, from: u64) {
+    // where the last frame heard ends, the last mask's time, the ruling (all where the track's
+    // frames reach as it connects), the open mask's planned off, each open play's rate, and each
+    // report not yet answered, a mask on's by its start
+    let (mut heard, mut masked, mut ruled) = (from, from, from);
     let (mut planned, mut open) = (None::<u64>, BTreeMap::<u64, u64>::new());
+    let mut asked = VecDeque::<Option<u64>>::new();
     let mut line = String::new();
     while reader.read_line(&mut line).unwrap_or_default() > 0 {
         let told: Value = serde_json::from_str(&line).unwrap_or_default();
         line.clear();
         let at = |key: &str| told[key].as_u64().unwrap_or_default();
         let mut said = Vec::new();
+        if told.get("ok").is_some() && asked.pop_front().flatten().is_some() && told["ok"] == false
+        {
+            planned = None;
+        }
         if told["pcm"].is_string() {
             heard = at("t").saturating_add(20_000);
         }
@@ -60,13 +68,16 @@ pub fn run(mut reader: BufReader<UnixStream>, tail: u64) {
             said.push(json!({"on": false, "op": "mask", "start": masked}));
             planned = None;
         }
-        let to = planned.map_or_else(|| heard.saturating_sub(wait), |off| heard.min(off));
+        let to = planned
+            .map_or_else(|| heard.saturating_sub(wait), |off| heard.min(off))
+            .min(asked.iter().flatten().copied().min().unwrap_or(u64::MAX));
         if to > ruled {
             said.push(json!({"op": "ruled", "to": to}));
             ruled = to;
         }
         // a write the connection's end beat is no matter: the next read ends the loop
         for report in said {
+            asked.push_back(report["start"].as_u64().filter(|_| report["on"] == true));
             drop(writeln!(reader.get_mut(), "{report}"));
         }
     }
