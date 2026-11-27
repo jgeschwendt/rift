@@ -7,6 +7,8 @@ import Foundation
 public final class Fluid: Model {
   let diarizer: LSEENDDiarizer
   let speakers = DiarizerManager()
+  /// The stream's 16 kHz to 8 kHz front end, its state kept across frames.
+  var stream = Decimator()
 
   /// Loads `ls-eend/` and `speaker-diarization/` under `model` (engines/README.md); nothing is
   /// fetched. Then runs each once, so the first audio heard is not the one that pays for the load.
@@ -20,6 +22,9 @@ public final class Fluid: Model {
     // no segments kept and 10 s of predictions, so a stream of hours holds no more than that
     let timeline = DiarizerTimelineConfig(maxStoredFrames: 100, storeSegments: false)
     diarizer = try LSEENDDiarizer(model: eend, timelineConfig: timeline)
+    guard diarizer.targetSampleRate == 8_000 else {
+      throw Failure(reason: "LS-EEND wants \(diarizer.targetSampleRate ?? 0) Hz, not 8000")
+    }
     let embedding = dir.appending(path: "speaker-diarization")
     speakers.initialize(
       models: try DiarizerModels.load(
@@ -33,10 +38,13 @@ public final class Fluid: Model {
 
   public func start(_ voices: [(label: String, pcm: [Float])]) throws -> [Int: String] {
     diarizer.reset()
+    stream = Decimator()
     var slots: [Int: String] = [:]
     for voice in voices {
+      // the stream's front end, so a voice is enrolled from what the live audio becomes
+      var enrolment = Decimator()
       let held = try diarizer.enrollSpeaker(
-        withAudio: voice.pcm, sourceSampleRate: 16_000, named: voice.label,
+        withAudio: enrolment(voice.pcm), sourceSampleRate: nil, named: voice.label,
         overwritingAssignedSpeakerName: false)
       if let held { slots[held.index] = voice.label }
     }
@@ -44,7 +52,7 @@ public final class Fluid: Model {
   }
 
   public func feed(_ pcm: [Float]) throws -> [[Float]] {
-    let given = try diarizer.process(samples: pcm, sourceSampleRate: 16_000)
+    let given = try diarizer.process(samples: stream(pcm), sourceSampleRate: nil)
     let (probs, width) = (given?.chunkResult.finalizedPredictions ?? [], diarizer.numSpeakers ?? 1)
     return stride(from: 0, to: probs.count, by: width).map { Array(probs[$0..<$0 + width]) }
   }

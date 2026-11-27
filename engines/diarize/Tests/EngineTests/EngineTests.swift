@@ -289,6 +289,48 @@ func voiced() -> [[String: Any]] {
     #expect(spoken == ["diarize: a span named more than 16 talkers; the rest were left out"])
   }
 
+  @Test("a model giving more steps than fed, or trailing past 2 s, fails rather than pairs")
+  func paired() throws {
+    final class Over: Model {
+      let rows: Int
+      init(_ rows: Int) { self.rows = rows }
+      func start(_ voices: [(label: String, pcm: [Float])]) throws -> [Int: String] { [:] }
+      func feed(_ pcm: [Float]) throws -> [[Float]] { Array(repeating: [0.9], count: rows) }
+      func embed(_ pcm: [Float]) throws -> [Float] { [] }
+    }
+    var failed: [String] = []
+    for (model, frames) in [(Over(2), 5), (Over(0), 105)] {
+      let engine = try Talkers(model: model, voices: [], floor: nil)
+      do {
+        for at in 0..<frames { _ = try engine.frame(at * 20_000, [0], masked: false) }
+      } catch {
+        failed.append(error.localizedDescription)
+      }
+    }
+    #expect(failed == ["the model gave 2 steps with 0 fed", "the model gave 0 steps with 21 fed"])
+  }
+
+  @Test("16 kHz to 8 kHz the same however the input is cut; 1 kHz passed, 6 kHz stopped")
+  func decimated() {
+    let tone = { (hz: Double) in
+      (0..<16_000).map { Float(sin(2 * Double.pi * hz * Double($0) / 16_000)) }
+    }
+    let low = tone(1_000)
+    var whole = Decimator()
+    let once = whole(low)
+    for size in [1, 7, 320, 1_600] {
+      var cut = Decimator()
+      let pieces = stride(from: 0, to: 16_000, by: size).flatMap {
+        cut(Array(low[$0..<min(16_000, $0 + size)]))
+      }
+      #expect(pieces == once, "\(size)")
+    }
+    let power = { (pcm: [Float]) in pcm.dropFirst(100).map { $0 * $0 }.reduce(0, +) / 7_900 }
+    var high = Decimator()
+    #expect(once.count == 8_000 && abs(power(once) - 0.5) < 0.01)
+    #expect(power(high(tone(6_000))) < 1e-5)
+  }
+
   @Test("the wire's pieces: a label's form, hex samples, PCM, the socket, a flag")
   func pieces() {
     #expect(["a", "alpha-2", "x_y", String(repeating: "a", count: 64)].allSatisfy(labelled))

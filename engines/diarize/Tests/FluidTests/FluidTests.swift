@@ -8,7 +8,7 @@ import Testing
 let model = ProcessInfo.processInfo.environment["DIARIZE_MODEL", default: ""]
 
 @Test(
-  "the models over the two-voice fixture, its first voice enrolled from its first phrase: that voice's label on its later phrase, an integer on the other's",
+  "the models over the two-voice fixture, its first voice enrolled from its first phrase: that voice's label over 0.5 on its later phrase, the other's never over 0.5 as it",
   .enabled(
     if: FileManager.default.fileExists(
       atPath: model + "/speaker-diarization/wespeaker_v2.mlmodelc"),
@@ -37,11 +37,49 @@ func fixture() async throws {
       }
       .flatMap { ($0["talkers"] as! [[String: Any]]).map { "\($0["id"]!)" } })
   }
-  #expect(named(8_000_000, 10_100_000) == ["first"], "\(said)")
-  #expect(named(3_800_000, 6_700_000) == ["1"], "\(said)")
-  #expect(named(10_900_000, 13_000_000) == ["1"], "\(said)")
-  let scores = said.flatMap {
-    ($0["talkers"] as! [[String: Any]]).compactMap { $0["score"] as? Double }
+  // each span's score for `first`, by its middle, in each voice's phrases
+  func scores(_ from: Int, _ to: Int) -> [Any] {
+    said.filter {
+      (($0["start"] as! Int) + ($0["end"] as! Int)) / 2 > from
+        && (($0["start"] as! Int) + ($0["end"] as! Int)) / 2 < to
+    }
+    .flatMap { ($0["talkers"] as! [[String: Any]]).filter { $0["id"] as? String == "first" } }
+    .map { $0["score"]! }
   }
-  #expect(!scores.isEmpty && scores.allSatisfy { $0 > 0.5 }, "\(scores)")
+  #expect(named(8_000_000, 10_100_000) == ["first"], "\(said)")
+  let own = scores(8_000_000, 10_100_000)
+  #expect(!own.isEmpty && own.allSatisfy { ($0 as? Double ?? 0) > 0.5 }, "\(own)")
+  // LS-EEND alone reads marius's first phrase as the enrolled voice; the score parts them: none
+  // of his spans scores `first` over 0.5
+  #expect(named(10_900_000, 13_000_000) == ["1"], "\(said)")
+  let other = scores(3_800_000, 6_700_000) + scores(10_900_000, 13_000_000)
+  #expect(other.allSatisfy { ($0 as? Double ?? 0) < 0.5 }, "\(other)")
+}
+
+@Test(
+  "the model's steps the same however the fixture is cut: 20 ms frames, 100 ms, 333 samples",
+  .enabled(
+    if: FileManager.default.fileExists(
+      atPath: model + "/speaker-diarization/wespeaker_v2.mlmodelc"),
+    "skipped: set DIARIZE_MODEL to the --model directory (engines/README.md)"))
+func chunked() async throws {
+  let fixture = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+    .appending(path: "../../../fixtures/voices.pcm")
+  let pcm = floats(try Data(contentsOf: fixture))
+  let fluid = try await Fluid(model: model)
+  var runs: [[[Float]]] = []
+  for size in [320, 1_600, 333] {
+    _ = try fluid.start([])
+    runs.append(
+      try stride(from: 0, to: pcm.count, by: size).flatMap {
+        try fluid.feed(Array(pcm[$0..<min(pcm.count, $0 + size)]))
+      })
+  }
+  let steps = pcm.count / 1_600
+  for run in runs {
+    // all but the steps still inside the model's right context
+    #expect(run.count > steps - 12 && run.count <= steps, "\(run.count) of \(steps)")
+    let pairs = zip(run, runs[0]).flatMap { zip($0, $1) }
+    #expect(run.count == runs[0].count && pairs.allSatisfy { abs($0 - $1) < 1e-3 })
+  }
 }

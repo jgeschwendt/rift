@@ -38,9 +38,13 @@ each model held instead by one test over a fixture (`engines/fixtures/phrase.pcm
 `$TRANSCRIBE_MODEL`, scribe's `--model` in `$SCRIBE_MODEL`, diarize's in `$DIARIZE_MODEL`) and
 says `skipped` otherwise. diarize keeps its own copy of scribe's socket plumbing
 (`Sources/Engine/Wire.swift`): each Swift engine is a package of its own, its pin and gate apart.
-LS-EEND's features depend on how its audio is fed, so diarize feeds it each 20 ms frame as it
-comes: fed 100 ms at a time, the fixture's second voice read as the first throughout (observed
-2026-11-26). Swift 6.2.4 miscompiled the scribe
+FluidAudio resamples each call's audio with a fresh converter, so diarize brings 16 kHz to
+LS-EEND's 8 kHz itself (`Decimator`, its filter state kept across frames, enrolment through the
+same) and hands it on unresampled; its steps are then the same however the stream is cut
+(`chunked` in the model tests), and the 20 ms resample's edges, not LS-EEND, made the earlier
+chunk-size dependence (measured 2026-11-27 · 32.9 dB SNR per 20 ms against a whole-file
+resample, the decimator 42.0 dB, LS-EEND's slots alike over the whole-file and decimated
+fixture). Swift 6.2.4 miscompiled the scribe
 suite's closure-taking stderr helper, handing one call's closure to another, so its tests swap
 the writer by `listen()` instead (observed 2026-11-26). llvm-cov sums line coverage per function,
 so a closure written inline over several lines then `?` (`f(&mut |x| { … })?;`) leaves its `})?;`

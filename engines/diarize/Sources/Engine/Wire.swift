@@ -7,9 +7,11 @@ let ended = "the connection ended"
 
 /// A failure said and, on the engine's connection, waited out and connected again: its end, a
 /// refusal, a line that is no JSON object; or a command's failure, said and exit 1.
-struct Failure: LocalizedError {
+public struct Failure: LocalizedError {
   let reason: String
-  var errorDescription: String? { reason }
+  public var errorDescription: String? { reason }
+
+  public init(reason: String) { self.reason = reason }
 }
 
 /// Writes one stderr line, by `write(2)` so a closed stderr cannot stop the engine.

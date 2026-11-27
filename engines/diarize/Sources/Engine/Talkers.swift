@@ -18,6 +18,8 @@ let bar: Float = 0.5
 /// voice or a pause under 300 ms is smoothed away and a step settles this many steps after the
 /// model gives it.
 let radius = 2
+/// The most steps a model's output may trail what it was fed: 2 s, over LS-EEND's 0.9 s.
+let lag = 20
 /// Samples a second.
 let rate = 16_000
 /// The most samples one embedding reads: WeSpeaker's 10 s window.
@@ -29,7 +31,7 @@ public protocol Model {
   /// holds.
   func start(_ voices: [(label: String, pcm: [Float])]) throws -> [Int: String]
   /// The steps `pcm`, appended to the stream, completes: each 100 ms step's probability per slot,
-  /// in order, never revised; fed one 20 ms frame at a time.
+  /// in order, never revised, the same however the stream is cut; at most `lag` steps behind it.
   func feed(_ pcm: [Float]) throws -> [[Float]]
   /// The voice in 16 kHz samples `pcm` as an embedding.
   func embed(_ pcm: [Float]) throws -> [Float]
@@ -98,8 +100,8 @@ final class Talkers {
     self.floor = floor ?? 0
   }
 
-  /// The frame at `t` heard and fed as it comes (LS-EEND's features differ fed in larger pieces),
-  /// a step a hole ends short first filled with silence, and the spans that settles.
+  /// The frame at `t` heard and fed as it comes, a step a hole ends short first filled with
+  /// silence, and the spans that settles.
   func frame(_ t: Int, _ samples: [Float], masked: Bool) throws -> [[String: Any]] {
     kept.append((t, samples))
     kept.removeFirst(max(0, kept.count - keptFrames))
@@ -114,9 +116,15 @@ final class Talkers {
     return try said + push(samples + [Float](repeating: 0, count: max(0, 320 - samples.count)))
   }
 
-  /// A frame's `samples` fed, and what settles.
+  /// A frame's `samples` fed, and what settles; a model giving more steps than were fed, or
+  /// falling more than `lag` behind, fails the connection rather than pair a step with the wrong
+  /// frames.
   func push(_ samples: [Float]) throws -> [[String: Any]] {
-    for slots in try model.feed(samples).prefix(fed.count) {
+    let rows = try model.feed(samples)
+    guard rows.count <= fed.count, fed.count - rows.count <= lag else {
+      throw Failure(reason: "the model gave \(rows.count) steps with \(fed.count) fed")
+    }
+    for slots in rows {
       given.append((fed.removeFirst(), Set(slots.indices.filter { slots[$0] > bar })))
     }
     var said: [[String: Any]] = []
