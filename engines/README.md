@@ -47,6 +47,15 @@ closes every turn at 830 ms, and a bar of 0.9 still cuts 17 (observed 2026-11-26
 1.5 s of voice closes 512 ms later: `prove-engines` logs the fixture's turn 279 ms after its
 speech ends (1.66 s of voice), 770 ms with `--short-ms 2000` (observed 2026-11-26).
 
+`read-aloud` speaks all of a say's text that has come, up to its last sentence end, in one call to
+the model, which starts afresh per piece of at most 120 tokens (whole sentences; a longer one
+alone, its frames cut to what the 1024-step state leaves past the voice's 125). Inside a piece a
+sentence join is the voice's own pause, 240 to 480 ms; across pieces there is no gap (0 to 160 ms
+of quiet) but the intonation restarts. Moonshine heard two paragraphs as written at up to 118
+tokens a piece, repeated words at 167 and dropped a clause at 203; a 60-word sentence with 11
+commas, 97 tokens, ended itself at 208 of its 430-frame cap (measured 2026-11-27 · alba, seed as
+in `pocket.rs`, frames of 80 ms under 0.01 RMS counted as quiet).
+
 `transcribe` transcribes only where a turn engine on its track says there is speech: with no
 `voice` lines it transcribes nothing and holds no more than its 30 s buffer. It takes
 `--terms <file>` (lines `Term` or `Term: heard, heard`), a file of your own, never committed.

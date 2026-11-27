@@ -1,5 +1,5 @@
 //! Pocket TTS behind [`Voice`], through ptts on xn's CPU backend: the checkpoint without voice
-//! cloning, one preset voice's embedding prompted once at load and its state reused per clause.
+//! cloning, one preset voice's embedding prompted once at load and its state reused per piece.
 
 use std::fmt::{self, Debug, Display, Formatter};
 use std::io;
@@ -30,6 +30,11 @@ const WEIGHTS: &str = "tts_b6369a24.safetensors";
 const TEMPERATURE: f32 = 0.7;
 /// The flow model's sequence budget per piece: the voice's prompt, the text and its frames.
 const BUDGET: usize = 1024;
+/// Tokens per piece at most, whole sentences joined up to it, a longer sentence alone: each
+/// piece starts afresh, so its joins are the voice's own pauses. Moonshine heard two paragraphs
+/// as written up to 118 tokens a piece, then repeated words at 167 and dropped them at 203
+/// (observed 2026-11-27); ptts's default is 50.
+const PIECE: usize = 120;
 /// The audio decoder's context, the reference CLI's.
 const CONTEXT: usize = 250;
 
@@ -53,6 +58,8 @@ pub struct Pocket {
     model: TTSModel<Backend>,
     /// The noise.
     noise: Noise,
+    /// The budget the voice's prompt leaves a piece's text and frames.
+    room: usize,
     /// The flow model's state with the voice prompted.
     voiced: TTSState<Backend>,
     /// The tokenizer, for cutting long text.
@@ -68,7 +75,7 @@ impl Debug for Pocket {
 
 impl Pocket {
     /// Loads the checkpoint in `dir` with the preset `voice` (`embeddings/<voice>.safetensors`),
-    /// then speaks one short clause, so the first say pays no first-run stall.
+    /// then speaks one short sentence, so the first say pays no first-run stall.
     #[inline]
     pub fn load(dir: &Path, voice: &str) -> io::Result<Self> {
         let words = Words(Arc::new(
@@ -110,6 +117,7 @@ impl Pocket {
             latent: cfg.flow_lm.ldim,
             model,
             noise,
+            room: BUDGET.saturating_sub(dims.iter().rev().nth(1).copied().unwrap_or_default()),
             voiced,
             words,
         };
@@ -130,7 +138,7 @@ impl Voice for Pocket {
         text: &str,
         give: &mut dyn FnMut(&[f32]) -> io::Result<bool>,
     ) -> io::Result<()> {
-        for piece in split_into_best_sentences(&self.words, text, None).map_err(failed)? {
+        for piece in split_into_best_sentences(&self.words, text, Some(PIECE)).map_err(failed)? {
             let (prompt, after) = prepare_text_prompt(&piece);
             let tokens = self
                 .model
@@ -148,8 +156,10 @@ impl Voice for Pocket {
                 Tensor::from_vec(vec![f32::NAN; self.latent], (1, 1, self.latent), &xn::CPU)
                     .map_err(failed)?;
             let mut left: Option<usize> = None;
-            // the reference CLI's cap on frames per piece
-            for _ in 0..((tokens.len() as f64 / 3.0 + 2.0) * 12.5).ceil() as usize {
+            // the reference CLI's cap on frames per piece, inside what the budget has left: a
+            // sentence past it is one piece still, cut short rather than overflowing the state
+            let cap = ((tokens.len() as f64 / 3.0 + 2.0) * 12.5).ceil() as usize;
+            for _ in 0..cap.min(self.room.saturating_sub(tokens.len())) {
                 let (latent, ended) = self
                     .model
                     .generate_step(&mut state, &last, &mut self.noise)
@@ -233,11 +243,21 @@ fn rename(name: &str) -> Option<String> {
 mod tests {
     use std::io;
 
-    use super::{DIR, Pocket};
+    use ptts::tts_model::{prepare_text_prompt, split_into_best_sentences};
+
+    use super::{DIR, PIECE, Pocket, failed};
     use crate::speak::Voice as _;
 
-    /// The model speaks a clause at 24 kHz in 80 ms chunks, stopping when told. Skipped, saying
-    /// so, without the weights.
+    /// A sentence of 60 words and 11 commas.
+    const LONG: &str = "When the morning train finally pulled into the station, a little after \
+        seven, the platform was crowded with commuters, students carrying heavy backpacks, and a \
+        few tired travelers who had been waiting since midnight, so the conductor, who had seen \
+        this many times before, simply smiled, opened every door at once, and let the whole \
+        noisy crowd pour in together.";
+
+    /// The model speaks a long sentence whole at 24 kHz in 80 ms chunks, in one piece and ended
+    /// by the model before the frame cap, and stops when told. Skipped, saying so, without the
+    /// weights.
     #[test]
     fn speaks() -> io::Result<()> {
         let dir = link::hub(DIR[0], DIR[1]);
@@ -247,20 +267,29 @@ mod tests {
         }
         let mut pocket = Pocket::load(&dir, "alba")?;
         let mut chunks = Vec::new();
-        pocket.speak("Hello there, how are you?", &mut |chunk| {
+        pocket.speak(LONG, &mut |chunk| {
             chunks.push(chunk.len());
             Ok(true)
         })?;
+        let pieces = split_into_best_sentences(&pocket.words, LONG, Some(PIECE)).map_err(failed)?;
+        let tokens = (pocket.model.flow_lm.conditioner)
+            .tokenize(&prepare_text_prompt(LONG).0)
+            .map_err(failed)?
+            .len();
+        assert_eq!(pieces.len(), 1, "one piece");
+        assert!(
+            chunks.len() > 150
+                && chunks.len() < ((tokens as f64 / 3.0f64 + 2.0f64) * 12.5f64) as usize,
+            "over 12 s, ended before the cap: {} chunks, {tokens} tokens",
+            chunks.len()
+        );
         let mut stopped = 0u8;
         pocket.speak("Hello there, how are you?", &mut |_| {
             stopped = stopped.saturating_add(1);
             Ok(false)
         })?;
         assert_eq!(pocket.rate(), 24_000, "its rate");
-        assert!(
-            chunks.iter().all(|&len| len == 1920) && chunks.len() > 12,
-            "over a second, in 80 ms chunks"
-        );
+        assert!(chunks.iter().all(|&len| len == 1920), "in 80 ms chunks");
         assert_eq!(stopped, 1, "stopped at once");
         Ok(())
     }

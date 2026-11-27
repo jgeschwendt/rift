@@ -32,7 +32,10 @@ over `engines/fixtures/phrase.pcm` (Pocket TTS, `cargo run --release -p read-alo
 fixture`) that runs where its weights are (Moonshine's directory in `$TRANSCRIBE_MODEL`, scribe's
 `--model` in `$SCRIBE_MODEL`) and says `skipped` otherwise. Swift 6.2.4 miscompiled the scribe
 suite's closure-taking stderr helper, handing one call's closure to another, so its tests swap
-the writer by `listen()` instead (observed 2026-11-26).
+the writer by `listen()` instead (observed 2026-11-26). llvm-cov sums line coverage per function,
+so a closure written inline over several lines then `?` (`f(&mut |x| { … })?;`) leaves its `})?;`
+line missed in the summary though `--show-missing-lines` names none; bind the closure first
+(observed 2026-11-27 · read-aloud's `joins`).
 
 The gate runs in hk's pre-push (`hk install --mise` once per clone) and in CI. `Cargo.toml`'s
 `[lints]` tables are kept by hand, held by no gate; each `allow` carries its reason. Coverage

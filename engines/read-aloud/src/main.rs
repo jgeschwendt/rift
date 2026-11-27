@@ -1,7 +1,8 @@
 //! `read-aloud <track> [--voice <name>] [--pocket <dir>]`: rift's reference speech engine on the
-//! mouth `<track>`. Pocket TTS speaks each say clause by clause as its text comes, in the preset
-//! voice `--voice` (default alba), its 24 kHz audio given as it is made; `--pocket` defaults to
-//! the checkpoint's pinned snapshot in the Hugging Face cache (engines/README.md).
+//! mouth `<track>`. Pocket TTS speaks each say as its text comes, all that has come up to its
+//! last sentence end at once, in the preset voice `--voice` (default alba), its 24 kHz audio
+//! given as it is made; `--pocket` defaults to the checkpoint's pinned snapshot in the Hugging
+//! Face cache (engines/README.md).
 #![expect(
     unused_crate_dependencies,
     reason = "the library's, which the binary reaches through it"

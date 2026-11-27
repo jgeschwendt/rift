@@ -1,6 +1,6 @@
 [package]
 categories = ["multimedia::audio"]
-description = "rift's reference speech engine: Pocket TTS, clause by clause"
+description = "rift's reference speech engine: Pocket TTS, whole sentences at a time"
 edition.workspace = true
 keywords = ["rift", "tts", "speech"]
 license.workspace = true
