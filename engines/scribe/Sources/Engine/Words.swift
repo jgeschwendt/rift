@@ -6,6 +6,9 @@ let capSpan = 20_000_000
 let frameSpan = 20_000
 /// The frames kept: 30 s.
 let keptFrames = 1_500
+/// The µs the cap waits behind the newest frame: past a voice's close and its line, as
+/// transcribe's feed does.
+let lag = 300_000
 /// The µs of audio before a voice's start decoded with it.
 let preroll = 250_000
 /// Samples a second.
@@ -43,6 +46,9 @@ final class Words {
   var begin: Int?
   /// Whether a voice is on in the open span.
   var voice = false
+  /// Whether the open span was carried on from a final's end (a cap's, or a turn's under a
+  /// voice), not opened by a voice.
+  var carried = false
   /// Whether the cap was said.
   var capped = false
 
@@ -51,30 +57,37 @@ final class Words {
     (self.model, self.floor) = (model, floor ?? 0)
   }
 
-  /// The frame at `t` kept; a span past the cap with its voice still on, finished there by the
-  /// engine's own rule.
+  /// The frame at `t` kept; a span past the cap, `lag` behind it, with its voice still on,
+  /// finished there by the engine's own rule.
   func frame(_ t: Int, _ pcm: [Float]) async throws -> [[String: Any]] {
     kept.append((t, pcm))
     kept.removeFirst(max(0, kept.count - keptFrames))
-    guard voice, let begin, t + frameSpan - begin >= capSpan else { return [] }
+    let end = t + frameSpan - lag
+    guard voice, let begin, end - begin >= capSpan else { return [] }
     // said once: a voice that never ends is a stuck turn engine, not news each 20 s
     if !capped { say("scribe: a span reached 20 s and was finished there") }
     capped = true
-    return try await finish(begin, t + frameSpan)
+    return try await finish(begin, end)
   }
 
   /// A voice line: an on opens a span from `start` less the pre-roll unless one is open (a turn
-  /// held across voices); an off leaves the span open for its turn.
+  /// held across voices); an off leaves the span open for its turn, but closes a carried span
+  /// it ends at or before, which then holds none of that voice.
   func voiced(_ on: Bool, _ start: Int) {
+    if !on, carried, let begin, start <= begin { self.begin = nil }
     // a voice at or before the last final's end, a replay's, opens nothing
-    if on, begin == nil, start > floor { begin = max(floor, start - preroll) }
+    if on, begin == nil, start > floor { (begin, carried) = (max(floor, start - preroll), false) }
     voice = on && begin != nil
   }
 
   /// The final words of the open span to a turn's `end`, decoded once over its audio alone; a
-  /// turn ending at or before the span begins (a replay's, already finished) leaves it as it is.
+  /// turn ending at or before the span begins closes a carried span and leaves one a voice
+  /// opened (a replay's turn, already finished, under a later voice).
   func turn(_ end: Int) async throws -> [[String: Any]] {
-    guard let begin, end > begin else { return [] }
+    guard let begin, end > begin else {
+      begin = carried ? nil : begin
+      return []
+    }
     return try await finish(begin, end)
   }
 
@@ -89,7 +102,7 @@ final class Words {
       heard.append((pcm.count, t + low * 1_000_000 / rate))
       pcm += frame[low..<min(frame.count, index(end - t))]
     }
-    (floor, begin) = (end, voice ? end : nil)
+    (floor, begin, carried) = (end, voice ? end : nil, voice)
     let words = timed(try await model.decode(pcm), heard, start, end)
     return words.isEmpty ? [] : [["end": end, "op": "words", "start": start, "words": words]]
   }
@@ -157,10 +170,10 @@ public func retime(_ heard: [Heard], as text: String) -> [Heard] {
   return out
 }
 
-/// The terms in a vocabulary file's text: each line `Term` or `Term: heard, heard`, blank lines
-/// and `#` comments skipped.
+/// The terms in a vocabulary file's text: each line (any newline, CRLF included) `Term` or
+/// `Term: heard, heard`, blank lines and `#` comments skipped.
 public func vocabulary(_ text: String) -> [(term: String, heard: [String])] {
-  text.split(separator: "\n").compactMap { line in
+  text.split(whereSeparator: \.isNewline).compactMap { line in
     let parts = line.split(separator: ":", maxSplits: 1).map {
       $0.trimmingCharacters(in: .whitespaces)
     }

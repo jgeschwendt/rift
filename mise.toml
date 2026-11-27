@@ -75,7 +75,10 @@ description = "prove-engines with scribe as the words engine, macOS only; needs 
 run = [
   "cargo build",
   "cargo build --release --manifest-path engines/Cargo.toml",
-  "swift build -c release --disable-keychain --package-path engines/scribe",
+  "swift build -c release --disable-keychain --force-resolved-versions --package-path engines/scribe",
   "mkdir -p /tmp/rift-prove-scribe/bin && cp target/debug/rift engines/target/release/endpoint engines/target/release/read-aloud engines/scribe/.build/release/scribe /tmp/rift-prove-scribe/bin/",
   "PROVE_WORDS=scribe uv run --project engines/transcribe --locked python engines/prove.py /tmp/rift-prove-scribe/bin/rift /tmp/rift-prove-scribe/bin /tmp/rift-prove-scribe ${PROVE_FAST:+--fast}",
+  # again with a vocabulary, written here: no terms file is ever committed
+  "printf 'Phlogix\\n' > /tmp/rift-prove-scribe/terms.txt",
+  "PROVE_WORDS=scribe PROVE_TERMS=/tmp/rift-prove-scribe/terms.txt uv run --project engines/transcribe --locked python engines/prove.py /tmp/rift-prove-scribe/bin/rift /tmp/rift-prove-scribe/bin /tmp/rift-prove-scribe/terms ${PROVE_FAST:+--fast}",
 ]

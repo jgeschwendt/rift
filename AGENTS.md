@@ -14,7 +14,7 @@ mise run dist      # this host's release archive, the next YYYY.M.N stamped, to 
 mise run install   # a dev build to ~/.local/bin/rift-next, beside the release; setup never wires it
 mise run check-engines   # engines/: fmt, lints, each engine's protocol logic at 100 % against a stub model
 mise run prove-engines   # engines/: all three on a throwaway daemon, the fixture and a fake output; PROVE_FAST=1 under load
-mise run prove-scribe    # the same with scribe as the words engine; macOS, $SCRIBE_MODEL
+mise run prove-scribe    # the same with scribe for words, then with --terms over fixtures/term.pcm; macOS, $SCRIBE_MODEL
 ```
 
 The reference engines (`engines/`, a Cargo workspace, a uv project and a Swift package of their own; licences and

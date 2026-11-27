@@ -3,11 +3,16 @@ import Engine
 import Foundation
 import Parakeet
 
+// a closed stderr or socket is an error a write returns, never a signal that ends the engine
+signal(SIGPIPE, SIG_IGN)
+
 /// Each stop signal's source, held for the process's life: one stderr line, then exit 0.
 let stops = [(SIGHUP, "SIGHUP"), (SIGINT, "SIGINT"), (SIGTERM, "SIGTERM")].map { number, name in
   signal(number, SIG_IGN)
   // the main queue: this file's closures are the main actor's, checked where they run (a global
-  // queue's trapped, observed 2026-11-26), and the engine's work runs off it
+  // queue's trapped, observed 2026-11-26); it serves them only because `run` and `session`
+  // are nonisolated, so their blocking socket reads never hold the main thread (`session`
+  // asserts it)
   let source = DispatchSource.makeSignalSource(signal: number, queue: .main)
   source.setEventHandler {
     say("scribe: stopped by \(name)")

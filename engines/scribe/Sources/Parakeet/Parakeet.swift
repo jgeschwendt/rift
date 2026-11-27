@@ -12,8 +12,10 @@ public final class Parakeet: Model {
   /// it and the terms' file (engines/README.md); nothing is fetched. Then runs each once, so
   /// the first turn heard is not the one that pays for the load.
   public init(model: String, terms: String?) async throws {
-    // FluidAudio's own lines to the unified log alone, so stderr holds the engine's
+    // FluidAudio's own lines to the unified log alone, so stderr holds the engine's, and from
+    // warning up: under it, its debug lines carry transcript text
     AppLogger.mirrorsToConsole = false
+    AppLogger.minimumLevel = .warning
     let dir = URL(fileURLWithPath: model)
     let ultra = try AsrModels.loadLocal(
       from: dir.appending(path: "parakeet-ultra"), version: .ultra)

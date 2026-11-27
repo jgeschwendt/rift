@@ -31,10 +31,14 @@ host=${host:-<name>}
 echo "rift engine add turn -- $prefix/endpoint ear-$host"
 echo "rift engine add words -- $prefix/transcribe/bin/transcribe ear-$host --model $model"
 echo "rift engine add speech -- $prefix/read-aloud mouth-$host"
-# scribe, macOS only: built in release from its Package.resolved, Parakeet Ultra and the CTC 110M
-# vocabulary model fetched at their pins into one --model directory
-if [ "$(uname)" = Darwin ] && command -v swift >/dev/null 2>&1; then
-  swift build -c release --disable-keychain --package-path "$here/scribe" --quiet
+# scribe, macOS with Swift 6.2 or later, else skipped in one line: built in release at its
+# Package.resolved pin, Parakeet Ultra and the CTC 110M vocabulary model fetched at their pins
+# into one --model directory
+if ! "$here/scribe/supported.sh"; then
+  echo "scribe: skipped: macOS with Swift 6.2 or later only" >&2
+else
+  swift build -c release --disable-keychain --force-resolved-versions --quiet \
+    --package-path "$here/scribe"
   install -m 755 "$here/scribe/.build/release/scribe" "$prefix/scribe.new"
   mv -f "$prefix/scribe.new" "$prefix/scribe"
   parakeet=$prefix/models/parakeet

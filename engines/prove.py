@@ -11,6 +11,9 @@ words event naming the fixture's words, then a say of a reply, its spoken count 
 fake output took. The feed's lines land in <out>/feed.jsonl, the verdict on stdout, exit 0 when it
 holds. $PROVE_WORDS names the words engine, transcribe (the default) or scribe, its weights in
 $TRANSCRIBE_MODEL or $SCRIBE_MODEL; the other models are read from their defaults (README.md).
+With $PROVE_TERMS the fixture is fixtures/term.pcm (Pocket TTS saying "Open the Phlogix
+dashboard, please.", an invented word scribe hears as Flogix without a vocabulary, measured
+2026-11-26) and the words engine takes --terms with that file: the final must name Phlogix.
 """
 
 # ruff: noqa: S603 -- it runs the programs it was handed
@@ -34,7 +37,8 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-HEARD = ("kitchen", "lights")
+TERMS = os.environ.get("PROVE_TERMS")
+FIXTURE, HEARD = ("term.pcm", ("phlogix",)) if TERMS else ("phrase.pcm", ("kitchen", "lights"))
 HERE = Path(__file__).parent
 REPLY = "Sure, the kitchen lights are on now. Anything else?"
 
@@ -104,7 +108,11 @@ class Proof:
         self.run(rift, "feed", stdout=(self.out / "feed.jsonl").open("w"))
         uv = ["uv", "run", "--project", str(HERE / "transcribe"), "--locked", "transcribe"]
         words = os.environ.get("PROVE_WORDS", "transcribe")
-        model = ["--model", os.environ[f"{words.upper()}_MODEL"]]
+        model = [
+            "--model",
+            os.environ[f"{words.upper()}_MODEL"],
+            *(["--terms", TERMS] * bool(TERMS)),
+        ]
         engine = {"scribe": [str(bins / "scribe")], "transcribe": uv}[words]
         for name, args in (
             ("endpoint", [str(bins / "endpoint"), "ear-desk"]),
@@ -120,7 +128,7 @@ class Proof:
 
     def drive(self) -> tuple[dict, dict, int]:
         """The fixture through the ear, its final words, the say of the reply, the sound taken."""
-        ear = [self.rift, "device", "ear", "desk", str(HERE / "fixtures/phrase.pcm")]
+        ear = [self.rift, "device", "ear", "desk", str(HERE / "fixtures" / FIXTURE)]
         self.run(*ear, *sys.argv[4:5]).wait()
         heard = lambda: [  # noqa: E731
             w for w in self.events("words") if HEARD[-1] in json.dumps(w["e"]["words"]).lower()

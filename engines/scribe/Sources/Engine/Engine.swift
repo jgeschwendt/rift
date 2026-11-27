@@ -113,6 +113,8 @@ func socketPath(_ env: [String: String]) -> String {
 /// each voice and turn line acted on, a refused report said, any other line ignored, until the
 /// connection ends.
 func session(path: String, track: String, model: any Model, now: Int) async throws {
+  // its reads block; on the main thread they would starve the stop signals' handlers
+  dispatchPrecondition(condition: .notOnQueue(.main))
   let request = { (from: Any) -> [String: Any] in
     ["from": from, "kind": "words", "name": engineName, "op": "engine", "track": track]
   }

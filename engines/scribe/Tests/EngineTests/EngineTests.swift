@@ -194,6 +194,23 @@ final class Daemon: @unchecked Sendable {
     #expect(spoken == ["scribe: a span reached 20 s and was finished there"])
   }
 
+  @Test(
+    "a cap 300 ms behind the newest frame; the span it carries, closed by an off or a turn ending before it, never opens the next voice's"
+  )
+  func capped() async throws {
+    // the voice ends at 19.9 s, its off and turn read only after the cap
+    let capping: [Line] = [.on(1), .frames(0, 0.05, 1_015)]
+    let next: [Line] = [
+      .frames(20_300_000, 0, 235), .on(25_000_000), .frames(25_000_000, 0.07, 25),
+      .off(25_500_000), .frames(25_500_000, 0, 15), .turn(25_500_000),
+    ]
+    for late in [[Line.off(19_900_000), .turn(19_900_000)], [.turn(19_900_000)]] {
+      let said = try await run(Words(model: Stub(), floor: nil), capping + late + next)
+      #expect(spans(said) == ["0 20000000", "24750000 25500000"])
+      #expect(finals(said).last == ["w7 25000000 25500000"])
+    }
+  }
+
   @Test("a turn with no words: no final, and its audio is never decoded again")
   func silent() async throws {
     let model = Stub()
@@ -233,6 +250,9 @@ final class Daemon: @unchecked Sendable {
     let terms = vocabulary("# a comment\n\nPostgres: post grass, postgress,\nMoonshine\n:\n  \n")
     #expect(terms.map(\.term) == ["Postgres", "Moonshine"])
     #expect(terms.map(\.heard) == [["post grass", "postgress"], []])
+    // CRLF, a leading comment and a trailing blank line read as LF does
+    let crlf = vocabulary("# a comment\r\nPostgres: post grass\r\nMoonshine\r\n\r\n")
+    #expect(crlf.map(\.term) == ["Postgres", "Moonshine"] && crlf[0].heard == ["post grass"])
     #expect(samples("0000ff7f0080") == [0, Float(32_767) / 32_768, -1])
     #expect((index(1), index(62), index(63)) == (1, 1, 2))
     #expect(socketPath(["RIFT_ROOT": "r"]) == "r/run/rift.sock")
