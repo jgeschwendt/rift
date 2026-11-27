@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// The interpolator's Kaiser window's shape: with `TAPS`, images and noise about 100 dB down.
+/// The interpolator's Kaiser window's shape: with `TAPS`, its stopband about 90 dB down.
 const BETA: f64 = 9.0;
 
 /// Phases between two given samples the interpolator's window is precomputed at, an output
@@ -33,6 +33,10 @@ const PHASES: usize = 256;
 
 /// Given samples read each side of an output sample's position.
 const TAPS: usize = 32;
+
+/// How far past its cut, in cycles a given sample, the window's stopband begins (measured
+/// 2026-11-27 · the response 90 dB down 0.045 past a cut of 0.4 or 0.45).
+const TRANSITION: f64 = 0.045;
 
 /// Fills each buffer of an open output, interleaved, given its rate, its channels and the
 /// microseconds until its first sample sounds.
@@ -258,8 +262,9 @@ struct Open {
 struct Play {
     /// The next output sample's position among the given samples.
     at: f64,
-    /// Since when, with none of it queued for the output, it has held some short of its lead.
-    dry: Option<Instant>,
+    /// The silent samples its output has played since, none of it queued, it held some short of
+    /// its lead.
+    dry: Option<u64>,
     /// Whether nothing more will be given: its `end`, or a hush.
     ended: bool,
     /// The index of `held`'s first sample.
@@ -352,19 +357,20 @@ impl Play {
         self.ended && self.at > self.given as f64 - 1.0f64 && !queued
     }
 
-    /// Whether a run may begin, none of it queued for the output: it has ended, or holds `lead`
-    /// past the interpolator's reach, or has held some short of that for `lead`; a run begun on a
-    /// cushion rides out a giver's jitter where one begun on its first give runs dry mid-word.
-    fn ready(&mut self, lead: Duration) -> bool {
+    /// Whether a run may begin on an output at `rate`, none of it queued for the output: it has
+    /// ended, or holds `lead` past the interpolator's reach, or has held some short of that while
+    /// the output played `lead` of silence, counted in its own samples; a run begun on a cushion
+    /// rides out a giver's jitter where one begun on its first give runs dry mid-word.
+    fn ready(&mut self, lead: Duration, rate: u32) -> bool {
         let ahead = self.given as f64 - TAPS as f64 - self.at;
         if ahead <= 0.0f64 {
             self.dry = None;
             return self.ended;
         }
-        let since = *self.dry.get_or_insert_with(Instant::now);
+        let waited = *self.dry.get_or_insert(0);
         let ready = self.ended
             || ahead >= lead.as_secs_f64() * f64::from(self.rate)
-            || since.elapsed() >= lead;
+            || waited as f64 >= lead.as_secs_f64() * f64::from(rate);
         self.dry = self.dry.filter(|_| !ready);
         ready
     }
@@ -394,6 +400,9 @@ impl Play {
             {
                 self.front = self.front.saturating_add(1);
             }
+        }
+        if let (None, Some(waited)) = (position, self.dry.as_mut()) {
+            *waited = waited.saturating_add(1);
         }
         if position.is_none() || self.since >= u64::from(rate).checked_div(50).unwrap_or_default() {
             reports.extend(self.report(position.is_none()));
@@ -436,8 +445,9 @@ fn absorb(
 }
 
 /// The interpolator's window for a play at `given` Hz into an output at `rate`: for each of
-/// `PHASES + 1` phases between two given samples, `2 × TAPS` Kaiser-windowed sinc taps cut at
-/// 0.475 of the lower rate, summing to 1.
+/// `PHASES + 1` phases between two given samples, `2 × TAPS` Kaiser-windowed sinc taps, summing
+/// to 1: cut at 0.475 of the given rate into a faster output; into a slower, `TRANSITION` short
+/// of the output's Nyquist, so the stopband begins there and nothing past it folds back.
 #[expect(
     clippy::as_conversions,
     clippy::cast_precision_loss,
@@ -446,7 +456,11 @@ fn absorb(
     reason = "the window computed once a play and output, in floating point, apart from the loop"
 )]
 fn window(given: u32, rate: u32) -> Vec<f64> {
-    let cut = 0.475f64 * f64::from(given.min(rate)) / f64::from(given);
+    let cut = if given > rate {
+        0.5f64 * f64::from(rate) / f64::from(given) - TRANSITION
+    } else {
+        0.475f64
+    };
     // the zeroth-order modified Bessel function by its series, its terms past 32 below an f64's
     let bessel = |x: f64| {
         (1..32u8)
@@ -783,7 +797,7 @@ pub fn run(reader: BufReader<UnixStream>, reply: &Value) {
                     .unwrap_or_default()
                     .checked_div(4)
                     .unwrap_or_default();
-                let flowing = waiting > 0 || given.ready(lead);
+                let flowing = waiting > 0 || given.ready(lead, hz);
                 while flowing
                     && waiting.saturating_add(converted.len()) < headroom
                     && let Some(next) = given.convert(hz, &windowed.2)
