@@ -36,7 +36,16 @@ each model held instead by one test over a fixture (`engines/fixtures/phrase.pcm
 `voices.pcm`: Pocket TTS, `cargo run --release -p read-aloud --example fixture -- <out>
 [<voice>=]<text>…`) that runs where its weights are (Moonshine's directory in
 `$TRANSCRIBE_MODEL`, scribe's `--model` in `$SCRIBE_MODEL`, diarize's in `$DIARIZE_MODEL`) and
-says `skipped` otherwise. diarize keeps its own copy of scribe's socket plumbing
+says `skipped` otherwise. `voices.pcm` regenerates byte for byte (verified 2026-11-27) from
+`engines/`: `cargo run --release -p read-aloud --example fixture -- fixtures/voices.pcm "I think
+we should leave early tomorrow morning." "marius=That works for me, although the traffic might be
+heavy near the bridge." "Then let us take the train instead of the car." "marius=Six is far too
+early for me, I am afraid."`; diarize's overlap test mixes its two later phrases in the test
+itself. The score table in `engines/README.md` adds, per voice `<v>` of alba, azelma, cosette,
+eponine, fantine, javert, jean and marius, a file never committed: `-- <v>.pcm "<v>=The museum
+opens at nine, but the queue starts much earlier on weekends." "<v>=Please remember to water the
+plants while I am away next week." "<v>=We could paint the fence blue if the hardware store
+still has some left."`. diarize keeps its own copy of scribe's socket plumbing
 (`Sources/Engine/Wire.swift`): each Swift engine is a package of its own, its pin and gate apart.
 FluidAudio resamples each call's audio with a fresh converter, so diarize brings 16 kHz to
 LS-EEND's 8 kHz itself (`Decimator`, its filter state kept across frames, enrolment through the

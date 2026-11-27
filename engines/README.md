@@ -48,6 +48,27 @@ LS-EEND is enrolled with audio, not an embedding, each time the engine connects.
 takes effect on the job's restart. A label is a track name's form starting with a letter. No
 profile is ever committed.
 
+A label is LS-EEND's guess and not proof of who speaks. It read the fixture's first marius phrase
+as the enrolled alba. The score is what tells voices apart: WeSpeaker's cosine between the span's
+audio and the profile. Measured against alba's profile, from the fixture's 2.8 s first phrase or
+from 10 s of her, on windows sliding 0.25 s through each phrase. The own voice is alba's other
+phrases; the others are azelma, cosette, eponine, fantine, javert, jean and marius (measured
+2026-11-27 · Pocket TTS, the fixture and the sentences in AGENTS.md):
+
+| window | own, 2.8 s profile, lowest | own, 10 s profile, lowest | others, 2.8 s profile, highest | others, 10 s profile, highest |
+| --- | --- | --- | --- | --- |
+| 0.5 s | 0.138 | 0.242 | 0.327 | 0.408 |
+| 1 s | 0.323 | 0.493 | 0.417 | 0.539 |
+| 1.5 s | 0.428 | 0.548 | 0.389 | 0.502 |
+| 2 s | 0.481 | 0.628 | 0.394 | 0.466 |
+| whole phrase | 0.560 | 0.698 | 0.359 | 0.508 |
+
+Under 2 s, other voices' windows score above the own voice's, so a span under 2 s scores null.
+From 2 s, a cosine of 0.53 is above every other voice's window under both profiles, and it maps
+to a score of 0.5 (linear from 0.06 to 1). A short profile's own voice can fall under it: the
+fixture's later alba phrase scores 0.512, and some of her 2 s windows read 0.481. So enrol 10 s
+or more, and act on a label only when it carries a score over 0.5.
+
 `endpoint` commits a turn when Smart Turn scores its close over `--bar` (0.5), else holds it for
 the next voice up to `--ceiling-ms` (3000) of silence. Smart Turn scores a short opening word and
 its pause as a finished turn (0.81–0.99 at those closes, observed 2026-11-26), so a turn over the

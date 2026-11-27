@@ -8,8 +8,9 @@ let stepFrames = 5
 let keptFrames = 1_500
 /// The longest span held before the engine cuts it itself: 20 s, in µs.
 let capSpan = 20_000_000
-/// The shortest span scored, 0.5 s in µs; a shorter one's score is null.
-let shortest = 500_000
+/// The shortest span scored, 2 s in µs; a shorter one's score is null: under it WeSpeaker scored
+/// windows of other voices over windows of the enrolled one, and over 0.53 (engines/README.md).
+let shortest = 2_000_000
 /// The most talkers a span names.
 let most = 16
 /// The probability over which a slot is speaking in a step.
@@ -54,10 +55,11 @@ func cosine(_ a: [Float], _ b: [Float]) -> Float {
   return aa * bb > 0 ? dot / (aa * bb).squareRoot() : 0
 }
 
-/// A cosine similarity as a score: linear from -0.3 (0) to 1 (1), clamped, to 3 places, so the
-/// 0.35 at which WeSpeaker parted two voices on 1 s windows reads 0.5.
+/// A cosine similarity as a score: linear from 0.06 (0) to 1 (1), clamped, to 3 places, so 0.53,
+/// over every window of 2 s or more of seven other voices WeSpeaker scored, reads 0.5
+/// (engines/README.md).
 func score(_ cosine: Float) -> Double {
-  (min(1, max(0, (Double(cosine) + 0.3) / 1.3)) * 1_000).rounded() / 1_000
+  (min(1, max(0, (Double(cosine) - 0.06) / 0.94)) * 1_000).rounded() / 1_000
 }
 
 /// One connection's spans, every time on the daemon's clock in µs.
@@ -202,7 +204,7 @@ final class Talkers {
   }
 
   /// How sure the span from `start` to `end` is `label`'s voice: its kept audio's embedding
-  /// against the profile's, null under 0.5 s.
+  /// against the profile's, null under 2 s.
   func scored(_ label: String, _ start: Int, _ end: Int) throws -> Any {
     guard end - start >= shortest, let profile = profiles[label] else { return NSNull() }
     var audio: [Float] = []

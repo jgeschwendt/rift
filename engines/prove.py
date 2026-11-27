@@ -18,9 +18,10 @@ dashboard, please.", an invented word scribe hears as Flogix without a vocabular
 With $PROVE_TALKERS (diarize's weights in $DIARIZE_MODEL) it proves the talkers engine instead:
 endpoint alone hears fixtures/voices.pcm (Pocket TTS, alba then marius, twice each); the first
 turn's voice is enrolled as `first` from the daemon's read of it (`diarize enrol --track`); then
-diarize connects and the fixture is played again. Each of that pass's turns must be mostly its
-voice's: `first` for alba's, an integer for marius's. The verdict adds each turn's ids and how
-long after the turn event the span reaching its end was logged.
+diarize connects and the fixture is played again. alba's turns must be mostly `first`, scored over
+0.5; marius's never `first` over 0.5 (LS-EEND alone names his first phrase `first`, its score
+under). The verdict adds each turn's ids, `first`'s scores and how long after the turn event the
+span reaching its end was logged.
 """
 
 # ruff: noqa: S603 -- it runs the programs it was handed
@@ -237,8 +238,16 @@ def talkers(rift: str, bins: Path, out: Path) -> None:
         start, end = turn["e"]["start"], turn["e"]["end"]
         share = shares([span["e"] for span in spans], start, end)
         reaching = next(span for span in spans if span["e"]["end"] >= end)
+        scores = [
+            talker["score"]
+            for span in spans
+            if span["e"]["start"] < end and span["e"]["end"] > start
+            for talker in span["e"]["talkers"]
+            if talker["id"] == "first"
+        ]
         rows.append(
             {
+                "first_scores": scores,
                 "ids_ms": {str(key): value // 1000 for key, value in share.items()},
                 "mostly": max(
                     (key for key in share if key not in {"", "?"}), key=share.get, default=None
@@ -253,12 +262,12 @@ def talkers(rift: str, bins: Path, out: Path) -> None:
     print(
         json.dumps({"enrolled": enrolled.stderr.strip(), "stops": stops, "turns": rows}, indent=1)
     )
-    # the fixture's four phrases, alba's first: its label, then an integer, in turn
-    mostly = [row["mostly"] for row in rows]
+    # the fixture's four phrases, alba's first: hers mostly `first`, scored over 0.5; marius's
+    # never `first` over 0.5, which LS-EEND alone may name him
+    over = [any((score or 0) > 0.5 for score in row["first_scores"]) for row in rows]
     sys.exit(
         0
-        if [isinstance(m, int) for m in mostly] == [False, True] * 2
-        and mostly[0] == mostly[2] == "first"
+        if over == [True, False] * 2 and rows[0]["mostly"] == rows[2]["mostly"] == "first"
         else 1
     )
 

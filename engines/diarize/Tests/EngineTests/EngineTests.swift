@@ -211,25 +211,26 @@ func voiced() -> [[String: Any]] {
       ])
     #expect(
       spans(said) == [
-        "0 500000 1", "500000 1000000 2", "1000000 1500000 alpha:1.0 visitor:1.0 2",
+        "0 500000 1", "500000 1000000 2", "1000000 1500000 alpha visitor 2",
         "1500000 1600000 alpha",
       ])
-    #expect(model.embedded == [8_000, 8_000])
+    // under 2 s, unscored
+    #expect(model.embedded.isEmpty)
     // a new connection's engine numbers afresh
     let again = try run(talkers(Stub()), [.frames(0, 0b10, 25), .frames(500_000, 0, 30)])
     #expect(spans(again) == ["0 500000 1"])
   }
 
-  @Test("a score: the cosine mapped linearly, 0.35 at 0.5; a zero embedding scores 0")
+  @Test("a score: the cosine mapped linearly, 0.53 at 0.5; a zero embedding's cosine 0")
   func scores() throws {
-    #expect((score(0.35), score(-0.3), score(-1), score(1), score(2)) == (0.5, 0, 0, 1, 1))
+    #expect((score(0.53), score(0.06), score(-1), score(1), score(2)) == (0.5, 0, 0, 1, 1))
     #expect(
       (cosine([1, 0], [0, 1]), cosine([0, 0], [1, 0]), cosine([3, 4], [3, 4])) == (0, 0, 1))
     let model = Stub()
-    model.vector = [0, 1]
+    model.vector = [1, 1]
     let said = try run(
-      talkers(model, [("alpha", 0)]), [.frames(0, 1, 50), .frames(1_000_000, 0, 15)])
-    #expect(spans(said) == ["0 1000000 alpha:0.231"] && model.embedded == [16_000])
+      talkers(model, [("alpha", 0)]), [.frames(0, 1, 100), .frames(2_000_000, 0, 15)])
+    #expect(spans(said) == ["0 2000000 alpha:0.688"] && model.embedded == [32_000])
   }
 
   @Test("a turn line cuts the span reaching its end there, once settled that far, or at once")
@@ -456,7 +457,7 @@ func voiced() -> [[String: Any]] {
         == #"{"from":"through","kind":"talkers","name":"diarize","op":"engine","track":"ear-desk"}"#
     )
     #expect(
-      spans(daemon.heard) == ["0 500000 alpha:1", "500000 1100000", "1100000 1600000 alpha:1"])
+      spans(daemon.heard) == ["0 500000 alpha", "500000 1100000", "1100000 1600000 alpha"])
     #expect(
       ends == ["returned", "not a JSON object: nope", #"{"code":"taken","ok":false}"#, ended])
     #expect(
