@@ -321,7 +321,10 @@
       against the signature it last recorded for it, and updates that record only after a launch:
       a kickstart onto a re-signed release was refused, and the job stayed refused through every
       later kickstart, while a bootout then a bootstrap started it at once. So a run that re-signs
-      the release reloads the agent instead of kickstarting it, and any load not ready within
+      the release reloads the agent instead of kickstarting it, and so does an agent loaded at
+      login: it carries a managed launch constraint (<code class="code">launchctl print</code> says
+      <code class="code">managed LWCR</code>) that a swap invalidates and a kickstart keeps, while a
+      bootstrap loads it without one. Any load not ready within
       <code class="code">$RIFT_RELOAD_MS</code> is reloaded once more before setup gives up. The ear's
       job is always loaded afresh: booted out before the daemon is touched, loaded once the new
       daemon answers ready, and ready once that daemon lists its track. A track another device

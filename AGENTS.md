@@ -240,8 +240,9 @@ printed:
    running ear keeps the file it mapped and a rerun changes nothing; then the daemon's and the
    ear's plists by temp + rename (`wrote <path>`);
 6. the ear, then the mouth, booted out when loaded, before the daemon is touched;
-7. the same daemon plist already loaded and the release not re-signed this run: `kickstart -k`,
-   the swap; else the reload: booted out when loaded, then `bootstrap`;
+7. the same daemon plist already loaded, the release not re-signed this run and the job's `print`
+   free of `managed LWCR` (a job loaded at login carries that launch constraint, which a swap
+   invalidates and a kickstart keeps): `kickstart -k`, the swap; else the reload: booted out when loaded, then `bootstrap`;
 8. health polled every 100 ms until a daemon answers ready (after a swap, not the one it
    replaced). None past `$RIFT_RELOAD_MS`: `<label> not ready <ms> ms after its load; loading it
    again`, the reload once more, then at most `$RIFT_READY_MS`: `<label> not ready <ms> ms after
