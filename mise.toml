@@ -28,7 +28,8 @@ run = [
   "uv run --project transcribe --locked ruff format --check --config transcribe/pyproject.toml transcribe prove.py",
   "uv run --project transcribe --locked ruff check --config transcribe/pyproject.toml transcribe prove.py",
   "uv run --project transcribe --locked pytest transcribe -p no:cacheprovider -rs --cov=transcribe/src --cov-config=transcribe/pyproject.toml",
-  # macOS with Swift 6.2 or later only (scribe/supported.sh), else one line saying it is skipped
+  # macOS with Swift 6.2 or later only (supported.sh), else one line saying each is skipped
+  "diarize/check.sh",
   "scribe/check.sh",
 ]
 
@@ -68,6 +69,16 @@ run = [
   "cargo build --release --manifest-path engines/Cargo.toml",
   "mkdir -p /tmp/rift-prove/bin && cp target/debug/rift engines/target/release/endpoint engines/target/release/read-aloud /tmp/rift-prove/bin/",
   "uv run --project engines/transcribe --locked python engines/prove.py /tmp/rift-prove/bin/rift /tmp/rift-prove/bin /tmp/rift-prove ${PROVE_FAST:+--fast}",
+]
+
+[tasks.prove-diarize]
+description = "diarize end to end, macOS only: endpoint and diarize on a throwaway daemon over fixtures/voices.pcm, one voice enrolled from the daemon's read; needs $DIARIZE_MODEL, the --model directory"
+run = [
+  "cargo build",
+  "cargo build --release --manifest-path engines/Cargo.toml -p endpoint",
+  "swift build -c release --disable-keychain --force-resolved-versions --package-path engines/diarize",
+  "mkdir -p /tmp/rift-prove-diarize/bin && cp target/debug/rift engines/target/release/endpoint engines/diarize/.build/release/diarize /tmp/rift-prove-diarize/bin/",
+  "PROVE_TALKERS=1 uv run --project engines/transcribe --locked python engines/prove.py /tmp/rift-prove-diarize/bin/rift /tmp/rift-prove-diarize/bin /tmp/rift-prove-diarize ${PROVE_FAST:+--fast}",
 ]
 
 [tasks.prove-scribe]

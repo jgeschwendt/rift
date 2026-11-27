@@ -1,6 +1,7 @@
-//! `cargo run --release --example fixture -- <out.pcm> <text>…`: the engines' synthetic fixture,
-//! Pocket TTS's alba saying each text, 0.5 s of silence first, 0.7 s between, 1.5 s last, as
-//! 16 kHz 16-bit mono little-endian PCM, the file a file-fed ear plays. No recording of a person.
+//! `cargo run --release --example fixture -- <out.pcm> [<voice>=]<text>…`: the engines' synthetic
+//! fixture, Pocket TTS saying each text in its preset voice (alba unless named, each voice loaded
+//! once), 0.5 s of silence first, 0.7 s between, 1.5 s last, as 16 kHz 16-bit mono
+//! little-endian PCM, the file a file-fed ear plays. No recording of a person.
 #![expect(
     clippy::arithmetic_side_effects,
     clippy::integer_division,
@@ -12,6 +13,8 @@
     reason = "the library's, which the example reaches through it"
 )]
 
+use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 use std::{env, fs, io};
 
 use link::hub;
@@ -20,12 +23,22 @@ use read_aloud::speak::Voice as _;
 
 fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
-    let mut pocket = Pocket::load(&hub(DIR[0], DIR[1]), "alba")?;
+    let mut pockets = BTreeMap::new();
     let mut said = vec![0.0; 12_000];
-    for (at, text) in args.iter().skip(1).enumerate() {
+    for (at, arg) in args.iter().skip(1).enumerate() {
         if at > 0 {
             said.resize(said.len() + 16_800, 0.0);
         }
+        let (voice, text) = arg
+            .split_once('=')
+            .filter(|&(voice, _)| {
+                !voice.is_empty() && voice.bytes().all(|byte| byte.is_ascii_lowercase())
+            })
+            .unwrap_or(("alba", arg));
+        let pocket = match pockets.entry(voice) {
+            Entry::Occupied(held) => held.into_mut(),
+            Entry::Vacant(free) => free.insert(Pocket::load(&hub(DIR[0], DIR[1]), voice)?),
+        };
         pocket.speak(text, &mut |chunk| {
             said.extend_from_slice(chunk);
             Ok(true)

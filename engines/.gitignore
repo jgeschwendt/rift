@@ -1,6 +1,7 @@
 .coverage
 .pytest_cache
 .ruff_cache
+/diarize/.build
 /scribe/.build
 /target
 /transcribe/.venv

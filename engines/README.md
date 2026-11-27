@@ -1,10 +1,13 @@
 # rift's reference engines
 
-Today's models on rift's socket, one engine per kind and track: `endpoint`, `read-aloud`, and two
-words engines to choose from, `transcribe` and `scribe` (macOS only).
+Today's models on rift's socket, one engine per kind and track: `endpoint`, `read-aloud`, two
+words engines to choose from, `transcribe` and `scribe` (macOS only), and `diarize` for talkers
+(macOS only).
 
 | engine | model | licence | weights, fetched by `install-engines` at their pin |
 | --- | --- | --- | --- |
+| diarize | LS-EEND, DIHARD III, 100 ms steps, Core ML | MIT | `FluidInference/ls-eend-coreml` at `28ce1b1f8ef186729df63b3886fbaae7bc10c4a1`, `optimized/dih3/100ms/` alone, under the install's `models/diarize/ls-eend/` |
+| diarize | WeSpeaker ResNet34-LM (`wespeaker_v2`, via pyannote), and pyannote segmentation 3.0, which FluidAudio's embedder loads beside it, Core ML | CC-BY-4.0, attribution required (WeSpeaker, pyannote, Fluid Inference; modified Core ML conversions); the segmentation MIT | `FluidInference/speaker-diarization-coreml` at `7eab74f3463c736418d0eb10296261ae581146c9`, those two `.mlmodelc` alone, under `models/diarize/speaker-diarization/` |
 | endpoint | Silero VAD v6.2 | MIT | Hugging Face `Tinysoft/silero-vad-6.2` at `3034960e5d3beb943b860ec0ea1a857bdae4ae96` |
 | endpoint | Smart Turn v3.2, CPU | BSD-2-Clause | `pipecat-ai/smart-turn-v3` at `f766f81d3cfdf7737ac64aad813d91bbfd56bf93` |
 | read-aloud | Pocket TTS, without voice cloning | CC-BY-4.0, Kyutai | `kyutai/pocket-tts-without-voice-cloning` at `00eac05ed3d16bdc3f6b5d598874019c34a89214` |
@@ -15,8 +18,9 @@ words engines to choose from, `transcribe` and `scribe` (macOS only).
 Libraries: onnxruntime 1.28.0 via `ort` (MIT; `ort-sys` fetches it at build time from its pinned
 list, SHA-256 checked, linked statically), `ptts`, `xn`, `rustfft` (MIT/Apache-2.0), `tokenizers`
 (Apache-2.0), `moonshine-voice` (MIT), numpy (BSD-3-Clause), FluidAudio 0.18.4 (Apache-2.0,
-`e0c6103`, `scribe/Package.resolved`, built with no traits: ASR alone). No engine fetches anything
-as it runs: `transcribe` and `scribe` refuse to start without `--model <dir>`.
+`e0c6103`, `scribe/Package.resolved` and `diarize/Package.resolved`, scribe built with no traits:
+ASR alone; diarize with `Diarizer` alone). No engine fetches anything as it runs: `transcribe`,
+`scribe` and `diarize` refuse to start without `--model <dir>`.
 
 Installed as rift's engine jobs: `mise run install-engines` builds and installs them into
 `~/.local/libexec/rift/` (Moonshine and Parakeet under its `models/`), fetches the models (rerun
@@ -32,7 +36,17 @@ rift engine add turn -- ~/.local/libexec/rift/endpoint ear-<host>
 rift engine add words -- ~/.local/libexec/rift/transcribe/bin/transcribe ear-<host> --model <dir>
 rift engine add speech -- ~/.local/libexec/rift/read-aloud mouth-<host>
 rift engine add words -- ~/.local/libexec/rift/scribe ear-<host> --model ~/.local/libexec/rift/models/parakeet  # in place of transcribe
+rift engine add talkers -- ~/.local/libexec/rift/diarize ear-<host> --model ~/.local/libexec/rift/models/diarize --profiles ~/.config/diarize
 ```
+
+`diarize` enrols a voice by hand, then names it by its label: `diarize enrol <label> --model <dir>
+--profiles <dir> --file <pcm>` (16 kHz 16-bit mono little-endian) or `--track <track> --from <t>
+--to <t>` (the daemon's `read` of that span), writing `<dir>/<label>.json` 0600 in a 0700
+directory: WeSpeaker's embedding of the audio and the audio itself (its first 30 s), since
+LS-EEND is enrolled with audio, not an embedding, each time the engine connects. `diarize forget
+<label> --profiles <dir>` removes it; the engine reads the directory at each connect, so either
+takes effect on the job's restart. A label is a track name's form starting with a letter. No
+profile is ever committed.
 
 `endpoint` commits a turn when Smart Turn scores its close over `--bar` (0.5), else holds it for
 the next voice up to `--ceiling-ms` (3000) of silence. Smart Turn scores a short opening word and

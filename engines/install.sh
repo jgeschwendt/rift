@@ -1,6 +1,6 @@
 #!/bin/sh
 # The reference engines installed beside rift's fixed copies, out of any checkout's target/ or
-# working tree: endpoint, read-aloud and (on macOS) scribe built in release and renamed into
+# working tree: endpoint, read-aloud and (on macOS) scribe and diarize built in release and renamed into
 # place, transcribe synced from its lock into a venv of its own, not editable, and every model
 # fetched here and now at its pin, so no engine fetches anything as it runs. Rerun to upgrade.
 # Prints the `rift engine add` lines for this machine and runs none. $RIFT_ENGINES_PREFIX
@@ -49,4 +49,22 @@ else
     --include 'MelSpectrogram.mlmodelc/*' --include config.json --include special_tokens_map.json \
     --include tokenizer.json --include tokenizer_config.json --include vocab.json
   echo "rift engine add words -- $prefix/scribe ear-$host --model $parakeet  # in place of transcribe"
+fi
+# diarize, the same condition: built at its Package.resolved pin, LS-EEND (DIHARD III, 100 ms)
+# and the WeSpeaker embedder with its segmentation model fetched at their pins into one --model
+# directory; its profiles are enrolled by hand (`diarize enrol`), never here
+if ! "$here/diarize/supported.sh"; then
+  echo "diarize: skipped: macOS with Swift 6.2 or later only" >&2
+else
+  swift build -c release --disable-keychain --force-resolved-versions --quiet \
+    --package-path "$here/diarize"
+  install -m 755 "$here/diarize/.build/release/diarize" "$prefix/diarize.new"
+  mv -f "$prefix/diarize.new" "$prefix/diarize"
+  voices=$prefix/models/diarize
+  hf FluidInference/ls-eend-coreml --revision 28ce1b1f8ef186729df63b3886fbaae7bc10c4a1 \
+    --local-dir "$voices/ls-eend" --include 'optimized/dih3/100ms/ls_eend_dih3_100ms.mlmodelc/*'
+  hf FluidInference/speaker-diarization-coreml --revision 7eab74f3463c736418d0eb10296261ae581146c9 \
+    --local-dir "$voices/speaker-diarization" --include 'pyannote_segmentation.mlmodelc/*' \
+    --include 'wespeaker_v2.mlmodelc/*'
+  echo "rift engine add talkers -- $prefix/diarize ear-$host --model $voices --profiles $HOME/.config/diarize"
 fi

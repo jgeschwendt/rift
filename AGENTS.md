@@ -14,6 +14,7 @@ mise run dist      # this host's release archive, the next YYYY.M.N stamped, to 
 mise run install   # a dev build to ~/.local/bin/rift-next, beside the release; setup never wires it
 mise run check-engines   # engines/: fmt, lints, each engine's protocol logic at 100 % against a stub model
 mise run prove-engines   # engines/: all three on a throwaway daemon, the fixture and a fake output; PROVE_FAST=1 under load
+mise run prove-diarize   # endpoint and diarize over fixtures/voices.pcm, one voice enrolled by the daemon's read; macOS, $DIARIZE_MODEL
 mise run prove-scribe    # the same with scribe for words, then with --terms over fixtures/term.pcm; macOS, $SCRIBE_MODEL
 ```
 
@@ -24,13 +25,22 @@ downloads in `engines/README.md`) run as `engines/target/release/endpoint <ear t
 <ear track> [--model <dir>] [--terms <file>]` (`--terms`: lines `Term` or `Term: heard, heard`,
 your own file, never committed), and on macOS `engines/scribe/.build/release/scribe <ear track>
 --model <dir> [--terms <file>]` (a Swift package; `<dir>` holds `parakeet-ultra/` and
-`parakeet-ctc-110m-coreml/`; build with `--disable-keychain`). Each stands, connects with `"from":"through"` so a start or reconnect resumes, and stops on a signal
+`parakeet-ctc-110m-coreml/`; build with `--disable-keychain`), and on macOS
+`engines/diarize/.build/release/diarize <ear track> --model <dir> [--profiles <dir>]` (its own
+Swift package; `<dir>` holds `ls-eend/` and `speaker-diarization/`; `diarize enrol|forget`
+in `engines/README.md`). Each stands, connects with `"from":"through"` so a start or reconnect resumes, and stops on a signal
 as a device does. Coverage exempts each engine's `main.rs`, `models.rs`, `pocket.rs`,
-`moonshine.py` and scribe's `Parakeet.swift` and `main.swift` (`engines/scribe/check.sh` gates
-`Sources/Engine` alone): model and command-line lines alone, each model held instead by one test
-over `engines/fixtures/phrase.pcm` (Pocket TTS, `cargo run --release -p read-aloud --example
-fixture`) that runs where its weights are (Moonshine's directory in `$TRANSCRIBE_MODEL`, scribe's
-`--model` in `$SCRIBE_MODEL`) and says `skipped` otherwise. Swift 6.2.4 miscompiled the scribe
+`moonshine.py`, scribe's `Parakeet.swift` and diarize's `Fluid.swift`, and each Swift engine's
+`main.swift` (its `check.sh` gates `Sources/Engine` alone): model and command-line lines alone,
+each model held instead by one test over a fixture (`engines/fixtures/phrase.pcm`, diarize's
+`voices.pcm`: Pocket TTS, `cargo run --release -p read-aloud --example fixture -- <out>
+[<voice>=]<text>…`) that runs where its weights are (Moonshine's directory in
+`$TRANSCRIBE_MODEL`, scribe's `--model` in `$SCRIBE_MODEL`, diarize's in `$DIARIZE_MODEL`) and
+says `skipped` otherwise. diarize keeps its own copy of scribe's socket plumbing
+(`Sources/Engine/Wire.swift`): each Swift engine is a package of its own, its pin and gate apart.
+LS-EEND's features depend on how its audio is fed, so diarize feeds it each 20 ms frame as it
+comes: fed 100 ms at a time, the fixture's second voice read as the first throughout (observed
+2026-11-26). Swift 6.2.4 miscompiled the scribe
 suite's closure-taking stderr helper, handing one call's closure to another, so its tests swap
 the writer by `listen()` instead (observed 2026-11-26). llvm-cov sums line coverage per function,
 so a closure written inline over several lines then `?` (`f(&mut |x| { … })?;`) leaves its `})?;`

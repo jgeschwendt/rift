@@ -14,6 +14,13 @@ $TRANSCRIBE_MODEL or $SCRIBE_MODEL; the other models are read from their default
 With $PROVE_TERMS the fixture is fixtures/term.pcm (Pocket TTS saying "Open the Phlogix
 dashboard, please.", an invented word scribe hears as Flogix without a vocabulary, measured
 2026-11-26) and the words engine takes --terms with that file: the final must name Phlogix.
+
+With $PROVE_TALKERS (diarize's weights in $DIARIZE_MODEL) it proves the talkers engine instead:
+endpoint alone hears fixtures/voices.pcm (Pocket TTS, alba then marius, twice each); the first
+turn's voice is enrolled as `first` from the daemon's read of it (`diarize enrol --track`); then
+diarize connects and the fixture is played again. Each of that pass's turns must be mostly its
+voice's: `first` for alba's, an integer for marius's. The verdict adds each turn's ids and how
+long after the turn event the span reaching its end was logged.
 """
 
 # ruff: noqa: S603 -- it runs the programs it was handed
@@ -156,9 +163,112 @@ class Proof:
         shutil.rmtree(self.root)
 
 
+def shares(spans: list[dict], start: int, end: int) -> dict:
+    """Each id's µs over [start, end) from the talkers events, nobody's under "", the unknown
+    under "?", as a client joins them.
+    """
+    held: dict = {"?": end - start}
+    for span in spans:
+        cover = min(end, span["end"]) - max(start, span["start"])
+        if cover > 0:
+            held["?"] -= cover
+            for talker in span["talkers"] or [{"id": ""}]:
+                held[talker["id"]] = held.get(talker["id"], 0) + cover
+    return held
+
+
+def talkers(rift: str, bins: Path, out: Path) -> None:
+    """The talkers proof and its verdict."""
+    proof, model = Proof(rift, out), os.environ["DIARIZE_MODEL"]
+    profiles = str(proof.root / "profiles")
+    ear = [rift, "device", "ear", "desk", str(HERE / "fixtures/voices.pcm"), *sys.argv[4:5]]
+    health = lambda: ask(proof.sock, {"op": "health"})[0].get("engines")  # noqa: E731
+
+    def heard(after: int) -> list[dict]:
+        """The turns, once more than `after` are in and the last voice is closed by one."""
+        turns, voices = proof.events("turn"), proof.events("voice")
+        last = voices[-1]["e"] if voices else {"on": True}
+        closed = not last["on"] and turns and turns[-1]["e"]["end"] >= last["start"]
+        return turns if closed and len(turns) > after else []
+
+    try:
+        proof.run(rift, "serve", stdout=subprocess.DEVNULL)
+        wait(lambda: Path(proof.sock).exists(), "daemon")
+        subprocess.run([rift, "ears", "on"], env=proof.env, check=True, capture_output=True)
+        proof.run(rift, "feed", stdout=(out / "feed.jsonl").open("w"))
+        endpoint = proof.run(
+            str(bins / "endpoint"), "ear-desk", stderr=(out / "endpoint.err").open("w")
+        )
+        wait(lambda: health() == {"ear-desk": {"turn": "endpoint"}}, "endpoint", 120)
+        proof.run(*ear).wait()
+        first = wait(lambda: heard(0), "turns")[0]["e"]
+        span = [
+            "--track",
+            "ear-desk",
+            "--from",
+            str(first["start"] - 250_000),
+            "--to",
+            str(first["end"]),
+        ]
+        enrol = [str(bins / "diarize"), "enrol", "first", "--model", model, "--profiles", profiles]
+        enrolled = subprocess.run(
+            [*enrol, *span], env=proof.env, check=True, capture_output=True, text=True
+        )
+        diarize = [str(bins / "diarize"), "ear-desk", "--model", model, "--profiles", profiles]
+        engine = proof.run(*diarize, stderr=(out / "diarize.err").open("w"))
+        want = {"ear-desk": {"talkers": "diarize", "turn": "endpoint"}}
+        wait(lambda: health() == want, "diarize", 120)
+        before = len(proof.events("turn"))
+        proof.run(*ear).wait()
+        turns = wait(lambda: heard(before), "turns of the second pass")[before:]
+        reach = lambda: max([span["e"]["end"] for span in proof.events("talkers")] or [0])  # noqa: E731
+        wait(lambda: reach() >= turns[-1]["e"]["end"], "talkers spans reaching the last turn", 30)
+        for process in (engine, endpoint):
+            process.send_signal(signal.SIGTERM)
+            process.wait()
+        ask(proof.sock, {"op": "shutdown"})
+        proof.held[0].wait()
+        proof.held[2].wait()
+    finally:
+        proof.stop()
+    spans = proof.events("talkers")
+    rows = []
+    for turn in turns:
+        start, end = turn["e"]["start"], turn["e"]["end"]
+        share = shares([span["e"] for span in spans], start, end)
+        reaching = next(span for span in spans if span["e"]["end"] >= end)
+        rows.append(
+            {
+                "ids_ms": {str(key): value // 1000 for key, value in share.items()},
+                "mostly": max(
+                    (key for key in share if key not in {"", "?"}), key=share.get, default=None
+                ),
+                "span_logged_after_turn_event_ms": (at(reaching) - at(turn)) // 1000,
+                "span_logged_after_turn_end_ms": (at(reaching) - end) // 1000,
+                "turn": (start, end),
+                "turn_logged_after_its_end_ms": (at(turn) - end) // 1000,
+            }
+        )
+    stops = {path.stem: path.read_text().strip() for path in sorted(out.glob("*.err"))}
+    print(
+        json.dumps({"enrolled": enrolled.stderr.strip(), "stops": stops, "turns": rows}, indent=1)
+    )
+    # the fixture's four phrases, alba's first: its label, then an integer, in turn
+    mostly = [row["mostly"] for row in rows]
+    sys.exit(
+        0
+        if [isinstance(m, int) for m in mostly] == [False, True] * 2
+        and mostly[0] == mostly[2] == "first"
+        else 1
+    )
+
+
 def main() -> None:
     """The proof and its verdict."""
     rift, bins, out = (Path(arg).resolve() for arg in sys.argv[1:4])
+    if os.environ.get("PROVE_TALKERS"):
+        out.mkdir(parents=True, exist_ok=True)
+        talkers(str(rift), bins, out)
     out.mkdir(parents=True, exist_ok=True)
     proof = Proof(str(rift), out)
     try:

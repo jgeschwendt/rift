@@ -588,7 +588,7 @@
       <tbody>
         <tr><td>① devices</td><td>clients of the socket, each an ear or a mouth; built: a file player and, on macOS, <a href="#microphone">the microphone</a> (<code class="code">rift device</code>), and, on macOS, <a href="#mouth">the mouth</a>, each standing as a launchd job of its own that every setup installs; one on another machine is a later protocol</td></tr>
         <tr><td>② one stream</td><td>built: every track on the daemon's clock, so a moment means the same instant on every track (<a href="#stream">the stream</a>)</td></tr>
-        <tr><td>③ voices</td><td>built: the talkers kind and its join to turns; designed: its reference engine. Who spoke when, voices speaking at once included, each an enrolled voice's label matched with how sure, which holds across the stream, or a number for one not enrolled, by a talkers <a href="#engines">engine</a></td></tr>
+        <tr><td>③ voices</td><td>built: the talkers kind, its join to turns and its reference engine. Who spoke when, voices speaking at once included, each an enrolled voice's label matched with how sure, which holds across the stream, or a number for one not enrolled, by a talkers <a href="#engines">engine</a></td></tr>
         <tr><td>④ words</td><td>the track's speech transcribed to words, each word with its start and end on that clock, by <a href="#engines">engines</a>: echo, then turn and words; a client joins words to voices by time</td></tr>
         <tr><td>⑤ playback</td><td>built: audio a client gives played on <a href="#mouth">a mouth</a>, hushed at once, a play's runs logged in the giver's own sample count; designed: text a client gives spoken by a speech <a href="#engines">engine</a></td></tr>
       </tbody>
@@ -599,7 +599,7 @@
 <section class="docs-section" id="engines" data-component="engines">
   <header>
     <h2 class="h2">Engines</h2>
-    <p class="docs-note">Built through slice 10; the reference talkers engine and the clean track (slices 11 and 12) designed. The work that reads sound (the echo stage, voice
+    <p class="docs-note">Built through slice 11; the clean track (slice 12) designed. The work that reads sound (the echo stage, voice
       and turns, words) and the work that makes it (speech) are engines: programs on rift's socket,
       each of one kind on one track, swapped while the daemon runs. Models come and go; the daemon,
       its clock, its log and its checks stay. The wire is <a href="protocol.html#engines">the
@@ -611,7 +611,7 @@
       <tbody>
         <tr><td class="table-mono">echo</td><td>an ear's frames live, every mouth's runs</td><td>masks of the ear; later, a clean track</td><td><code class="code">tail</code>, in rift: masks each run as it sounds, plus a tail</td></tr>
         <tr><td class="table-mono">speech</td><td>a mouth's says, text in pieces</td><td>a play of the audio, marks of the text sounded</td><td><code class="code">read-aloud</code>: Pocket TTS</td></tr>
-        <tr><td class="table-mono">talkers</td><td>an ear's ruled frames, or a clean track's, and the turn engine's turns</td><td>who spoke when: settled spans, each voice an enrolled label with how sure, or a number</td><td><code class="code">diarize</code>: LS-EEND, then WeSpeaker against the enrolled voices (designed)</td></tr>
+        <tr><td class="table-mono">talkers</td><td>an ear's ruled frames, or a clean track's, and the turn engine's turns</td><td>who spoke when: settled spans, each voice an enrolled label with how sure, or a number</td><td><code class="code">diarize</code>: LS-EEND, then WeSpeaker against the enrolled voices</td></tr>
         <tr><td class="table-mono">turn</td><td>an ear's ruled frames, or a clean track's</td><td>voice starts and stops, turns</td><td><code class="code">endpoint</code>: Silero VAD, then Smart Turn at each close</td></tr>
         <tr><td class="table-mono">words</td><td>the same frames, and the turn engine's turns</td><td>partial and final words, each timed</td><td><code class="code">transcribe</code>: Moonshine v2</td></tr>
       </tbody>
@@ -701,18 +701,19 @@
       pure function of two kinds of event on a feed (<a href="protocol.html#engines">who spoke a
       turn</a>). A client that acts only on one enrolled voice's speech keeps each
       <code class="code">turn</code> until a <code class="code">talkers</code> span reaches its end,
-      then sums the voice's share over the turn's whole length, time no span covers unknown: with labels settling about 1.1 s after the audio and the turn
-      logged 279 ms after speech ends past 1.5 s of voice, 770 ms under it, it knows 0.3 to 0.8 s
-      after the turn event (unverified 2026-11-26 · the two engines' delays measured apart, never
-      together).</li>
+      then sums the voice's share over the turn's whole length, time no span covers unknown: the
+      span reaching a turn's end is logged 1.11 to 1.22 s after that end, 0.83 to 0.94 s after the
+      turn event (measured 2026-11-26 · <code class="code">mise run prove-diarize</code>, 2 runs of
+      4 turns, endpoint and diarize on one daemon).</li>
     <li><strong>Enrolment is the engine's, local and private.</strong> A profile is the engine's
       own file, in a directory its job's command names; the daemon learns a label and nothing else
       about whom it names. The enrolment tool is a subcommand of the engine, never of rift:
-      <code class="code">diarize enrol &lt;label&gt; --profiles &lt;dir&gt;</code> with
+      <code class="code">diarize enrol &lt;label&gt; --model &lt;dir&gt; --profiles &lt;dir&gt;</code> with
       <code class="code">--track &lt;track&gt; --from &lt;t&gt; --to &lt;t&gt;</code> (it reads the span with
       <code class="code">read</code>, as any client) or <code class="code">--file &lt;pcm&gt;</code>,
-      embeds the speech in it and writes <code class="code">&lt;dir&gt;/&lt;label&gt;.json</code>
-      0600; <code class="code">diarize forget &lt;label&gt;</code> removes it, and the running engine
+      refuses audio LS-EEND finds no voice in, and writes the audio (its first 30 s) and its
+      embedding to <code class="code">&lt;dir&gt;/&lt;label&gt;.json</code> 0600, the directory
+      made 0700; <code class="code">diarize forget &lt;label&gt; --profiles &lt;dir&gt;</code> removes it, and the running engine
       reads the directory as it connects, so a new profile takes effect on its job's restart. No
       profile, recording or label is ever committed.</li>
     <li><strong>The echo stage rules before anything downstream reads.</strong> With an echo engine
@@ -787,6 +788,7 @@ rift status                                   # "engines":{"ear-mac":{"echo":"ta
     <table data-table>
       <thead><tr><th>reference engine</th><th>kind</th><th>what it does</th><th>where</th></tr></thead>
       <tbody>
+        <tr><td class="table-mono">diarize</td><td>talkers</td><td>LS-EEND (DIHARD III, 100 ms steps) through FluidAudio, macOS only, fed each 20 ms frame as it comes, each step's slots over 0.5 smoothed by a median of five steps; a step settles once two more have come, so a span is reported 1.1 to 1.2 s after the audio it ends on (LS-EEND gives each step once, 0.9 s after it, never revising it), cut at each change of who speaks, each hole, each turn line's end and at 20 s. The profiles in <code class="code">--profiles</code>, read at each connect, enrol LS-EEND afresh with each label's audio; each span naming a label is scored by WeSpeaker's embedding of its audio (at most 10 s) against the profile's, the cosine mapped linearly from -0.3 (0) to 1 (1), so 0.35 reads 0.5, null under 0.5 s. Masked frames are nobody's. LS-EEND names a new voice from its first steps, not after a second of nobody: 8 of 11 phrases over three Pocket TTS voices from their first step, the rest 0.2 to 0.5 s in, nobody before it; it told no overlap of two of them apart (observed 2026-11-26). <code class="code">diarize enrol</code> and <code class="code">forget</code> keep the profiles (<code class="code">engines/README.md</code>). Ready 0.3 s after start once Core ML's cache is warm; 0.7 ms a step, 16 ms an embedding (measured 2026-11-26 · <code class="code">mise run prove-diarize</code>; a timing probe over <code class="code">fixtures/voices.pcm</code>)</td><td><code class="code">engines/diarize/</code>, Swift</td></tr>
         <tr><td class="table-mono">endpoint</td><td>turn</td><td>Silero VAD on 32 ms windows, a voice reported once it spans 96 ms of speech and closed after 256 ms under its offset, Smart Turn v3.2 scoring the turn so far at each close, over <code class="code">--bar</code> (0.5) a turn, else held for the next voice up to <code class="code">--ceiling-ms</code> (3000) of silence; a turn over the bar spanning under <code class="code">--short-ms</code> (1500) of voice is held <code class="code">--grace-ms</code> (512) of silence first, a voice reported inside it joining the turn (one that starts inside it but spans its 96 ms only after it is due does not), either flag at 0 turning that off, as Smart Turn scores a short opening word and its pause a finished turn (0.81 to 0.99; on recordings of one speaker, 75 sentences, turns cut mid-sentence 23 to 6 at the same 310 ms median close, observed 2026-11-26). Voice off is logged 279 ms after speech ends, and the turn with it over 1.5 s of voice, 770 ms after under it (observed 2026-11-26 · <code class="code">engines/prove.py</code>, the fixture's 1.66 s, then with <code class="code">--short-ms 2000</code>). A hole under 256 ms is heard as silence of its length; a longer one closes the voice at the hole's start and resets Silero, so no hole makes a voice or a turn of its own. Connecting, it hears again the audio from the oldest the window holds, any boot, so a turn held as an engine left is rebuilt whole and closed as usual, by the ceiling, or by the grace when it was waiting one out; the voices its reply's <code class="code">through</code> covers stay unreported, a logged turn heard again is refused unsaid, and a turn whose voice was under way at that oldest audio is dropped, said once, rather than reported short (its edge swept meanwhile, it resumes from <code class="code">through</code> and says the held turn is not rebuilt)</td><td><code class="code">engines/endpoint/</code>, Rust</td></tr>
         <tr><td class="table-mono">read-aloud</td><td>speech</td><td>Pocket TTS, voice <code class="code">--voice</code> (alba), each say spoken as its text comes in spans of whole sentences of up to 390 bytes (a longer sentence alone), one model piece of at most 120 tokens each, so commas and the joins between sentences keep the voice's own prosody, its 24 kHz chunks given as made, a mark once each span that sounded is given, so marks rise strictly, a hush stopping it at the next chunk (play open 63 ms after the say, measured 2026-11-26 · <code class="code">engines/prove.py</code>)</td><td><code class="code">engines/read-aloud/</code>, Rust</td></tr>
         <tr><td class="table-mono">scribe</td><td>words</td><td>Parakeet Ultra through FluidAudio, macOS only, decoding each turn once, whole, at its turn line: its frames in a 30 s buffer, a span opened at a voice's start less 250 ms and held across the voices of a turn held unfinished, decoded over its audio to the turn's end alone, at 20 s by its own rule (300 ms behind the newest frame, past a voice's close and its line, the rest carried on as the next span while the voice is on, and closed by an off or a turn line ending at or before it); no partials; none for a turn with no words. With no voice lines it decodes nothing; a turn line ending before a span a voice opened (a replay's) leaves it open. It writes no transcript anywhere but its reports: FluidAudio's own lines go to the unified log alone, from warning up. It connects from 30 s back, and loads and warms its model before it connects, saying so once. Parakeet times each word by its tokens, each mapped back to when its audio was heard, holes included; <code class="code">--model</code> required, <code class="code">--terms</code> rescoring the words toward the file's terms by FluidAudio's CTC spotter, each kept word keeping its times and a replaced run sharing the span it took (any newline, CRLF included); without it, no rescoring: a second fixture's invented "Phlogix", heard "Flogix" without it, is "Phlogix" with it, its final 79 to 82 ms after its turn line (2 runs). The fixture's final lands 39 to 51 ms after its turn line, the decode itself, so decoding speculatively at voice off could save at most that; ready 9.3 s after start on first use (Core ML compiling for the Neural Engine), 151 to 158 ms after; a 38 MB footprint, the weights on the Neural Engine not counted (measured 2026-11-26 · <code class="code">mise run prove-scribe</code>, 5 runs; <code class="code">/usr/bin/time -l</code>)</td><td><code class="code">engines/scribe/</code>, Swift: an engine in any language</td></tr>
@@ -803,7 +805,7 @@ rift status                                   # "engines":{"ear-mac":{"echo":"ta
     "Please turn on the kitchen lights.", no recording of a person) where its weights are, scribe's
     skipped off macOS; <code class="code">mise run prove-engines</code> runs three against a
     throwaway daemon and a fake output (<code class="code">PROVE_FAST=1</code> on a loaded
-    machine), <code class="code">prove-scribe</code> the same with scribe for words. rift's release
+    machine), <code class="code">prove-scribe</code> the same with scribe for words, <code class="code">prove-diarize</code> endpoint and diarize over <code class="code">fixtures/voices.pcm</code>. rift's release
     carries none of them. Smart Turn completes a falling sentence (0.988) and holds an unfinished
     one ("So I was thinking that we...", 0.008, the retired reference's front end agreeing at
     0.008); the ceiling path is the stub suite's. A file-fed ear paced in real time on a busy
@@ -825,29 +827,25 @@ rift status                                   # "engines":{"ear-mac":{"echo":"ta
         <tr><td>8 · the loop</td><td>the jobs on a Mac</td><td>speak, a final <code class="code">words</code> event, a <code class="code">say</code>, its <code class="code">spoken</code> whole and the ear's track masked across its runs; the same with fixture and fake output as the suite's last case</td></tr>
         <tr><td>9 · talkers</td><td>the kind, <code class="code">talkers</code> reports and events, its <code class="code">through</code>, its frames and turn lines, <code class="code">rift engine add talkers</code></td><td>a suite talkers engine over a file-fed ear: its spans logged with the values sent, talkers as given; refused and unlogged: one overlapping, out of order, empty, past the last frame, a string id not of the form or not starting with a letter, an integer under 1 or with a score, a score outside 0 to 1, an id twice or out of order; a reconnect's <code class="code">through</code> the last span's end; each turn line after the frame holding its end, as slice 3's; health and the <code class="code">engine</code> events listing it; the plist's kind against the <code class="code">launchctl</code> stub</td></tr>
         <tr><td>10 · the join</td><td>nothing in the daemon: the client's rule, held by the suite</td><td>a suite turn engine and talkers engine on one ear, a feed reading both: for each turn, each id's, nobody's and the unknown time over its whole length summed from the values, a gap unknown, known once a span reaches its end; a talkers engine's <code class="code">engine</code> off after a turn's last span and before its event, so the tail reads unknown, not "not yet"; a reconnect mid-turn, each connection's integer ids kept apart; with none connected, health and the feed saying so</td></tr>
-        <tr><td>11 · <code class="code">diarize</code></td><td>the reference talkers engine, <code class="code">engines/diarize/</code>, Swift, macOS only, and its <code class="code">enrol</code> and <code class="code">forget</code></td><td>its protocol logic at 100 % against a stub diarizer and embedder in <code class="code">check-engines</code> on macOS (said skipped elsewhere): settling, cuts at turn lines, ids and order; one model test over a synthetic fixture of two Pocket TTS voices, one enrolled from its first phrase: that voice's label on its later phrases, an integer on the other's, a span naming both where the fixture overlaps them</td></tr>
+        <tr><td>11 · <code class="code">diarize</code></td><td>the reference talkers engine, <code class="code">engines/diarize/</code>, Swift, macOS only, and its <code class="code">enrol</code> and <code class="code">forget</code></td><td>its protocol logic at 100 % against a stub diarizer and embedder in <code class="code">check-engines</code> on macOS (said skipped elsewhere): settling, cuts at turn lines, gaps and nobody, masks, ids and order, resuming from <code class="code">through</code>, the 16-talker cap, enrolment's files; one model test over <code class="code">fixtures/voices.pcm</code> (Pocket TTS, alba then marius, twice each), alba enrolled from its first phrase: its label on its later phrase, an integer on marius's; <code class="code">prove-diarize</code> the same through a throwaway daemon, the profile enrolled by the daemon's <code class="code">read</code>. Overlap is not tested: LS-EEND named one voice at a time over two of Pocket's mixed</td></tr>
         <tr><td>12 · on the clean track</td><td>a talkers engine naming <code class="code">clean-&lt;name&gt;</code> once the echo engine streams one</td><td>the clean track accepted as a talkers engine's track and its turn lines routed from that track's turn engine; a profile enrolled from the clean track scoring its own voice there as from the ruled ear; the machine's own speech, masked on the ear, nobody's on the clean track</td></tr>
       </tbody>
     </table>
   </div>
   <ul class="stack">
-    <li><strong>The reference talkers engine, designed.</strong> <code class="code">diarize</code>:
-      FluidAudio's LS-EEND streaming diarizer (MIT, up to 10 voices) for who speaks when, its
-      enrolled voices seeded from the profiles, and FluidAudio's WeSpeaker embedder (CC-BY-4.0) for
-      each span's score against them; with one voice enrolled it named 98.3 % of that voice's frames
-      and 0.2 % of another's as it, updating every 100 ms at 0.7 ms a step, a new voice given an id
-      1.0 to 1.1 s after it starts (observed 2026-11-26 · two speakers, one enrolled). It reports a
-      span once LS-EEND's labels for its end have stopped changing, cut at each change and each
-      turn line, scores a span under 0.5 s <code class="code">null</code>, and connects with
-      <code class="code">"from":"through"</code>. Swift because FluidAudio is a Swift package on
-      Apple's Neural Engine; a SwiftPM package of its own with its resolved lock, its models in its
-      own cache, their downloads and licences in <code class="code">engines/README.md</code>. Its
-      row joins the reference engines when built.</li>
-    <li><strong>Its install.</strong> <code class="code">swift build -c release --package-path
-      engines/diarize</code>, a profile with <code class="code">engines/diarize/.build/release/diarize
-      enrol</code>, then <code class="code">rift engine add talkers --
-      &lt;checkout&gt;/engines/diarize/.build/release/diarize ear-mac --profiles
-      ~/.config/diarize/</code>, the directory 0700 and the job's alone.</li>
+    <li><strong>The reference talkers engine.</strong> <code class="code">diarize</code> (its row
+      above): FluidAudio's LS-EEND (MIT, up to 10 voices) for who speaks when and its WeSpeaker
+      embedder (CC-BY-4.0) for each span's score; with one voice enrolled LS-EEND named 98.3 % of
+      that voice's frames and 0.2 % of another's as it (observed 2026-11-26 · two speakers, one
+      enrolled). The 1.0 to 1.1 s before a new voice's first segment that the same run measured is
+      LS-EEND's 0.9 s output lag, not a voice read as nobody, so no span waits on a relabel: the
+      settling delay is that lag and the median's 0.2 s. A profile keeps the enrolment audio as
+      well as its embedding, since LS-EEND enrols from audio. Swift because FluidAudio is a Swift
+      package on Apple's Neural Engine; a SwiftPM package of its own with its resolved lock.</li>
+    <li><strong>Its install.</strong> <code class="code">mise run install-engines</code> builds it
+      and fetches its models at their pins; a profile with <code class="code">diarize enrol</code>,
+      then the <code class="code">rift engine add talkers -- … --profiles ~/.config/diarize</code>
+      line it prints, the directory 0700 and the job's alone.</li>
     <li><strong>What the clean track adds.</strong> Nothing on the wire: a talkers engine names
       <code class="code">clean-&lt;name&gt;</code> as the turn and words engines do, all three on the
       same track so the turn lines it reads are that track's. A profile is enrolled from the track
