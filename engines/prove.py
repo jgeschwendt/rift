@@ -9,8 +9,8 @@ A throwaway daemon with its own root, a fake output under $RIFT_SPEAKER (no soun
 speaker), the three engines connected, the fixture fed by a file-fed ear: voice, a turn, a final
 words event naming the fixture's words, then a say of a reply, its spoken count and the sound the
 fake output took. The feed's lines land in <out>/feed.jsonl, the verdict on stdout, exit 0 when it
-holds. $TRANSCRIBE_MODEL names Moonshine's directory; the other models are read from their
-defaults (README.md).
+holds. $PROVE_WORDS names the words engine, transcribe (the default) or scribe, its weights in
+$TRANSCRIBE_MODEL or $SCRIBE_MODEL; the other models are read from their defaults (README.md).
 """
 
 # ruff: noqa: S603 -- it runs the programs it was handed
@@ -103,14 +103,16 @@ class Proof:
         subprocess.run([rift, "ears", "on"], env=self.env, check=True, capture_output=True)
         self.run(rift, "feed", stdout=(self.out / "feed.jsonl").open("w"))
         uv = ["uv", "run", "--project", str(HERE / "transcribe"), "--locked", "transcribe"]
-        model = ["--model", os.environ["TRANSCRIBE_MODEL"]]
+        words = os.environ.get("PROVE_WORDS", "transcribe")
+        model = ["--model", os.environ[f"{words.upper()}_MODEL"]]
+        engine = {"scribe": [str(bins / "scribe")], "transcribe": uv}[words]
         for name, args in (
             ("endpoint", [str(bins / "endpoint"), "ear-desk"]),
-            ("transcribe", [*uv, "ear-desk", *model]),
+            (words, [*engine, "ear-desk", *model]),
             ("read-aloud", [str(bins / "read-aloud"), "mouth-desk"]),
         ):
             self.run(*args, stderr=(self.out / f"{name}.err").open("w"))
-        want = {"ear-desk": {"turn": "endpoint", "words": "transcribe"}}
+        want = {"ear-desk": {"turn": "endpoint", "words": words}}
         want["mouth-desk"] = {"speech": "read-aloud"}
         health = lambda: ask(self.sock, {"op": "health"})[0]  # noqa: E731
         ready = lambda: health().get("engines") == want and "mouth-desk" in health()["devices"]  # noqa: E731

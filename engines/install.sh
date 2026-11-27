@@ -1,11 +1,11 @@
 #!/bin/sh
 # The reference engines installed beside rift's fixed copies, out of any checkout's target/ or
-# working tree: endpoint and read-aloud built in release and renamed into place, transcribe
-# synced from its lock into a venv of its own, not editable, and every model fetched here and
-# now at its pin, so no engine fetches anything as it runs. Rerun to upgrade. Prints the
-# `rift engine add` lines for this machine and runs none. $RIFT_ENGINES_PREFIX overrides
-# ~/.local/libexec/rift (the suite's temp directory); $TRANSCRIBE_MODEL names a Moonshine
-# directory already fetched, in place of fetching one under the prefix.
+# working tree: endpoint, read-aloud and (on macOS) scribe built in release and renamed into
+# place, transcribe synced from its lock into a venv of its own, not editable, and every model
+# fetched here and now at its pin, so no engine fetches anything as it runs. Rerun to upgrade.
+# Prints the `rift engine add` lines for this machine and runs none. $RIFT_ENGINES_PREFIX
+# overrides ~/.local/libexec/rift (the suite's temp directory); $TRANSCRIBE_MODEL names a
+# Moonshine directory already fetched, in place of fetching one under the prefix.
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 prefix=${RIFT_ENGINES_PREFIX:-$HOME/.local/libexec/rift}
@@ -31,3 +31,18 @@ host=${host:-<name>}
 echo "rift engine add turn -- $prefix/endpoint ear-$host"
 echo "rift engine add words -- $prefix/transcribe/bin/transcribe ear-$host --model $model"
 echo "rift engine add speech -- $prefix/read-aloud mouth-$host"
+# scribe, macOS only: built in release from its Package.resolved, Parakeet Ultra and the CTC 110M
+# vocabulary model fetched at their pins into one --model directory
+if [ "$(uname)" = Darwin ] && command -v swift >/dev/null 2>&1; then
+  swift build -c release --disable-keychain --package-path "$here/scribe" --quiet
+  install -m 755 "$here/scribe/.build/release/scribe" "$prefix/scribe.new"
+  mv -f "$prefix/scribe.new" "$prefix/scribe"
+  parakeet=$prefix/models/parakeet
+  hf FluidInference/parakeet-ultra-coreml --revision 95eaa59a39d4394f047a4dc5cce480388a60d1b6 \
+    --local-dir "$parakeet/parakeet-ultra" --include '*.mlmodelc/*' --include '*.json'
+  hf FluidInference/parakeet-ctc-110m-coreml --revision accdafd8cf8a2ff1cabe3c11e54416b405d409aa \
+    --local-dir "$parakeet/parakeet-ctc-110m-coreml" --include 'AudioEncoder.mlmodelc/*' \
+    --include 'MelSpectrogram.mlmodelc/*' --include config.json --include special_tokens_map.json \
+    --include tokenizer.json --include tokenizer_config.json --include vocab.json
+  echo "rift engine add words -- $prefix/scribe ear-$host --model $parakeet  # in place of transcribe"
+fi

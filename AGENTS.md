@@ -14,19 +14,25 @@ mise run dist      # this host's release archive, the next YYYY.M.N stamped, to 
 mise run install   # a dev build to ~/.local/bin/rift-next, beside the release; setup never wires it
 mise run check-engines   # engines/: fmt, lints, each engine's protocol logic at 100 % against a stub model
 mise run prove-engines   # engines/: all three on a throwaway daemon, the fixture and a fake output; PROVE_FAST=1 under load
+mise run prove-scribe    # the same with scribe as the words engine; macOS, $SCRIBE_MODEL
 ```
 
-The reference engines (`engines/`, a Cargo workspace and a uv project of their own; licences and
+The reference engines (`engines/`, a Cargo workspace, a uv project and a Swift package of their own; licences and
 downloads in `engines/README.md`) run as `engines/target/release/endpoint <ear track> [--bar 0.5]
 [--ceiling-ms 3000] [--grace-ms 512] [--short-ms 1500] [--silero <file>] [--smart-turn <file>]`, `engines/target/release/read-aloud
-<mouth track> [--voice alba] [--pocket <dir>]` and `uv run --project engines/transcribe transcribe
+<mouth track> [--voice alba] [--pocket <dir>]`, `uv run --project engines/transcribe transcribe
 <ear track> [--model <dir>] [--terms <file>]` (`--terms`: lines `Term` or `Term: heard, heard`,
-your own file, never committed). Each stands, connects with `"from":"through"` so a start or reconnect resumes, and stops on a signal
-as a device does. Coverage exempts each engine's `main.rs`, `models.rs`, `pocket.rs` and
-`moonshine.py`: model and command-line lines alone, each model held instead by one test over
-`engines/fixtures/phrase.pcm` (Pocket TTS, `cargo run --release -p read-aloud --example fixture`)
-that runs where its weights are (Moonshine's directory in `$TRANSCRIBE_MODEL`) and says `skipped`
-otherwise.
+your own file, never committed), and on macOS `engines/scribe/.build/release/scribe <ear track>
+--model <dir> [--terms <file>]` (a Swift package; `<dir>` holds `parakeet-ultra/` and
+`parakeet-ctc-110m-coreml/`; build with `--disable-keychain`). Each stands, connects with `"from":"through"` so a start or reconnect resumes, and stops on a signal
+as a device does. Coverage exempts each engine's `main.rs`, `models.rs`, `pocket.rs`,
+`moonshine.py` and scribe's `Parakeet.swift` and `main.swift` (`engines/scribe/check.sh` gates
+`Sources/Engine` alone): model and command-line lines alone, each model held instead by one test
+over `engines/fixtures/phrase.pcm` (Pocket TTS, `cargo run --release -p read-aloud --example
+fixture`) that runs where its weights are (Moonshine's directory in `$TRANSCRIBE_MODEL`, scribe's
+`--model` in `$SCRIBE_MODEL`) and says `skipped` otherwise. Swift 6.2.4 miscompiled the scribe
+suite's closure-taking stderr helper, handing one call's closure to another, so its tests swap
+the writer by `listen()` instead (observed 2026-11-26).
 
 The gate runs in hk's pre-push (`hk install --mise` once per clone) and in CI. `Cargo.toml`'s
 `[lints]` tables are kept by hand, held by no gate; each `allow` carries its reason. Coverage

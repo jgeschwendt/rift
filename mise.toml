@@ -28,6 +28,8 @@ run = [
   "uv run --project transcribe --locked ruff format --check --config transcribe/pyproject.toml transcribe prove.py",
   "uv run --project transcribe --locked ruff check --config transcribe/pyproject.toml transcribe prove.py",
   "uv run --project transcribe --locked pytest transcribe -p no:cacheprovider -rs --cov=transcribe/src --cov-config=transcribe/pyproject.toml",
+  # macOS and Swift only, else one line saying it is skipped
+  "scribe/check.sh",
 ]
 
 [tasks.cover]
@@ -66,4 +68,14 @@ run = [
   "cargo build --release --manifest-path engines/Cargo.toml",
   "mkdir -p /tmp/rift-prove/bin && cp target/debug/rift engines/target/release/endpoint engines/target/release/read-aloud /tmp/rift-prove/bin/",
   "uv run --project engines/transcribe --locked python engines/prove.py /tmp/rift-prove/bin/rift /tmp/rift-prove/bin /tmp/rift-prove ${PROVE_FAST:+--fast}",
+]
+
+[tasks.prove-scribe]
+description = "prove-engines with scribe as the words engine, macOS only; needs $SCRIBE_MODEL, the --model directory"
+run = [
+  "cargo build",
+  "cargo build --release --manifest-path engines/Cargo.toml",
+  "swift build -c release --disable-keychain --package-path engines/scribe",
+  "mkdir -p /tmp/rift-prove-scribe/bin && cp target/debug/rift engines/target/release/endpoint engines/target/release/read-aloud engines/scribe/.build/release/scribe /tmp/rift-prove-scribe/bin/",
+  "PROVE_WORDS=scribe uv run --project engines/transcribe --locked python engines/prove.py /tmp/rift-prove-scribe/bin/rift /tmp/rift-prove-scribe/bin /tmp/rift-prove-scribe ${PROVE_FAST:+--fast}",
 ]
