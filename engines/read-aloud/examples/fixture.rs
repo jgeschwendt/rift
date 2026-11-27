@@ -1,7 +1,7 @@
 //! `cargo run --release --example fixture -- <out.pcm> [<voice>=]<text>…`: the engines' synthetic
-//! fixture, Pocket TTS saying each text in its preset voice (alba unless named, each voice loaded
-//! once), 0.5 s of silence first, 0.7 s between, 1.5 s last, as 16 kHz 16-bit mono
-//! little-endian PCM, the file a file-fed ear plays. No recording of a person.
+//! fixture, Pocket TTS saying each text in its preset voice (alba unless one of `VOICES` is named,
+//! each voice loaded once), 0.5 s of silence first, 0.7 s between, 1.5 s last, as 16 kHz 16-bit
+//! mono little-endian PCM, the file a file-fed ear plays. No recording of a person.
 #![expect(
     clippy::arithmetic_side_effects,
     clippy::integer_division,
@@ -21,6 +21,12 @@ use link::hub;
 use read_aloud::pocket::{DIR, Pocket};
 use read_aloud::speak::Voice as _;
 
+/// Pocket TTS's preset voices: a text's `<voice>=` prefix is read as a voice only when it names
+/// one, so a text holding `=` is said whole.
+const VOICES: [&str; 8] = [
+    "alba", "azelma", "cosette", "eponine", "fantine", "javert", "jean", "marius",
+];
+
 fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
     let mut pockets = BTreeMap::new();
@@ -31,9 +37,7 @@ fn main() -> io::Result<()> {
         }
         let (voice, text) = arg
             .split_once('=')
-            .filter(|&(voice, _)| {
-                !voice.is_empty() && voice.bytes().all(|byte| byte.is_ascii_lowercase())
-            })
+            .filter(|&(voice, _)| VOICES.contains(&voice))
             .unwrap_or(("alba", arg));
         let pocket = match pockets.entry(voice) {
             Entry::Occupied(held) => held.into_mut(),
