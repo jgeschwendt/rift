@@ -49,6 +49,7 @@ TERMS = os.environ.get("PROVE_TERMS")
 FIXTURE, HEARD = ("term.pcm", ("phlogix",)) if TERMS else ("phrase.pcm", ("kitchen", "lights"))
 HERE = Path(__file__).parent
 REPLY = "Sure, the kitchen lights are on now. Anything else?"
+SURE = 0.5  # the score over which a talkers label is the enrolled voice's
 
 
 def ask(sock: str, *requests: dict, rest: bool = False) -> list[dict]:
@@ -264,11 +265,9 @@ def talkers(rift: str, bins: Path, out: Path) -> None:
     )
     # the fixture's four phrases, alba's first: hers mostly `first`, scored over 0.5; marius's
     # never `first` over 0.5, which LS-EEND alone may name him
-    over = [any((score or 0) > 0.5 for score in row["first_scores"]) for row in rows]
+    over = [any((score or 0) > SURE for score in row["first_scores"]) for row in rows]
     sys.exit(
-        0
-        if over == [True, False] * 2 and rows[0]["mostly"] == rows[2]["mostly"] == "first"
-        else 1
+        0 if over == [True, False] * 2 and rows[0]["mostly"] == rows[2]["mostly"] == "first" else 1
     )
 
 
