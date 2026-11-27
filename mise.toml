@@ -28,7 +28,7 @@ run = [
   "uv run --project transcribe --locked ruff format --check --config transcribe/pyproject.toml transcribe prove.py",
   "uv run --project transcribe --locked ruff check --config transcribe/pyproject.toml transcribe prove.py",
   "uv run --project transcribe --locked pytest transcribe -p no:cacheprovider -rs --cov=transcribe/src --cov-config=transcribe/pyproject.toml",
-  # macOS and Swift only, else one line saying it is skipped
+  # macOS with Swift 6.2 or later only (scribe/supported.sh), else one line saying it is skipped
   "scribe/check.sh",
 ]
 
