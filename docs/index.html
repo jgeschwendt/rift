@@ -353,7 +353,10 @@
       default closes it and opens the new one, what is queued kept; an output that goes with no
       default left is one stderr line and a wait, the play queued and its giver paced, until one
       appears or, past <code class="code">$RIFT_STALL_MS</code>, the stall rule ends the play. An output that fails while it stays listed (cpal pauses its stream on a rate change,
-      a Bluetooth profile's switch or a device lost: anything but a glitch) ends its open; the mouth
+      a Bluetooth profile's switch or a device lost: anything but a glitch) ends its open; a glitch
+      (CoreAudio's processor overload, an I/O cycle the output missed, heard as a click) plays on,
+      said on stderr as <code class="code">"&lt;output&gt;" glitched (&lt;n&gt;)</code> the 1st, 2nd,
+      4th… time in an open; the mouth
       says so, closes it as above and opens it again a poll on, a refused open retried as any. Each
       output its frames name, <code class="code">speaker</code>, as an ear's name their
       microphone.</li>
@@ -367,20 +370,31 @@
       have. A hush drops the converted queue and
       the given samples alike.</li>
     <li><strong>Conversion.</strong> Audio is given 16-bit mono at a stated rate, 8 to 48 kHz, and
-      converted once, in the mouth, to the output's rate: each output sample a Hann-windowed sinc
-      interpolation of the given samples around its position, 16 each side, cut at 0.45 of the lower
-      of the two rates, its taps precomputed at 256 phases between two samples once a play and
-      output, the nearest phase read; then written to every channel; no gain, the system's volume alone. Audio is
-      not narrowed before it is played. The track is then made from what the output took, by the
-      ear's own converter to 16 kHz.</li>
+      converted once, in the mouth, to the output's rate: each output sample a Kaiser-windowed
+      (β 9) sinc interpolation of the given samples around its position, 32 each side, cut at 0.475
+      of the lower of the two rates, its taps precomputed at 256 phases between two samples once a
+      play and output and read between the two nearest; the <i>n</i>th output sample's position
+      <i>n</i> × given rate / output rate, one division, so no rounding adds up. A tone given at 16
+      or 24 kHz to a 44.1 or 48 kHz output comes out at 89 dB SINAD or more as 16 bits, their own
+      floor, flat within 0.01 dB to 10 kHz of 24 (measured 2026-11-27 · tones of 300 Hz to 10 kHz, a
+      replica of the interpolator matched to the fake output's samples; <code class="code">fidelity</code>
+      in the suite holds 85 dB). Then written to every channel; no gain, the system's volume alone.
+      Audio is not narrowed before it is played. The track is then made from what the output took, by the ear's own converter to 16 kHz.</li>
     <li><strong>Where audio waits.</strong> In the mouth alone: the daemon passes each give on as it
       reads it and holds none, and withholds the give's reply while the mouth holds
       <code class="code">$RIFT_AHEAD_MS</code> (200) or more of it untaken, so a giver faster than real
       time is paced by its replies and the mouth holds at most that plus one give (16 KiB). A hush
       drops that queue in one place; a queue in the daemon would still need the mouth's dropped, and
-      would be memory a restart loses either way. A mouth that runs dry plays silence and starts the
-      next run with the next give; there is no priming wait, so a giver slower than real time is heard
-      as it is, in runs. The last 16 samples wait for the play's <code class="code">end</code>, which
+      would be memory a restart loses either way. A run begins on a cushion: with nothing converted
+      queued, as a play starts or once its mouth has run dry, the mouth waits until it holds
+      <code class="code">$RIFT_LEAD_MS</code> (100) past the interpolation's reach, or the play has
+      ended, or it has held some for that long, then plays; a giver faster than real time but
+      jittery, a speech engine giving 80 ms frames as it makes them, is heard whole, where a run
+      begun on its first frame ran dry after it (measured 2026-11-27 · the fake output, 80 ms gives
+      75 to 95 ms apart: three runs before, one after). A mouth run dry plays silence, its position
+      held; a giver slower than real time is heard in runs, each begun on that cushion, so in fewer,
+      longer pauses rather than a stutter every give. A run's start, the
+      <code class="code">sound</code> event's, is when it began. The last 32 samples wait for the play's <code class="code">end</code>, which
       the interpolation needs, so an <code class="code">end</code> held up past what the mouth holds
       splits off a run of them; the last sample stands for what is past it, so a play run to its end
       counts every given sample played. The daemon's queue to the mouth is the mouth's alone; one
@@ -520,7 +534,9 @@
       first play after idle pays for the open; the job under launchd from its own copy, asking
       nothing; sleep and wake mid-play; the output's rate changed in Audio MIDI Setup mid-play and a
       Bluetooth headset switching profile, each seen as a failed output and reopened; no glitch from
-      the callback's mutex under load; a muted output, whose taken samples still count as played;
+      the callback's mutex under load (no <code class="code">glitched</code> line in
+      <code class="code">mouth.err</code>); a play by ear against the same file through the fake
+      output then <code class="code">afplay</code>, which parts conversion from the device; a muted output, whose taken samples still count as played;
       a rollback (<code class="code">rift upgrade --back</code> onto the release before the mouth)
       leaving the mouth idle with its log capped.</li>
   </ul>
@@ -903,6 +919,7 @@ rift status                                   # "engines":{"ear-mac":{"echo":"ta
         <tr><td class="table-mono">RIFT_AHEAD_MS</td><td>how much of a play its mouth may hold untaken before the daemon withholds the giver's next reply, default 200</td></tr>
         <tr><td class="table-mono">RIFT_BOOTOUT_MS</td><td><code class="code">setup</code>'s wait for launchd to let go of a job after a bootout, default 30000</td></tr>
         <tr><td class="table-mono">RIFT_DRAIN_MS</td><td>the drain's budget for open connections before they are cut, default 1000 (launchd's <code class="code">ExitTimeOut</code> is 3 s); before them, the wait for each mouth to answer its play's hush, within the same amount</td></tr>
+        <tr><td class="table-mono">RIFT_LEAD_MS</td><td>the cushion <code class="code">--speaker</code> holds before a run of a play begins, and the longest it waits for it, default 100; past <code class="code">RIFT_AHEAD_MS</code> the giver is paced before it fills, so the wait decides</td></tr>
         <tr><td class="table-mono">RIFT_LINGER_MS</td><td>how long after the output last took a play's sample <code class="code">--speaker</code> keeps it open, default 10000</td></tr>
         <tr><td class="table-mono">RIFT_LOG_CAP</td><td>the size at which <code class="code">serve.log</code>, <code class="code">serve.err</code>, <code class="code">ear.err</code>, <code class="code">mouth.err</code> and each <code class="code">engines/&lt;kind&gt;.err</code> are each copied to <code class="code">.1</code> and emptied (emptied, not renamed, since launchd's writer appends on), default 1 MiB</td></tr>
         <tr><td class="table-mono">RIFT_MIC</td><td>the suite's fake microphones in place of the system's: a directory, its format in <code class="code">src/ear.rs</code></td></tr>
@@ -915,7 +932,7 @@ rift status                                   # "engines":{"ear-mac":{"echo":"ta
         <tr><td class="table-mono">RIFT_SEGMENT_MS</td><td>a segment's length, in whole 20 ms frames, at least one, default 10000</td></tr>
         <tr><td class="table-mono">RIFT_SIGN_MS</td><td>how long <code class="code">setup</code> lets each <code class="code">launchctl</code>, <code class="code">scutil</code>, <code class="code">security</code>, <code class="code">openssl</code> and <code class="code">codesign</code> call run before killing it and failing, naming the call, default 30000</td></tr>
         <tr><td class="table-mono">RIFT_SPEAKER</td><td>the suite's fake outputs in place of the system's: a directory, its format in <code class="code">src/mouth.rs</code> (<a href="#mouth">the mouth</a>)</td></tr>
-        <tr><td class="table-mono">RIFT_STALL_MS</td><td>how long a play's mouth may report nothing while it owes progress before the daemon ends the play <code class="code">mouth</code> (owed: the play's end after <code class="code">end</code>, or given past what was taken by more than the interpolator's 32 samples), checked every second, default 15000</td></tr>
+        <tr><td class="table-mono">RIFT_STALL_MS</td><td>how long a play's mouth may report nothing while it owes progress before the daemon ends the play <code class="code">mouth</code> (owed: the play's end after <code class="code">end</code>, or given past what was taken by more than the interpolator's 64 samples), checked every second, default 15000</td></tr>
         <tr><td class="table-mono">RIFT_ZERO_MS</td><td>how long a microphone may give only exact zeros after its open before <code class="code">--mic</code> closes it as a failed open, naming the grant, default 2000</td></tr>
       </tbody>
     </table>

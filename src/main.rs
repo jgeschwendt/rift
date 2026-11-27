@@ -63,7 +63,7 @@ const PROTO: u64 = 1;
 
 /// Given samples a mouth's interpolator holds untaken as it waits for more, its window both
 /// sides (src/mouth.rs): no progress owed (docs/protocol.html#plays).
-const REACH: u64 = 32;
+const REACH: u64 = 64;
 
 /// The `stopping` state, the one the request handler tests for.
 const STOPPING: &str = "stopping";

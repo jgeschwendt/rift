@@ -143,7 +143,7 @@ is neither ended nor hushed; `hush` and an `end` finish a play given nothing at 
 hushes and waits for `done` up to `PATIENCE` (1 s), then cuts the mouth and ends the play at its
 last report; the drain runs it per play inside its budget. `stalled`, run with the sweep every
 second, ends `mouth` a play whose mouth owes progress (its end after `end`, or given past taken
-by more than `REACH`, the interpolator's 32 samples) and has not reported since its last report, give or `end` (`Play.heard`) for
+by more than `REACH`, the interpolator's 64 samples) and has not reported since its last report, give or `end` (`Play.heard`) for
 `$RIFT_STALL_MS`. A mouth's say-once lines and its backoff reset only once an output has held
 open a poll (`steady`), so one that opens and fails at once is said once and retried ever more
 slowly; the ear's reset needs audio heard, so it has no such shape. `finish` logs the run under way and `played`, closes the mouth's open segment,

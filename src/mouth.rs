@@ -24,11 +24,15 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// Phases between two given samples the interpolator's window is precomputed at.
+/// The interpolator's Kaiser window's shape: with `TAPS`, images and noise about 100 dB down.
+const BETA: f64 = 9.0;
+
+/// Phases between two given samples the interpolator's window is precomputed at, an output
+/// sample's taps read between the two nearest.
 const PHASES: usize = 256;
 
 /// Given samples read each side of an output sample's position.
-const TAPS: usize = 16;
+const TAPS: usize = 32;
 
 /// Fills each buffer of an open output, interleaved, given its rate, its channels and the
 /// microseconds until its first sample sounds.
@@ -254,6 +258,8 @@ struct Open {
 struct Play {
     /// The next output sample's position among the given samples.
     at: f64,
+    /// Since when, with none of it queued for the output, it has held some short of its lead.
+    dry: Option<Instant>,
     /// Whether nothing more will be given: its `end`, or a hush.
     ended: bool,
     /// The index of `held`'s first sample.
@@ -264,6 +270,9 @@ struct Play {
     held: VecDeque<f32>,
     /// Its number.
     num: u64,
+    /// Where the open output's stepping began, among the given samples: `at` is this plus
+    /// `stepped` output samples, by one division, so no step's rounding adds up.
+    origin: f64,
     /// Whether its last frame has been padded and queued.
     padded: bool,
     /// Its samples the output took.
@@ -274,6 +283,8 @@ struct Play {
     run: Option<(u64, u64)>,
     /// Output samples taken since its last report.
     since: u64,
+    /// Output samples converted since `origin`.
+    stepped: u64,
 }
 
 #[expect(
@@ -286,8 +297,8 @@ struct Play {
 )]
 impl Play {
     /// The next output sample at `rate`, and its position: the window's taps over the given
-    /// samples around it, its phase the nearest precomputed; none once converted to the end or
-    /// while what it needs is not yet given.
+    /// samples around it, each read between the two precomputed phases nearest; none once
+    /// converted to the end or while what it needs is not yet given.
     fn convert(&mut self, rate: u32, window: &[f64]) -> Option<(f32, f64)> {
         let base = self.at.floor();
         let ahead = (base as u64).saturating_add(TAPS as u64);
@@ -295,10 +306,17 @@ impl Play {
         {
             return None;
         }
-        let phase = ((self.at - base) * PHASES as f64).round() as usize;
-        let taps = window
-            .get(phase.saturating_mul(2 * TAPS)..)
-            .unwrap_or_default();
+        let between = (self.at - base) * PHASES as f64;
+        let part = between - between.floor();
+        let [low, high] = [0, 1].map(|row| {
+            window
+                .get(
+                    (between as usize)
+                        .saturating_add(row)
+                        .saturating_mul(2 * TAPS)..,
+                )
+                .unwrap_or_default()
+        });
         let first = (base as u64).saturating_add(1).saturating_sub(TAPS as u64);
         let skip = usize::try_from(first.saturating_sub(self.front)).unwrap_or_default();
         // taps before the first given sample read silence
@@ -311,11 +329,12 @@ impl Play {
                     .copied()
                     .chain(iter::repeat(0.0f32)),
             )
-            .zip(taps.iter().take(2 * TAPS))
-            .map(|(held, tap)| f64::from(held) * tap)
+            .zip(low.iter().zip(high).take(2 * TAPS))
+            .map(|(held, (below, above))| f64::from(held) * part.mul_add(above - below, *below))
             .sum();
         let at = self.at;
-        self.at += f64::from(self.rate) / f64::from(rate);
+        self.stepped = self.stepped.saturating_add(1);
+        self.at = self.stepped as f64 * f64::from(self.rate) / f64::from(rate) + self.origin;
         // the last sample of an ended play stands for the given samples past it, so that taken,
         // every given sample counts played
         let last = self.ended && self.at > self.given as f64 - 1.0f64;
@@ -331,6 +350,23 @@ impl Play {
     /// converted left untaken.
     fn finished(&self, queued: bool) -> bool {
         self.ended && self.at > self.given as f64 - 1.0f64 && !queued
+    }
+
+    /// Whether a run may begin, none of it queued for the output: it has ended, or holds `lead`
+    /// past the interpolator's reach, or has held some short of that for `lead`; a run begun on a
+    /// cushion rides out a giver's jitter where one begun on its first give runs dry mid-word.
+    fn ready(&mut self, lead: Duration) -> bool {
+        let ahead = self.given as f64 - TAPS as f64 - self.at;
+        if ahead <= 0.0f64 {
+            self.dry = None;
+            return self.ended;
+        }
+        let since = *self.dry.get_or_insert_with(Instant::now);
+        let ready = self.ended
+            || ahead >= lead.as_secs_f64() * f64::from(self.rate)
+            || since.elapsed() >= lead;
+        self.dry = self.dry.filter(|_| !ready);
+        ready
     }
 
     /// The run under way as a report, `closing` it; none with no run.
@@ -400,8 +436,8 @@ fn absorb(
 }
 
 /// The interpolator's window for a play at `given` Hz into an output at `rate`: for each of
-/// `PHASES + 1` phases between two given samples, `2 × TAPS` Hann-windowed sinc taps cut at 0.45
-/// of the lower rate, summing to 1.
+/// `PHASES + 1` phases between two given samples, `2 × TAPS` Kaiser-windowed sinc taps cut at
+/// 0.475 of the lower rate, summing to 1.
 #[expect(
     clippy::as_conversions,
     clippy::cast_precision_loss,
@@ -410,7 +446,16 @@ fn absorb(
     reason = "the window computed once a play and output, in floating point, apart from the loop"
 )]
 fn window(given: u32, rate: u32) -> Vec<f64> {
-    let cut = 0.45f64 * f64::from(given.min(rate)) / f64::from(given);
+    let cut = 0.475f64 * f64::from(given.min(rate)) / f64::from(given);
+    // the zeroth-order modified Bessel function by its series, its terms past 32 below an f64's
+    let bessel = |x: f64| {
+        (1..32u8)
+            .fold((1.0f64, 1.0f64), |(sum, term), at| {
+                let next = term * (x / (2.0f64 * f64::from(at))).powi(2);
+                (sum + next, next)
+            })
+            .0
+    };
     (0..=PHASES)
         .flat_map(|phase| {
             let fraction = phase as f64 / PHASES as f64;
@@ -422,7 +467,9 @@ fn window(given: u32, rate: u32) -> Vec<f64> {
                     } else {
                         (2.0f64 * PI * cut * apart).sin() / (PI * apart)
                     };
-                    sinc * 0.5f64.mul_add((PI * apart / (TAPS as f64 + 1.0f64)).cos(), 0.5f64)
+                    let edge = apart / TAPS as f64;
+                    sinc * bessel(BETA * edge.mul_add(-edge, 1.0f64).max(0.0f64).sqrt())
+                        / bessel(BETA)
                 })
                 .collect();
             let sum: f64 = taps.iter().sum();
@@ -454,8 +501,12 @@ pub fn run(reader: BufReader<UnixStream>, reply: &Value) {
                 taken: Mutex::new(0),
             }))
         });
-        let [poll, linger] = [("RIFT_POLL_MS", 1000), ("RIFT_LINGER_MS", 10_000)]
-            .map(|(key, default)| Duration::from_millis(setting(key, default)));
+        let [lead, linger, poll] = [
+            ("RIFT_LEAD_MS", 100),
+            ("RIFT_LINGER_MS", 10_000),
+            ("RIFT_POLL_MS", 1000),
+        ]
+        .map(|(key, default)| Duration::from_millis(setting(key, default)));
         let out = Arc::new(Mutex::new(reader.get_ref().try_clone().ok()?));
         reader.get_ref().set_read_timeout(None).ok()?;
         let (heard, hearing) = mpsc::sync_channel(BEHIND);
@@ -553,11 +604,13 @@ pub fn run(reader: BufReader<UnixStream>, reply: &Value) {
                         if num != ours {
                             play = Some(Play {
                                 at: 0.0,
+                                dry: None,
                                 ended: false,
                                 front: 0,
                                 given: 0,
                                 held: VecDeque::new(),
                                 num: num.unwrap_or_default(),
+                                origin: 0.0,
                                 padded: false,
                                 played: 0,
                                 rate: u32::try_from(line["rate"].as_u64().unwrap_or_default())
@@ -565,6 +618,7 @@ pub fn run(reader: BufReader<UnixStream>, reply: &Value) {
                                     .max(1),
                                 run: None,
                                 since: 0,
+                                stepped: 0,
                             });
                         }
                         // four lowercase hex digits a 16-bit sample, little-endian
@@ -711,11 +765,12 @@ pub fn run(reader: BufReader<UnixStream>, reply: &Value) {
                 (open, broken, cut, steady) = (None, false, None, None);
                 if let Some(given) = play.as_mut() {
                     given.at = untaken.map_or(given.at, |queued| queued.1);
+                    (given.origin, given.stepped) = (given.at, 0);
                     reports.extend(given.report(true));
                 }
             }
             // converted ahead of the output a quarter second, outside the lock, its window made
-            // once a play and rate
+            // once a play and rate; a run begun only once the play is `ready`
             let mut converted = Vec::new();
             if let (Some(given), Some(hz)) = (
                 play.as_mut(),
@@ -728,7 +783,9 @@ pub fn run(reader: BufReader<UnixStream>, reply: &Value) {
                     .unwrap_or_default()
                     .checked_div(4)
                     .unwrap_or_default();
-                while waiting.saturating_add(converted.len()) < headroom
+                let flowing = waiting > 0 || given.ready(lead);
+                while flowing
+                    && waiting.saturating_add(converted.len()) < headroom
                     && let Some(next) = given.convert(hz, &windowed.2)
                 {
                     converted.push(next);

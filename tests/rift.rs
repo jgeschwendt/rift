@@ -5943,7 +5943,7 @@ esac
             "true",
         )?;
         // a giver that pauses longer than the stall time, having given no more than the
-        // interpolator's reach (32 samples), owes nothing however slowly its mouth plays them: the
+        // interpolator's reach (64 samples), owes nothing however slowly its mouth plays them: the
         // play is open still
         let mut paused = greet(&root)?;
         drop(say(
@@ -6291,12 +6291,12 @@ esac
         #[expect(
             clippy::as_conversions,
             clippy::cast_possible_truncation,
+            clippy::cast_precision_loss,
             clippy::cast_sign_loss,
             reason = "the interpolator's positions, as the mouth steps them"
         )]
-        let reached = ((1..leveled)
-            .fold(0.0f64, |at, _| at + 16_000.0f64 / 44_100.0f64)
-            .floor() as u64)
+        let reached = ((leveled.saturating_sub(1) as f64 * 16_000.0f64 / 44_100.0f64).floor()
+            as u64)
             .saturating_add(1);
         same(
             &format!(
@@ -6593,5 +6593,158 @@ esac
             r#"{"ok":true}"#,
         )?;
         same(&format!("{:?}", again.0.wait()?.code()), "Some(0)")
+    }
+
+    /// `count` samples of a cosine at `hz` and half scale, 16-bit at `rate`.
+    #[expect(
+        clippy::as_conversions,
+        clippy::cast_possible_truncation,
+        clippy::float_arithmetic,
+        clippy::single_call_fn,
+        reason = "a test signal, apart from the test it serves"
+    )]
+    fn cosine(rate: u32, hz: u32, count: u32) -> Vec<i16> {
+        (0..count)
+            .map(|at| {
+                let phase = 2.0f64 * PI * f64::from(hz) * f64::from(at) / f64::from(rate);
+                (phase.cos() * 16384.0f64).round() as i16
+            })
+            .collect()
+    }
+
+    /// A tone at `hz` as an output at `rate` took it: its length from its first sample to its
+    /// last, every run of two or more zeros (the mouth run dry) cut out, and its SINAD in dB, the
+    /// sine and cosine fitted to it by least squares 256 samples in from each end against what
+    /// is left.
+    #[expect(
+        clippy::as_conversions,
+        clippy::cast_precision_loss,
+        clippy::float_arithmetic,
+        clippy::single_call_fn,
+        reason = "a test signal's measure, apart from the test it serves"
+    )]
+    fn quality(heard: &[i16], rate: u32, hz: u32) -> (usize, f64) {
+        let first = heard.iter().position(|&sample| sample != 0);
+        let last = heard.iter().rposition(|&sample| sample != 0);
+        let span = heard
+            .get(first.unwrap_or_default()..=last.unwrap_or_default())
+            .unwrap_or_default();
+        let (mut kept, mut zeros) = (Vec::new(), 0usize);
+        for &sample in span {
+            if sample == 0 {
+                zeros = zeros.saturating_add(1);
+            } else {
+                kept.extend(iter::repeat_n(0.0f64, usize::from(zeros == 1)));
+                kept.push(f64::from(sample));
+                zeros = 0;
+            }
+        }
+        let core: Vec<(f64, f64, f64)> = (kept.iter().enumerate())
+            .skip(256)
+            .take(kept.len().saturating_sub(512))
+            .map(|(at, &value)| {
+                let phase = 2.0f64 * PI * f64::from(hz) * at as f64 / f64::from(rate);
+                (phase.sin(), phase.cos(), value)
+            })
+            .collect();
+        let sum = |term: &dyn Fn(&(f64, f64, f64)) -> f64| core.iter().map(term).sum::<f64>();
+        let (ss, cc, sc) = (
+            sum(&|row| row.0 * row.0),
+            sum(&|row| row.1 * row.1),
+            sum(&|row| row.0 * row.1),
+        );
+        let (sy, cy) = (sum(&|row| row.0 * row.2), sum(&|row| row.1 * row.2));
+        let det = ss.mul_add(cc, -sc * sc);
+        let (sine, cos) = (
+            sy.mul_add(cc, -cy * sc) / det,
+            cy.mul_add(ss, -sy * sc) / det,
+        );
+        let fit = |row: &(f64, f64, f64)| sine.mul_add(row.0, cos * row.1);
+        let signal = sum(&|row| fit(row).powi(2));
+        let noise = sum(&|row| (row.2 - fit(row)).powi(2));
+        (kept.len(), 10.0f64 * (signal / noise).log10())
+    }
+
+    /// The mouth's conversion by value, and its lead, on a mouth whose lead (`$RIFT_LEAD_MS`) no
+    /// play here reaches: a cosine given in two halves at 16 or 24 kHz, the second only once the
+    /// output has taken 200 ms of silence, which is all it took meanwhile, plays at its `end` in
+    /// one run, its every sample played; taken by a 48 or a 44.1 kHz output, it is exactly as long
+    /// as the positions the mouth steps (one per output sample, `given / rate` apart, the last at
+    /// or before the last given sample), at 85 dB SINAD or more, its 16 bits allowing about 92.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn fidelity() -> Outcome {
+        let root = temp("fidelity")?;
+        let fake = format!("{root}/fake");
+        fs::create_dir_all(format!("{fake}/outputs"))?;
+        fs::write(format!("{fake}/outputs/Desk"), "48000 1 0")?;
+        fs::write(format!("{fake}/outputs/Hall"), "44100 1 0")?;
+        let (mut daemon, _) = serve(&root, &[])?;
+        let mut mouth = Daemon(
+            Command::new(env!("CARGO_BIN_EXE_rift"))
+                .env("RIFT_ROOT", &root)
+                .env("RIFT_SPEAKER", &fake)
+                .env("RIFT_LEAD_MS", "60000")
+                .env("RIFT_LINGER_MS", "300")
+                .env("RIFT_POLL_MS", "100")
+                .args(["device", "mouth", "desk", "--speaker"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()?,
+        );
+        until(|| {
+            let mut conn = greet(&root).map_err(|cause| io::Error::other(cause.to_string()))?;
+            Ok(say(&mut conn, r#"{"op":"health"}"#)?.contains("mouth-desk"))
+        })?;
+        let log = || fs::read_to_string(format!("{fake}/log")).unwrap_or_default();
+        let closed = || Ok(log().matches("open ").count() == log().matches("close ").count());
+        // each 150 ms, under the 200 ms a giver is paced at, so both halves are taken unwithheld
+        for (rate, hz, output, out_rate, length) in [
+            (24_000u32, 300u32, "Desk", 48_000u32, 7199usize),
+            (24_000, 10_000, "Hall", 44_100, 6614),
+            (16_000, 6000, "Desk", 48_000, 7198),
+        ] {
+            fs::write(format!("{fake}/default"), format!("{output}\n"))?;
+            until(closed)?;
+            let start = taken(&fake, output).len();
+            let sound = cosine(rate, hz, rate.checked_div(1000).unwrap_or_default() * 150);
+            let (first, rest) = sound.split_at(sound.len().checked_div(2).unwrap_or_default());
+            let mut giving = greet(&root)?;
+            let asked = json!({"op": "play", "rate": rate, "track": "mouth-desk"}).to_string();
+            let reply: Value = serde_json::from_str(&say(&mut giving, &asked)?)?;
+            drop(say(&mut giving, &give(first))?);
+            let waited = usize::try_from(out_rate.checked_div(5).unwrap_or_default())?;
+            until(|| Ok(taken(&fake, output).len() >= start.saturating_add(waited)))?;
+            let silent = (taken(&fake, output).get(start..start.saturating_add(waited)))
+                .unwrap_or_default()
+                .iter()
+                .all(|&sample| sample == 0);
+            drop(say(&mut giving, &give(rest))?);
+            drop(say(&mut giving, r#"{"op":"end"}"#)?);
+            let last: Value = serde_json::from_str(&next(&mut giving)?)?;
+            let runs = kinds(&root, "sound", usize::MAX)?
+                .matches(&format!(r#""play":{},"#, reply["play"]))
+                .count();
+            let (took, sinad) = quality(
+                taken(&fake, output).get(start..).unwrap_or_default(),
+                out_rate,
+                hz,
+            );
+            same(
+                &format!(
+                    "{silent} {} {runs} {took} {}",
+                    last["played"],
+                    sinad >= 85.0f64
+                ),
+                &format!("true {} 1 {length} true", sound.len()),
+            )?;
+        }
+        same(&signal(&mouth, "TERM")?, "")?;
+        same(&format!("{:?}", mouth.0.wait()?.code()), "Some(0)")?;
+        same(
+            &say(&mut greet(&root)?, r#"{"op":"shutdown"}"#)?,
+            r#"{"ok":true}"#,
+        )?;
+        same(&format!("{:?}", daemon.0.wait()?.code()), "Some(0)")
     }
 }
