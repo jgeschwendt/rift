@@ -47,11 +47,15 @@ closes every turn at 830 ms, and a bar of 0.9 still cuts 17 (observed 2026-11-26
 1.5 s of voice closes 512 ms later: `prove-engines` logs the fixture's turn 279 ms after its
 speech ends (1.66 s of voice), 770 ms with `--short-ms 2000` (observed 2026-11-26).
 
-`read-aloud` speaks all of a say's text that has come, up to its last sentence end, in one call to
-the model, which starts afresh per piece of at most 120 tokens (whole sentences; a longer one
-alone, its frames cut to what the 1024-step state leaves past the voice's 125). Inside a piece a
-sentence join is the voice's own pause, 240 to 480 ms; across pieces there is no gap (0 to 160 ms
-of quiet) but the intonation restarts. Moonshine heard two paragraphs as written at up to 118
+`read-aloud` speaks a say's text in spans of whole sentences as it comes, a say's queued texts
+and its end joined first. A span ends at the last sentence end (`.`, `!` or `?` then a space, so
+an abbreviation's period ends one too) within 390 bytes, Pocket's 120-token piece at 3.25 bytes
+a token, the fewest of three texts (3.26 to 3.72); a longer sentence is one span. Each span is
+one model call and one mark, and the model starts afresh per piece (a sentence past 120 tokens
+alone, its frames cut to what the 1024-step state leaves past the voice's 125, one stderr line
+saying so, and `spoken` then counting characters that did not sound). Inside a piece a sentence
+join is the voice's own pause, 240 to 480 ms; across pieces there is no gap (0 to 160 ms of
+quiet) but the intonation restarts. Moonshine heard two paragraphs as written at up to 118
 tokens a piece, repeated words at 167 and dropped a clause at 203; a 60-word sentence with 11
 commas, 97 tokens, ended itself at 208 of its 430-frame cap (measured 2026-11-27 · alba, seed as
 in `pocket.rs`, frames of 80 ms under 0.01 RMS counted as quiet).

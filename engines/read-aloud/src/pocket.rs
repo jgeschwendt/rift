@@ -30,11 +30,12 @@ const WEIGHTS: &str = "tts_b6369a24.safetensors";
 const TEMPERATURE: f32 = 0.7;
 /// The flow model's sequence budget per piece: the voice's prompt, the text and its frames.
 const BUDGET: usize = 1024;
-/// Tokens per piece at most, whole sentences joined up to it, a longer sentence alone: each
-/// piece starts afresh, so its joins are the voice's own pauses. Moonshine heard two paragraphs
-/// as written up to 118 tokens a piece, then repeated words at 167 and dropped them at 203
-/// (observed 2026-11-27); ptts's default is 50.
-const PIECE: usize = 120;
+/// Tokens per piece at most, whole sentences joined up to it, a longer sentence alone.
+///
+/// Each piece starts afresh, so its joins are the voice's own pauses, and the speaking cuts its
+/// spans to fit one. Moonshine heard two paragraphs as written up to 118 tokens a piece, repeated
+/// words at 167 and dropped a clause at 203 (measured 2026-11-27); ptts's default is 50.
+pub const PIECE: usize = 120;
 /// The audio decoder's context, the reference CLI's.
 const CONTEXT: usize = 250;
 
@@ -159,7 +160,8 @@ impl Voice for Pocket {
             // the reference CLI's cap on frames per piece, inside what the budget has left: a
             // sentence past it is one piece still, cut short rather than overflowing the state
             let cap = ((tokens.len() as f64 / 3.0 + 2.0) * 12.5).ceil() as usize;
-            for _ in 0..cap.min(self.room.saturating_sub(tokens.len())) {
+            let budgeted = cap.min(self.room.saturating_sub(tokens.len()));
+            for _ in 0..budgeted {
                 let (latent, ended) = self
                     .model
                     .generate_step(&mut state, &last, &mut self.noise)
@@ -179,6 +181,12 @@ impl Voice for Pocket {
                     break;
                 }
                 last = latent;
+            }
+            if left.is_none() && budgeted < cap {
+                eprintln!(
+                    "read-aloud: a piece of {} tokens cut short at the budget's {budgeted} frames",
+                    tokens.len()
+                );
             }
         }
         Ok(())
