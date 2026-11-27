@@ -45,15 +45,21 @@ rift engine add talkers -- ~/.local/libexec/rift/diarize ear-<host> --model ~/.l
 directory: WeSpeaker's embedding of the audio and the audio itself (its first 30 s), since
 LS-EEND is enrolled with audio, not an embedding, each time the engine connects. `diarize forget
 <label> --profiles <dir>` removes it; the engine reads the directory at each connect, so either
-takes effect on the job's restart. A label is a track name's form starting with a letter. No
+takes effect on the job's restart, and loads nothing from a directory not this user's or
+writable by others, saying so once. A label is a track name's form starting with a letter. No
 profile is ever committed.
 
-A label is LS-EEND's guess and not proof of who speaks. It read the fixture's first marius phrase
-as the enrolled alba. The score is what tells voices apart: WeSpeaker's cosine between the span's
-audio and the profile. Measured against alba's profile, from the fixture's 2.8 s first phrase or
-from 10 s of her, on windows sliding 0.25 s through each phrase. The own voice is alba's other
-phrases; the others are azelma, cosette, eponine, fantine, javert, jean and marius (measured
-2026-11-27 · Pocket TTS, the fixture and the sentences in AGENTS.md):
+A label is LS-EEND's guess, never proof of who speaks: with alba enrolled it labelled files of four
+other voices as her, 1.8 to 13.6 s of each, and the fixture's first marius phrase too. A span's
+score is WeSpeaker's cosine between its audio (at most 10 s) and the profile, mapped linearly
+from 0.06 (0) to 1 (1); null means not identified, and is every span under 2 s, where other
+voices' windows outscored the enrolled one's. The score is evidence, not authentication: the
+protocol promises nothing of it beyond its order within one engine and release.
+
+Measured on synthetic voices only, Pocket TTS's eight presets, against alba's profile; no rate of
+false accepts has been measured on people (measured 2026-11-27 · the fixture and the sentences
+in AGENTS.md). Windows slide 0.25 s. The profile from 2.8 s (the fixture's first phrase) or 10 s
+of her, through each phrase of alba's other sentences (own) and of the seven other voices:
 
 | window | own, 2.8 s profile, lowest | own, 10 s profile, lowest | others, 2.8 s profile, highest | others, 10 s profile, highest |
 | --- | --- | --- | --- | --- |
@@ -63,11 +69,22 @@ phrases; the others are azelma, cosette, eponine, fantine, javert, jean and mari
 | 2 s | 0.481 | 0.628 | 0.394 | 0.466 |
 | whole phrase | 0.560 | 0.698 | 0.359 | 0.508 |
 
-Under 2 s, other voices' windows score above the own voice's, so a span under 2 s scores null.
-From 2 s, a cosine of 0.53 is above every other voice's window under both profiles, and it maps
-to a score of 0.5 (linear from 0.06 to 1). A short profile's own voice can fall under it: the
-fixture's later alba phrase scores 0.512, and some of her 2 s windows read 0.481. So enrol 10 s
-or more, and act on a label only when it carries a score over 0.5.
+The profile enrolled by `diarize enrol` from her whole 14.5 s file, through every window over
+0.02 RMS of each file; own is alba's sentences not enrolled:
+
+| window | own, lowest | marius, highest | the six others, highest |
+| --- | --- | --- | --- |
+| 2 s | 0.180 | 0.649 | 0.419 |
+| 3 s | 0.596 | 0.647 | 0.429 |
+| 4 s | 0.607 | 0.637 | 0.412 |
+| 6 s | 0.732 | 0.622 | 0.412 |
+| 10 s | 0.830 | 0.642 | 0.402 |
+
+Separation depends on the profile and the voice. Under the longer profile marius's windows score
+up to 0.649 (a score of 0.627), above the own voice's up to 4 s. A voice close to the enrolled
+one, or a recording of it, can score as high as the voice itself. So a client acts only on a
+label with a non-null score, and when it needs a decision, chooses and validates its own cut on
+its own voices; no value of the score is a cut this engine vouches for.
 
 `endpoint` commits a turn when Smart Turn scores its close over `--bar` (0.5), else holds it for
 the next voice up to `--ceiling-ms` (3000) of silence. Smart Turn scores a short opening word and

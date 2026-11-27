@@ -262,13 +262,17 @@ def talkers(rift: str, bins: Path, out: Path) -> None:
     print(
         json.dumps({"enrolled": enrolled.stderr.strip(), "stops": stops, "turns": rows}, indent=1)
     )
-    # the fixture's four phrases, alba's first: hers mostly `first`, each scored; every score of
-    # hers above every score of marius's as `first`, which LS-EEND alone may name him
+    sys.exit(0 if ordered(rows) else 1)
+
+
+def ordered(rows: list[dict]) -> bool:
+    """The fixture's four phrases, alba's first: hers mostly `first`, each scored; every score of
+    hers above every score of marius's as `first`, which LS-EEND alone may name him.
+    """
     hers = [[s for s in row["first_scores"] if s is not None] for row in rows[0::2]]
     his = [s for row in rows[1::2] for s in row["first_scores"] if s is not None]
     named = len(rows) == len(hers) * 2 and rows[0]["mostly"] == rows[2]["mostly"] == "first"
-    ordered = all(hers) and min(min(h) for h in hers) > max(his, default=0)
-    sys.exit(0 if named and ordered else 1)
+    return named and all(hers) and min(min(h) for h in hers) > max(his, default=0)
 
 
 def main() -> None:

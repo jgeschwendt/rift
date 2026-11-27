@@ -12,7 +12,7 @@ mise run check     # the gate: fmt, clippy -D warnings, the end-to-end suite at 
 mise run cover     # the suite under llvm-cov alone, naming any line it misses; mic.rs, speaker.rs exempt
 mise run dist      # this host's release archive, the next YYYY.M.N stamped, to dist/ (unsigned)
 mise run install   # a dev build to ~/.local/bin/rift-next, beside the release; setup never wires it
-mise run check-engines   # engines/: fmt, lints, each engine's protocol logic at 100 % against a stub model
+mise run check-engines   # engines/: fmt, lints, each engine's protocol logic at 100 % of lines against a stub model
 mise run prove-engines   # engines/: all three on a throwaway daemon, the fixture and a fake output; PROVE_FAST=1 under load
 mise run prove-diarize   # endpoint and diarize over fixtures/voices.pcm, one voice enrolled by the daemon's read; macOS, $DIARIZE_MODEL
 mise run prove-scribe    # the same with scribe for words, then with --terms over fixtures/term.pcm; macOS, $SCRIBE_MODEL
@@ -41,19 +41,23 @@ says `skipped` otherwise. `voices.pcm` regenerates byte for byte (verified 2026-
 we should leave early tomorrow morning." "marius=That works for me, although the traffic might be
 heavy near the bridge." "Then let us take the train instead of the car." "marius=Six is far too
 early for me, I am afraid."`; diarize's overlap test mixes its two later phrases in the test
-itself. The score table in `engines/README.md` adds, per voice `<v>` of alba, azelma, cosette,
-eponine, fantine, javert, jean and marius, a file never committed: `-- <v>.pcm "<v>=The museum
-opens at nine, but the queue starts much earlier on weekends." "<v>=Please remember to water the
-plants while I am away next week." "<v>=We could paint the fence blue if the hardware store
-still has some left."`. diarize keeps its own copy of scribe's socket plumbing
+itself. Per voice `<v>` of alba, azelma, cosette, eponine, fantine, javert, jean and marius,
+`-- <v>.pcm "<v>=The museum opens at nine, but the queue starts much earlier on weekends."
+"<v>=Please remember to water the plants while I am away next week." "<v>=We could paint the
+fence blue if the hardware store still has some left."` makes the files behind the score tables
+in `engines/README.md`, alba's committed as `fixtures/alba.pcm` (the model test's 14.5 s
+enrolment); for alba, javert and marius, `-- x-<v>.pcm "<v>=I never said that the report was
+finished, only that the numbers looked right to me." "<v>=Could you send the files again before
+the meeting starts this afternoon?" "<v>=The weather was cold all week, and nobody wanted to walk
+to the station."` the rest (`x-alba.pcm` the own voice against that profile); none but alba's is
+committed. diarize keeps its own copy of scribe's socket plumbing
 (`Sources/Engine/Wire.swift`): each Swift engine is a package of its own, its pin and gate apart.
-FluidAudio resamples each call's audio with a fresh converter, so diarize brings 16 kHz to
-LS-EEND's 8 kHz itself (`Decimator`, its filter state kept across frames, enrolment through the
-same) and hands it on unresampled; its steps are then the same however the stream is cut
-(`chunked` in the model tests), and the 20 ms resample's edges, not LS-EEND, made the earlier
-chunk-size dependence (measured 2026-11-27 · 32.9 dB SNR per 20 ms against a whole-file
-resample, the decimator 42.0 dB, LS-EEND's slots alike over the whole-file and decimated
-fixture). Swift 6.2.4 miscompiled the scribe
+FluidAudio resamples each call's audio with a fresh converter, whose edges every 20 ms put the
+fixture at 32.9 dB SNR against a whole-file resample; so diarize brings 16 kHz to LS-EEND's 8 kHz
+itself (`Decimator`, its filter state kept across frames, enrolment through the same) and hands it
+on unresampled, and its steps are the same however the stream is cut (`chunked` in the model
+tests; measured 2026-11-27 · the decimator 36.1 dB from FluidAudio's whole-file resample, which
+keeps the 3.6 to 4 kHz the decimator stops). Swift 6.2.4 miscompiled the scribe
 suite's closure-taking stderr helper, handing one call's closure to another, so its tests swap
 the writer by `listen()` instead (observed 2026-11-26). llvm-cov sums line coverage per function,
 so a closure written inline over several lines then `?` (`f(&mut |x| { … })?;`) leaves its `})?;`

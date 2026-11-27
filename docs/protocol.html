@@ -583,9 +583,12 @@
       and boots while its profile stands; or an integer for a
       voice matching none, numbered from 1 on each connection in the order first reported, never
       reused on it and meaning nothing past it (the <code class="code">engine</code> events bracket
-      a connection). <code class="code">score</code> is how sure the engine is that the span's
-      audio is that enrolled voice, 0 to 1, higher surer, comparable only within one engine, and
-      <code class="code">null</code> for an integer id or a span too short to score. The talkers are
+      a connection). <code class="code">score</code> is the engine's evidence that the span's
+      audio is that enrolled voice, 0 to 1, higher closer, meaning nothing beyond its order within
+      one engine and release, so no value of it is a cut the protocol promises; evidence, not
+      authentication. <code class="code">null</code> is an integer id's, and a label's the engine
+      did not identify (a span too short to score, say): never act on a label with a null
+      score. The talkers are
       ordered strings first, in byte order, then integers rising, each id once. A span is never
       empty (<code class="code">start</code> before <code class="code">end</code>) and names at
       most 16 talkers. A span's end is the engine's settled reach: no later span starts before it.
@@ -625,7 +628,7 @@
         <tr><td class="table-mono">mask</td><td>echo</td><td class="table-mono">{"on":true,"op":"mask","start":…}</td><td>from an on's <code class="code">start</code> to its off's the ear is the machine hearing itself; on and off alternating from on, rising; <code class="code">mask</code></td></tr>
         <tr><td class="table-mono">partial</td><td>words</td><td class="table-mono">{"end":…,"op":"partial","start":…,"words":[…]}</td><td>a hypothesis for audio after the last final, superseding the last partial; not logged, sent to <code class="code">partials</code> readers</td></tr>
         <tr><td class="table-mono">ruled</td><td>echo</td><td class="table-mono">{"op":"ruled","to":…}</td><td>every sample before <code class="code">to</code> is ruled on; rising; releases the frames held for it; not logged</td></tr>
-        <tr><td class="table-mono">talkers</td><td>talkers</td><td class="table-mono">{"end":…,"op":"talkers","start":…,"talkers":[{"id":"enrolled-1","score":0.82},{"id":2,"score":null}]}</td><td>the voices speaking throughout [<code class="code">start</code>, <code class="code">end</code>), settled, never revised; spans never overlap and rise, none empty; at most 16 talkers, each id a string of a track name's form starting with a letter, with a <code class="code">score</code> from 0 to 1 or <code class="code">null</code>, or an integer from 1 with <code class="code">null</code>, the <code class="code">score</code> always present; strings in byte order, then integers rising, none twice; <code class="code">talkers</code>, each talker's two fields alone</td></tr>
+        <tr><td class="table-mono">talkers</td><td>talkers</td><td class="table-mono">{"end":…,"op":"talkers","start":…,"talkers":[{"id":"enrolled-1","score":0.82},{"id":2,"score":null}]}</td><td>the voices speaking throughout [<code class="code">start</code>, <code class="code">end</code>), settled, never revised; spans never overlap and rise, none empty; at most 16 talkers, each id a string of a track name's form starting with a letter, with a <code class="code">score</code> from 0 to 1 or <code class="code">null</code> (not identified), or an integer from 1 with <code class="code">null</code>, the <code class="code">score</code> always present; strings in byte order, then integers rising, none twice; <code class="code">talkers</code>, each talker's two fields alone</td></tr>
         <tr><td class="table-mono">turn</td><td>turn</td><td class="table-mono">{"end":…,"op":"turn","start":…}</td><td>a turn from the voice that began it to the voice's end that closed it; turns never overlap and rise; <code class="code">turn</code></td></tr>
         <tr><td class="table-mono">voice</td><td>turn</td><td class="table-mono">{"on":true,"op":"voice","start":…}</td><td>speech starts (<code class="code">on</code>) or stops at <code class="code">start</code>, on and off alternating from on; <code class="code">voice</code></td></tr>
         <tr><td class="table-mono">words</td><td>words</td><td class="table-mono">{"end":…,"op":"words","start":…,"words":[{"end":…,"start":…,"text":"hello"}]}</td><td>final words for [<code class="code">start</code>, <code class="code">end</code>), never revised; finals never overlap and rise, each word inside its span, the words rising; <code class="code">words</code></td></tr>
@@ -684,16 +687,18 @@
       <code class="code">talkers</code>: a client joins by time on a feed. For a
       <code class="code">turn</code> [s, e) it keeps the <code class="code">talkers</code> events
       overlapping it, before or after the turn's own, and over the turn's whole length sums each
-      id's time, nobody's (spans with no talkers) and the unknown (time no span covers). The turn
+      id's time, nobody's (spans with no talkers) and the unknown (time no span covers). A span
+      counts as a label's only when the label carries a non-null score the client accepts; a label
+      with a null score, or one the client does not accept, counts as unknown. The turn
       is known once a span ends at or past e. Its tail is unknown when an
       <code class="code">engine</code> off for the talkers kind on the track is logged after the
       turn's last span (before or after the turn's own event) with no span reaching e, or when no
       talkers engine is on at the turn's event and no span covers it; otherwise it is not yet
       known. Integer ids are summed per connection, never across an <code class="code">engine</code>
       on: a new connection's <code class="code">1</code> is another voice. What share counts as
-      mostly, and what score as sure, are the client's. Four answers stay apart: a label (an
-      enrolled voice), an integer (a voice not enrolled), no talkers (nobody), and no span
-      (unknown).</li>
+      mostly, and what score it accepts, are the client's, chosen and validated on its own voices.
+      Four answers stay apart: a label with an accepted score (an enrolled voice), an integer (a
+      voice not enrolled), no talkers (nobody), and no span or no accepted score (unknown).</li>
     <li><strong>A talkers engine leaving.</strong> Its spans logged stand; the span it held open
       is never reported, so its reach stops at its last end and the next engine resumes from
       <code class="code">through</code>, its integer ids counted afresh.</li>
@@ -752,18 +757,20 @@
 ← {"turn":{"end":1764000001200000,"start":1764000000300000}}
 → {"end":1764000000300000,"op":"talkers","start":1764000000000000,"talkers":[]}
 ← {"ok":true,"seq":26}
-→ {"end":1764000001200000,"op":"talkers","start":1764000000300000,"talkers":[{"id":"enrolled-1","score":0.82}]}
+→ {"end":1764000001200000,"op":"talkers","start":1764000000300000,"talkers":[{"id":"enrolled-1","score":null}]}
 ← {"ok":true,"seq":27}
 → {"end":1764000001600000,"op":"talkers","start":1764000001200000,"talkers":[]}
 ← {"ok":true,"seq":30}
-→ {"end":1764000002100000,"op":"talkers","start":1764000001600000,"talkers":[{"id":"enrolled-1","score":0.71},{"id":1,"score":null}]}
+→ {"end":1764000002100000,"op":"talkers","start":1764000001600000,"talkers":[{"id":"enrolled-1","score":null},{"id":1,"score":null}]}
 ← {"ok":true,"seq":31}
 → {"end":1764000002000000,"op":"talkers","start":1764000002100000,"talkers":[{"id":1,"score":null}]}
 ← {"code":"bad_request","ok":false}</pre>
   <p class="docs-note">The last ends before it starts and is refused, logging nothing; the engine
     holds what it has until it reports it right. Its first span ends at the turn's start and its
     second at the turn's end, the cut the turn line asked for, so a client knows at seq 27 that the
-    turn was <code class="code">enrolled-1</code>'s throughout.</p>
+    engine labelled the whole turn <code class="code">enrolled-1</code>. With its score null (diarize
+    scores no span under 2 s), that label identifies no one, and the turn counts as unknown: a
+    client acts only on a label whose non-null score it accepts.</p>
   <p class="docs-note">An echo engine masking a play as it sounds, the tail heard out:</p>
   <pre class="tree">→ {"kind":"echo","name":"tail","op":"engine","track":"ear-desk"}
 ← {"ok":true,"ruled":1764000004980000,"seq":19}
@@ -805,8 +812,9 @@
       and contents, a final's latency, word boundaries, a mask's tail, when a turn closes, a
       speech engine's rate and its marks' spacing; a talkers engine's thresholds, how many voices
       it tells apart, how long a new voice waits for its id and a span to settle, where it cuts
-      beyond the turn ends and changes, and what its scores mean beyond their order. A client depends on values and order, never
-      on how soon.</li>
+      beyond the turn ends and changes, which spans it scores, and what a score means beyond its
+      order within one engine and release, so any cut on it is the client's own. A client depends
+      on values and order, never on how soon.</li>
   </ul>
 </section>
 
