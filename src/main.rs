@@ -3348,7 +3348,7 @@ fn main() -> ExitCode {
                     Duration::from_millis(setting("RIFT_RELOAD_MS", 15_000)),
                     Duration::from_millis(setting("RIFT_READY_MS", 30_000)),
                 );
-                // `name` kickstarted, else loaded afresh, then waited on until the daemon's
+                // `name` kickstarted (unless it carries a managed launch constraint), else loaded afresh, then waited on until the daemon's
                 // health is `done`; a job launchd refused to spawn stays refused through any
                 // kickstart, so one not done past the first budget is loaded afresh, once
                 let up = |name: &str,
@@ -3360,7 +3360,14 @@ fn main() -> ExitCode {
                         unload(name)?;
                         must(&["bootstrap", &gui, &file.to_string_lossy()])
                     };
-                    if kick {
+                    // a job loaded at login carries a managed launch constraint a swap
+                    // invalidates and a kickstart keeps: it is loaded afresh, which drops it
+                    if kick
+                        && !String::from_utf8_lossy(
+                            &call(&["print", &format!("{gui}/{name}")])?.stdout,
+                        )
+                        .contains("managed LWCR")
+                    {
                         must(&["kickstart", "-k", &format!("{gui}/{name}")])?;
                     } else {
                         load()?;
