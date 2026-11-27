@@ -585,7 +585,7 @@
       <tbody>
         <tr><td>① devices</td><td>clients of the socket, each an ear or a mouth; built: a file player and, on macOS, <a href="#microphone">the microphone</a> (<code class="code">rift device</code>), and, on macOS, <a href="#mouth">the mouth</a>, each standing as a launchd job of its own that every setup installs; one on another machine is a later protocol</td></tr>
         <tr><td>② one stream</td><td>built: every track on the daemon's clock, so a moment means the same instant on every track (<a href="#stream">the stream</a>)</td></tr>
-        <tr><td>③ voices</td><td>designed: who spoke when, voices speaking at once included, each an enrolled voice's label matched with how sure, which holds across the stream, or a number for one not enrolled, by a talkers <a href="#engines">engine</a></td></tr>
+        <tr><td>③ voices</td><td>built: the talkers kind and its join to turns; designed: its reference engine. Who spoke when, voices speaking at once included, each an enrolled voice's label matched with how sure, which holds across the stream, or a number for one not enrolled, by a talkers <a href="#engines">engine</a></td></tr>
         <tr><td>④ words</td><td>the track's speech transcribed to words, each word with its start and end on that clock, by <a href="#engines">engines</a>: echo, then turn and words; a client joins words to voices by time</td></tr>
         <tr><td>⑤ playback</td><td>built: audio a client gives played on <a href="#mouth">a mouth</a>, hushed at once, a play's runs logged in the giver's own sample count; designed: text a client gives spoken by a speech <a href="#engines">engine</a></td></tr>
       </tbody>
@@ -596,7 +596,7 @@
 <section class="docs-section" id="engines" data-component="engines">
   <header>
     <h2 class="h2">Engines</h2>
-    <p class="docs-note">Built through slice 6; the clean track, the model engines, the loop and the talkers kind designed. The work that reads sound (the echo stage, voice
+    <p class="docs-note">Built through slice 10; the reference talkers engine and the clean track (slices 11 and 12) designed. The work that reads sound (the echo stage, voice
       and turns, words) and the work that makes it (speech) are engines: programs on rift's socket,
       each of one kind on one track, swapped while the daemon runs. Models come and go; the daemon,
       its clock, its log and its checks stay. The wire is <a href="protocol.html#engines">the

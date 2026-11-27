@@ -3308,6 +3308,129 @@ mod tests {
         same(&format!("{:?}", restarted.0.wait()?.code()), "Some(0)")
     }
 
+    /// The join by time, the suite as a turn engine, a talkers engine, the ear and a client reading
+    /// a feed (docs/protocol.html#engines): per `turn` in feed order, each id's time inside it
+    /// summed from the `talkers` spans overlapping it, before or after the turn's own, up to the
+    /// first reaching its end, so its talkers are known there; a talkers engine leaving mid-turn,
+    /// its `engine` off before any span reaching the end, so the tail reads unknown, never
+    /// nobody's; with none connected, health and the feed saying so and a turn with no span.
+    #[test]
+    fn join() -> Outcome {
+        let root = temp("join")?;
+        let (mut daemon, _) = serve(
+            &root,
+            &[("RIFT_PING_MS", "86400000"), ("RIFT_SEGMENT_MS", "100")],
+        )?;
+        drop(rift(&root, &[], &["ears", "on"])?);
+        let mut client = greet(&root)?;
+        same(
+            &say(&mut client, r#"{"after":null,"op":"feed"}"#)?,
+            r#"{"ok":true,"reset":false}"#,
+        )?;
+        let (mut ear, hi) = device(&root, r#"{"kind":"ear","name":"desk","op":"device"}"#, 0)?;
+        let base = hi["ping"].as_u64().unwrap_or_default() - 2_000_000;
+        let engine = |kind: &str| {
+            json!({"from": null, "kind": kind, "name": kind, "op": "engine", "track": "ear-desk"})
+                .to_string()
+        };
+        let (mut turns, mut heard) = (greet(&root)?, greet(&root)?);
+        drop(line_after(&mut turns, &engine("turn"))?);
+        drop(line_after(&mut heard, &engine("talkers"))?);
+        let all = placed(&mut ear, base, 0..15)?;
+        let at = |index: usize| all.get(index).copied().unwrap_or_default();
+        let report = |conn: &mut BufReader<UnixStream>, said: Value| -> Outcome {
+            same(
+                &line_after(conn, &said.to_string())?["ok"].to_string(),
+                "true",
+            )
+        };
+        let span = |start: usize, stop: usize, said: Value| json!({"end": at(stop), "op": "talkers", "start": at(start), "talkers": said});
+        let spoken = |conn: &mut BufReader<UnixStream>, start: usize, stop: usize| -> Outcome {
+            report(conn, json!({"on": true, "op": "voice", "start": at(start)}))?;
+            report(conn, json!({"on": false, "op": "voice", "start": at(stop)}))?;
+            report(
+                conn,
+                json!({"end": at(stop), "op": "turn", "start": at(start)}),
+            )
+        };
+        let (enrolled, unknown) = (
+            json!({"id": "enrolled-1", "score": 0.8f64}),
+            json!({"id": 1u8, "score": null}),
+        );
+        // two spans before the turn's event, the one reaching its end after it
+        report(&mut heard, span(0, 1, json!([])))?;
+        report(&mut heard, span(1, 4, json!([enrolled])))?;
+        spoken(&mut turns, 1, 6)?;
+        report(&mut heard, span(4, 6, json!([enrolled, unknown])))?;
+        // the talkers engine gone mid-turn: settled to 8 of a turn to 9
+        report(&mut heard, span(6, 8, json!([unknown])))?;
+        spoken(&mut turns, 7, 9)?;
+        drop(heard);
+        until(|| unlisted(&root, "ear-desk", "talkers"))?;
+        same(
+            &serde_json::from_str::<Value>(&say(&mut greet(&root)?, r#"{"op":"health"}"#)?)?
+                ["engines"]
+                .to_string(),
+            r#"{"ear-desk":{"turn":"turn"}}"#,
+        )?;
+        spoken(&mut turns, 11, 13)?;
+        let read = take(&mut client, events(&root)?.len())?;
+        let feed = read.as_array().map(Vec::as_slice).unwrap_or_default();
+        let time = |event: &Value, key: &str| event[key].as_u64().unwrap_or_default();
+        let joined: Vec<Value> = (feed.iter().enumerate())
+            .filter(|&(_, event)| event["kind"] == "turn")
+            .map(|(index, turn)| {
+                let (start, end) = (time(turn, "start"), time(turn, "end"));
+                let (mut known, mut shares) = (start, Vec::<(Value, u64)>::new());
+                // the spans up to a talkers engine's leaving after the turn
+                let left = (feed.iter().enumerate())
+                    .find(|&(seen, event)| {
+                        seen > index && event["stage"] == "talkers" && event["on"] == false
+                    })
+                    .map_or(feed.len(), |found| found.0);
+                for event in (feed.iter().take(left)).filter(|event| event["kind"] == "talkers") {
+                    let (low, high) =
+                        (time(event, "start").max(start), time(event, "end").min(end));
+                    if known >= end || low >= high {
+                        continue;
+                    }
+                    known = high;
+                    for talker in event["talkers"].as_array().into_iter().flatten() {
+                        let inside = high.saturating_sub(low);
+                        match shares.iter_mut().find(|share| share.0 == talker["id"]) {
+                            Some(share) => share.1 = share.1.saturating_add(inside),
+                            None => shares.push((talker["id"].clone(), inside)),
+                        }
+                    }
+                }
+                json!({"known": known, "shares": shares, "turn": [start, end]})
+            })
+            .collect();
+        same(
+            &format!(
+                "{} {}",
+                json!(joined),
+                (feed.iter().rev())
+                    .find(|event| event["stage"] == "talkers")
+                    .map_or(Value::Null, |event| event["on"].clone())
+            ),
+            &format!(
+                "{} false",
+                json!([
+                    {"known": at(6), "shares": [["enrolled-1", at(6) - at(1)], [1u8, at(6) - at(4)]], "turn": [at(1), at(6)]},
+                    {"known": at(8), "shares": [[1u8, at(8) - at(7)]], "turn": [at(7), at(9)]},
+                    {"known": at(11), "shares": [], "turn": [at(11), at(13)]}
+                ])
+            ),
+        )?;
+        drop((ear, turns));
+        same(
+            &say(&mut greet(&root)?, r#"{"op":"shutdown"}"#)?,
+            r#"{"ok":true}"#,
+        )?;
+        same(&format!("{:?}", daemon.0.wait()?.code()), "Some(0)")
+    }
+
     /// The echo stage, the suite as the echo engine, a words engine and the ear
     /// (docs/protocol.html#engines): the words engine given no frame past the ruling, then each
     /// once ruled; a mask or ruling out of order, before the ruling or past what was heard
