@@ -3119,6 +3119,195 @@ mod tests {
         same(&format!("{:?}", rebooted.0.wait()?.code()), "Some(0)")
     }
 
+    /// A talkers engine, the suite as it, a turn engine and the ear (docs/protocol.html#engines):
+    /// health and the `engine` events listing it; each voice and turn line after the frame it is
+    /// due, by the `t`s read; spans logged with the values sent, each talker's `id` and `score`
+    /// alone; refused and unlogged: one overlapping, out of order or past the last frame given, an
+    /// id not of a track name's form, a number under 1 or scored, a score missing or outside 0 to
+    /// 1, more than 16, an id twice or out of order; a reconnect's `through` the last span's end,
+    /// its replay from there, and the same after a restart.
+    #[test]
+    fn talkers() -> Outcome {
+        let root = temp("talkers")?;
+        let envs = [("RIFT_PING_MS", "86400000"), ("RIFT_SEGMENT_MS", "100")];
+        let (mut daemon, _) = serve(&root, &envs)?;
+        drop(rift(&root, &[], &["ears", "on"])?);
+        let (mut ear, hi) = device(&root, r#"{"kind":"ear","name":"desk","op":"device"}"#, 0)?;
+        let base = hi["ping"].as_u64().unwrap_or_default() - 2_000_000;
+        let engine = |kind: &str, from: Value| {
+            json!({"from": from, "kind": kind, "name": kind, "op": "engine", "track": "ear-desk"})
+                .to_string()
+        };
+        let (mut turns, mut heard) = (greet(&root)?, greet(&root)?);
+        same(
+            &format!(
+                "{} {} {}",
+                line_after(&mut turns, &engine("turn", Value::Null))?["through"],
+                line_after(&mut heard, &engine("talkers", Value::Null))?["through"],
+                serde_json::from_str::<Value>(&say(&mut greet(&root)?, r#"{"op":"health"}"#)?)?["engines"]
+            ),
+            r#"null null {"ear-desk":{"talkers":"talkers","turn":"turn"}}"#,
+        )?;
+        let early = placed(&mut ear, base, 0..5)?;
+        let at = |index: usize| early.get(index).copied().unwrap_or_default();
+        let (closed, given) = (at(3) + 5000, at(4) + 20_000);
+        for report in [
+            json!({"on": true, "op": "voice", "start": at(1)}),
+            json!({"on": false, "op": "voice", "start": closed}),
+            json!({"end": closed, "op": "turn", "start": at(1)}),
+        ] {
+            same(
+                &line_after(&mut turns, &report.to_string())?["ok"].to_string(),
+                "true",
+            )?;
+        }
+        let lines: Vec<Value> = iter::repeat_with(|| line(&mut heard))
+            .take(8)
+            .collect::<Result<_, _>>()?;
+        same(
+            &format!(
+                "{:?} {}",
+                ordered(&lines),
+                json!(
+                    lines
+                        .iter()
+                        .filter(|got| got["t"].is_null())
+                        .collect::<Vec<_>>()
+                )
+            ),
+            &format!(
+                "{:?} {}",
+                (true, early.clone()),
+                json!([
+                    {"voice": {"on": true, "start": at(1)}},
+                    {"voice": {"on": false, "start": closed}},
+                    {"turn": {"end": closed, "start": at(1)}}
+                ])
+            ),
+        )?;
+        let span = |start: u64, stop: u64, said: Value| {
+            json!({"end": stop, "op": "talkers", "start": start, "talkers": said}).to_string()
+        };
+        let one = |id: Value, score: Value| json!([{"id": id, "score": score}]);
+        let numbers = |count: u64| {
+            json!(
+                (1..=count)
+                    .map(|id| json!({"id": id, "score": null}))
+                    .collect::<Vec<_>>()
+            )
+        };
+        let mut full = json!([{"id": "a", "score": 0u8}, {"id": "b", "score": 1u8}]);
+        if let (Some(list), Value::Array(more)) = (full.as_array_mut(), numbers(14)) {
+            list.extend(more);
+        }
+        let mut verdicts = Vec::new();
+        for report in [
+            span(at(0), at(1), json!([])),
+            span(
+                at(1),
+                closed,
+                json!([{"id": "enrolled-1", "score": 0.82f64, "x": 1u8}]),
+            ),
+            span(at(1), at(4), json!([])),
+            span(at(4), closed, json!([])),
+            span(closed, given + 1, json!([])),
+            span(closed, given, json!("x")),
+            span(closed, given, one(json!("a/b"), Value::Null)),
+            span(closed, given, one(json!("x".repeat(65)), Value::Null)),
+            span(closed, given, one(json!(0u8), Value::Null)),
+            span(closed, given, one(json!(1.5f64), Value::Null)),
+            span(closed, given, one(json!(1u8), json!(0.5f64))),
+            span(closed, given, one(json!("a"), json!(1.5f64))),
+            span(closed, given, one(json!("a"), json!(-0.1f64))),
+            span(closed, given, one(json!("a"), json!("high"))),
+            span(closed, given, json!([{"id": "a"}])),
+            span(closed, given, numbers(17)),
+            span(
+                closed,
+                given,
+                json!([{"id": 1u8, "score": null}, {"id": 1u8, "score": null}]),
+            ),
+            span(
+                closed,
+                given,
+                json!([{"id": 2u8, "score": null}, {"id": 1u8, "score": null}]),
+            ),
+            span(
+                closed,
+                given,
+                json!([{"id": 1u8, "score": null}, {"id": "a", "score": null}]),
+            ),
+            span(
+                closed,
+                given,
+                json!([{"id": "b", "score": null}, {"id": "a", "score": null}]),
+            ),
+            span(closed, given, full.clone()),
+        ] {
+            let got = line_after(&mut heard, &report)?;
+            verdicts.push(got["code"].as_str().unwrap_or("ok").to_owned());
+        }
+        same(
+            &verdicts.join(" "),
+            &format!("ok ok{} ok", " bad_request".repeat(18)),
+        )?;
+        let logged = |start: u64, stop: u64, said: Value| json!({"end": stop, "engine": "talkers", "kind": "talkers", "start": start, "talkers": said, "track": "ear-desk"});
+        same(
+            &json!(
+                events(&root)?
+                    .iter()
+                    .map(|event| &event["e"])
+                    .filter(|event| event["kind"] == "talkers")
+                    .collect::<Vec<_>>()
+            )
+            .to_string(),
+            &json!([
+                logged(at(0), at(1), json!([])),
+                logged(at(1), closed, one(json!("enrolled-1"), json!(0.82f64))),
+                logged(closed, given, full),
+            ])
+            .to_string(),
+        )?;
+        // gone, back from where it left off: the frame after the last span's end
+        drop(heard);
+        until(|| unlisted(&root, "ear-desk", "talkers"))?;
+        same(
+            &kinds(&root, "engine", usize::MAX)?
+                .lines()
+                .filter(|seen| seen.contains(r#""stage":"talkers""#))
+                .collect::<Vec<_>>()
+                .join(" "),
+            r#"{"kind":"engine","name":"talkers","on":true,"stage":"talkers","track":"ear-desk"} {"kind":"engine","name":"talkers","on":false,"stage":"talkers","track":"ear-desk"}"#,
+        )?;
+        let later = placed(&mut ear, base, 5..7)?;
+        let mut resumed = greet(&root)?;
+        same(
+            &format!(
+                "{} {}",
+                line_after(&mut resumed, &engine("talkers", json!("through")))?["through"],
+                line(&mut resumed)?["t"]
+            ),
+            &format!("{given} {}", later[0]),
+        )?;
+        drop((resumed, turns, ear));
+        same(
+            &say(&mut greet(&root)?, r#"{"op":"shutdown"}"#)?,
+            r#"{"ok":true}"#,
+        )?;
+        same(&format!("{:?}", daemon.0.wait()?.code()), "Some(0)")?;
+        let (mut restarted, _) = serve(&root, &envs)?;
+        same(
+            &line_after(&mut greet(&root)?, &engine("talkers", Value::Null))?["through"]
+                .to_string(),
+            &given.to_string(),
+        )?;
+        same(
+            &say(&mut greet(&root)?, r#"{"op":"shutdown"}"#)?,
+            r#"{"ok":true}"#,
+        )?;
+        same(&format!("{:?}", restarted.0.wait()?.code()), "Some(0)")
+    }
+
     /// The echo stage, the suite as the echo engine, a words engine and the ear
     /// (docs/protocol.html#engines): the words engine given no frame past the ruling, then each
     /// once ruled; a mask or ruling out of order, before the ruling or past what was heard
@@ -4107,8 +4296,8 @@ esac
                 format!("{gui}/dev.gigantic.rift.{kind}"),
             )
         };
-        let ((echo, echo_job), (turn, turn_job), (words, _)) =
-            (at("echo"), at("turn"), at("words"));
+        let ((echo, echo_job), (talkers, _), (turn, turn_job), (words, _)) =
+            (at("echo"), at("talkers"), at("turn"), at("words"));
         let exe = env!("CARGO_BIN_EXE_rift");
         let tail = |track: &'static str| [exe, "engine", "run", "tail", track];
         let adding = |kind: &'static str, command: &[&'static str]| -> Vec<&'static str> {
@@ -4201,7 +4390,22 @@ esac
         drop(held.0.kill());
         drop(held.0.wait());
         // disabled: written, not loaded, its command kept as given
-        fs::write(format!("{root}/disabled"), "dev.gigantic.rift.words\n")?;
+        fs::write(
+            format!("{root}/disabled"),
+            "dev.gigantic.rift.talkers\ndev.gigantic.rift.words\n",
+        )?;
+        same(
+            &run(&[], &adding("talkers", &["diarize", "ear-test"]))?,
+            &format!(
+                "0\nwrote {talkers}\ndev.gigantic.rift.talkers is disabled, so written and not loaded; launchctl enable {gui}/dev.gigantic.rift.talkers stands it\n"
+            ),
+        )?;
+        same(
+            &fs::read_to_string(&talkers)?
+                .contains(&format!("<string>dev.gigantic.rift.talkers</string>\n  <key>ProgramArguments</key>\n  <array><string>diarize</string><string>ear-test</string></array>\n  <key>RunAtLoad</key>\n  <true/>\n  <key>StandardErrorPath</key>\n  <string>{data}/engines/talkers.err</string>"))
+                .to_string(),
+            "true",
+        )?;
         same(
             &run(
                 &[],
@@ -4214,8 +4418,9 @@ esac
         same(
             &run(&[], &["engine", "list"])?,
             &format!(
-                "0\n{}\n{}\n",
+                "0\n{}\n{}\n{}\n",
                 json!({"command": tail("ear-held"), "kind": "echo"}),
+                json!({"command": ["diarize", "ear-test"], "kind": "talkers"}),
                 json!({"command": ["a&b <c>", "ear-test", "--terms", "x"], "kind": "words"})
             ),
         )?;
@@ -4249,14 +4454,15 @@ esac
         let removed = run(&[], &["setup", "--remove"])?;
         same(
             &format!(
-                "{} {} {}",
+                "{} {} {} {}",
                 removed.contains(&format!(
-                    "launchctl bootout {echo_job}\nremoved {echo}\nremoved {words}\n"
+                    "launchctl bootout {echo_job}\nremoved {echo}\nremoved {talkers}\nremoved {words}\n"
                 )),
                 fs::exists(&echo)?,
+                fs::exists(&talkers)?,
                 fs::exists(&words)?
             ),
-            "true false false",
+            "true false false false",
         )?;
         same(
             &say(&mut greet(&data)?, r#"{"op":"shutdown"}"#)?,
@@ -4979,7 +5185,7 @@ esac
         // the keychain and its password go as files, the root stays; no host name is asked for;
         // the engine jobs, none here, are asked after first
         fs::write(format!("{root}/fail-scutil"), "")?;
-        let engines: String = ["echo", "speech", "turn", "words"]
+        let engines: String = ["echo", "speech", "talkers", "turn", "words"]
             .iter()
             .map(|kind| absent(&format!("{gui}/dev.gigantic.rift.{kind}")))
             .collect();

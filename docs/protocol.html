@@ -501,8 +501,8 @@
 <section class="docs-section" id="engines" data-component="engines">
   <header>
     <h2 class="h2">Engines</h2>
-    <p class="docs-note">Served, the echo engine's clean track and the talkers kind aside, both
-      designed (<a href="index.html#engines">the slices</a>). An engine is a client that does one kind of work
+    <p class="docs-note">Served, the echo engine's clean track aside, designed
+      (<a href="index.html#engines">the slices</a>). An engine is a client that does one kind of work
       on one track and reports results, which the daemon checks and logs as events
       (<a href="index.html#engines">the design</a>). Every op, field, event and code here is
       additive: <code class="code">proto</code> stays 1, and nothing above changes meaning.</p>
@@ -614,7 +614,7 @@
         <tr><td class="table-mono">mask</td><td>echo</td><td class="table-mono">{"on":true,"op":"mask","start":…}</td><td>from an on's <code class="code">start</code> to its off's the ear is the machine hearing itself; on and off alternating from on, rising; <code class="code">mask</code></td></tr>
         <tr><td class="table-mono">partial</td><td>words</td><td class="table-mono">{"end":…,"op":"partial","start":…,"words":[…]}</td><td>a hypothesis for audio after the last final, superseding the last partial; not logged, sent to <code class="code">partials</code> readers</td></tr>
         <tr><td class="table-mono">ruled</td><td>echo</td><td class="table-mono">{"op":"ruled","to":…}</td><td>every sample before <code class="code">to</code> is ruled on; rising; releases the frames held for it; not logged</td></tr>
-        <tr><td class="table-mono">talkers</td><td>talkers</td><td class="table-mono">{"end":…,"op":"talkers","start":…,"talkers":[{"id":"enrolled-1","score":0.82},{"id":2,"score":null}]}</td><td>the voices speaking throughout [<code class="code">start</code>, <code class="code">end</code>), settled, never revised; spans never overlap and rise; each id a string of a track name's form with a <code class="code">score</code> from 0 to 1 or <code class="code">null</code>, or an integer from 1 with <code class="code">null</code>; strings alphabetical, then integers rising, none twice; <code class="code">talkers</code></td></tr>
+        <tr><td class="table-mono">talkers</td><td>talkers</td><td class="table-mono">{"end":…,"op":"talkers","start":…,"talkers":[{"id":"enrolled-1","score":0.82},{"id":2,"score":null}]}</td><td>the voices speaking throughout [<code class="code">start</code>, <code class="code">end</code>), settled, never revised; spans never overlap and rise; at most 16 talkers, each id a string of a track name's form with a <code class="code">score</code> from 0 to 1 or <code class="code">null</code>, or an integer from 1 with <code class="code">null</code>, the <code class="code">score</code> always present; strings alphabetical, then integers rising, none twice; <code class="code">talkers</code>, each talker's two fields alone</td></tr>
         <tr><td class="table-mono">turn</td><td>turn</td><td class="table-mono">{"end":…,"op":"turn","start":…}</td><td>a turn from the voice that began it to the voice's end that closed it; turns never overlap and rise; <code class="code">turn</code></td></tr>
         <tr><td class="table-mono">voice</td><td>turn</td><td class="table-mono">{"on":true,"op":"voice","start":…}</td><td>speech starts (<code class="code">on</code>) or stops at <code class="code">start</code>, on and off alternating from on; <code class="code">voice</code></td></tr>
         <tr><td class="table-mono">words</td><td>words</td><td class="table-mono">{"end":…,"op":"words","start":…,"words":[{"end":…,"start":…,"text":"hello"}]}</td><td>final words for [<code class="code">start</code>, <code class="code">end</code>), never revised; finals never overlap and rise, each word inside its span, the words rising; <code class="code">words</code></td></tr>

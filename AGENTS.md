@@ -130,12 +130,12 @@ at a time, its stop signal arming as a standing device's but exit 1.
 
 The design is `docs/index.html#engines`, the wire `docs/protocol.html#engines`. `Live.engines`
 holds each connected engine by track and kind; an engine's lines leave through a writer of its
-own (`Joining`): its `engine` reply (an echo engine's open plays after it), then a turn's or
-words engine's replay, a chunk at a time off the lock, joining its topics under the lock only
+own (`Joining`): its `engine` reply (an echo engine's open plays after it), then a frame reader's
+(`reads`: talkers, turn, words) replay, a chunk at a time off the lock, joining its topics under the lock only
 once a chunk finds nothing more, so live lines queue only after it has caught up, then what it
 is told under its topics: `<track>` (an echo engine, as a listener), `runs` (every play's open, runs and
-end, to echo engines), `<track> heard` (the frames passed on), `<track> turn` (a words engine's
-turn lines), `<track> say` (a speech engine's says), `<track> partial` (`partials` readers). A
+end, to echo engines), `<track> heard` (the frames passed on), `<track> turn` (a talkers and a
+words engine's turn and voice lines), `<track> say` (a speech engine's says), `<track> partial` (`partials` readers). A
 placed frame joins its track's `pending` and passes on (`release`, masked by `masked`) once its
 echo engine's `ruled` reaches its end, at once with none; the replay (`replay`) reads `segments`
 up to the first pending frame (a segment the sweep moved read from the archive set as it is
@@ -143,7 +143,8 @@ read), applying `Track.spans` (the logged masks, each open from its on to its of
 derived at boot, cut by the sweep) as live does, so the join is the lock's. A say's text is
 counted in its speech engine's `unread` until its writer has written it, the reply withheld at
 `UNREAD`. `latest`, derived from the log,
-is each track's floor per report kind and the reply's `through`. A say (`Live.says`) holds its
+is each track's floor per report kind and the reply's `through`; `listed` checks a report's
+words or talkers (at most `TALKERS`, 16); a talkers span is logged and kept nowhere else. A say (`Live.says`) holds its
 mouth; `conclude` ends the says a predicate picks (its play's `finish`, `done`, `unsay` for a
 hush, its client or engine gone, quiet, the drain, its mouth gone) and logs `spoken`; the next
 boot logs `lost` for a `say` without one. `rift engine run tail` (`src/tail.rs`) reads until its

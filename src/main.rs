@@ -68,6 +68,10 @@ const REACH: u64 = 32;
 /// The `stopping` state, the one the request handler tests for.
 const STOPPING: &str = "stopping";
 
+/// The most voices one talkers span may name, past any diarizer's count: a longer list is
+/// refused (docs/protocol.html#engines).
+const TALKERS: usize = 16;
+
 /// A say's `text` reply is withheld while its speech engine has this many pieces of text not yet
 /// written to it (docs/protocol.html#engines).
 const UNREAD: usize = 8;
@@ -86,7 +90,7 @@ static STOP: OnceLock<String> = OnceLock::new();
 struct Engine {
     /// Where the last frame it was given ends: a report naming a time past it is refused.
     given: u64,
-    /// Whether it reads live: a turn or words engine once its replay has caught up.
+    /// Whether it reads live: a talkers, turn or words engine once its replay has caught up.
     joined: bool,
     /// Its connection's key, for an echo engine dropped behind its ruling.
     key: u64,
@@ -108,7 +112,7 @@ type Chunk = (
     (u64, u64, (u64, u64)),
 );
 
-/// An engine's writer: its lines from its reply on, then, for a turn or words engine, its replay
+/// An engine's writer: its lines from its reply on, then, for one that reads frames, its replay
 /// from disk chunk by chunk until it has caught up, when it joins its topics under the lock, then
 /// what it is told.
 struct Joining {
@@ -171,8 +175,8 @@ struct Live {
     held: Vec<Value>,
     /// The last connection key handed out.
     keys: u64,
-    /// The latest time each track's logged reports of each kind name, any boot: a `words`,
-    /// `turn` or `mask` its end, a `voice` its start; a report before it is refused.
+    /// The latest time each track's logged reports of each kind name, any boot: a `mask`,
+    /// `talkers`, `turn` or `words` its end, a `voice` its start; a report before it is refused.
     latest: BTreeMap<(String, String), u64>,
     /// The last play's number, across every boot.
     numbered: u64,
@@ -272,7 +276,7 @@ struct Track {
     /// Whether the device streaming it plays (docs/protocol.html#plays).
     plays: bool,
     /// Its logged `mask`s and `turn`s ending inside the window, any boot, by kind, rising: the
-    /// masks applied to the frames its turn and words engines read, the turns a words engine's.
+    /// masks applied to the frames its engines read, the turns its talkers and words engines'.
     spans: BTreeMap<String, Vec<(u64, u64)>>,
 }
 
@@ -542,7 +546,7 @@ impl Live {
     }
 
     /// Passes `track`'s held frames its echo engine has ruled past, all with none connected, to
-    /// its turn and words engines, the logged masks applied.
+    /// the engines reading its frames, the logged masks applied.
     fn release(&mut self, track: &str) {
         let ruled = (self.engines.get(&(track.to_owned(), "echo".to_owned())))
             .map_or(u64::MAX, |echo| echo.ruled);
@@ -555,8 +559,8 @@ impl Live {
             lines.push((at, masked(&held.spans, at, &pcm)));
         }
         for (at, line) in lines {
-            // a turn or words engine still replaying is given no live frame yet
-            for kind in ["turn", "words"] {
+            // an engine still replaying is given no live frame yet
+            for kind in ["talkers", "turn", "words"] {
                 if let Some(engine) = (self.engines.get_mut(&(track.to_owned(), kind.to_owned())))
                     .filter(|engine| engine.joined)
                 {
@@ -567,17 +571,17 @@ impl Live {
         }
     }
 
-    /// One chunk of a turn or words engine's replay at `cursor` (`Joining`): `track`'s frames on
+    /// One chunk of a frame-reading engine's replay at `cursor` (`Joining`): `track`'s frames on
     /// disk from its first time on, up to the first frame its echo engine holds (which comes live
     /// once ruled on), each segment read from `audio/` or the archive as the replay reaches it;
-    /// for a words engine each logged turn ending after its second, past its third, after the
-    /// frame holding its end. None once there is nothing to send: caught up. A segment in neither
-    /// place ends it `gone`.
+    /// when `told` (a talkers or words engine) each logged turn ending after its second, past its
+    /// third, after the frame holding its end. None once there is nothing to send: caught up. A
+    /// segment in neither place ends it `gone`.
     fn replay(
         &self,
         live: &'static Mutex<Self>,
         track: &str,
-        words: bool,
+        told: bool,
         cursor: (u64, u64, (u64, u64)),
     ) -> Option<Chunk> {
         let (from, since, turned) = cursor;
@@ -634,7 +638,7 @@ impl Live {
         let mut turns: Vec<((u64, u64), String)> = (marks.get("turn").into_iter().flatten())
             .map(|&(start, stop)| queued(stop, 1, json!({"turn": {"end": stop, "start": start}})))
             .chain(voices.flatten())
-            .filter(|said| words && said.0.0 > since && said.0 > turned)
+            .filter(|said| told && said.0.0 > since && said.0 > turned)
             .collect();
         turns.sort();
         if spans.is_empty() && turns.is_empty() {
@@ -678,7 +682,8 @@ impl Live {
 
     /// `slot`'s engine's report, checked and acted on (docs/protocol.html#engines): its reply, else
     /// `bad_request` and nothing logged. A span starts on or after the latest of its kind and ends
-    /// no later than the last frame the engine was given; words rise inside it.
+    /// no later than the last frame the engine was given; words rise inside it, talkers are in
+    /// order.
     fn report(&mut self, slot: &(String, String), request: &Value) -> io::Result<Value> {
         let (track, op) = (&slot.0, request["op"].as_str().unwrap_or_default());
         // a ruling, a voice and a mask name one time, `to` and `start`
@@ -712,22 +717,8 @@ impl Live {
         let timed = first
             .zip(last)
             .is_some_and(|(start, end)| floor <= start && start <= end && end <= ceiling);
-        let mut reach = first.unwrap_or_default();
-        let worded = request["words"].as_array().is_some_and(|said| {
-            said.iter().all(|word| {
-                let span =
-                    (word["start"].as_u64().zip(word["end"].as_u64())).filter(|&(start, end)| {
-                        reach <= start
-                            && start <= end
-                            && Some(end) <= last
-                            && word["text"].is_string()
-                    });
-                reach = span.map_or(u64::MAX, |held| held.1);
-                span.is_some()
-            })
-        });
-        // the fields its event carries, each word's its own three; a partial's line the same but
-        // its kind
+        // the fields its event carries, each word's or talker's its own; a partial's line the
+        // same but its kind
         let mut event = json!({"engine": name, "kind": op, "track": track});
         let fields: &[&str] = if switched {
             &["on", "start"]
@@ -737,9 +728,19 @@ impl Live {
         for &field in fields {
             event[field] = request[field].clone();
         }
-        if slot.1 == "words" {
-            event["words"] = (request["words"].as_array().into_iter().flatten())
-                .map(|word| json!({"end": word["end"], "start": word["start"], "text": word["text"]}))
+        for (list, keys) in [
+            ("talkers", &["id", "score"][..]),
+            ("words", &["end", "start", "text"]),
+        ]
+        .into_iter()
+        .filter(|kind| kind.0 == slot.1)
+        {
+            event[list] = (request[list].as_array().into_iter().flatten())
+                .map(|item| {
+                    (keys.iter())
+                        .map(|&key| (key.to_owned(), item[key].clone()))
+                        .collect::<Map<_, _>>()
+                })
                 .collect();
         }
         let (begun, reached) = (first.unwrap_or_default(), last.unwrap_or_default());
@@ -776,16 +777,17 @@ impl Live {
                 self.release(track);
                 Ok(json!({"ok": true}))
             }
-            ("words", "partial") if timed && worded => {
+            ("words", "partial") if timed && listed(request) => {
                 drop(event.as_object_mut().and_then(|held| held.remove("kind")));
                 self.fan(&format!("{track} partial"), &format!("{event}\n"));
                 Ok(json!({"ok": true}))
             }
             // a voice's and a mask's on and off alternate from on
-            ("echo", "mask") | ("turn", "turn" | "voice") | ("words", "words")
-                if timed
-                    && (worded || slot.1 != "words")
-                    && (!switched || request["on"] == !on) =>
+            ("echo", "mask")
+            | ("talkers", "talkers")
+            | ("turn", "turn" | "voice")
+            | ("words", "words")
+                if timed && listed(request) && (!switched || request["on"] == !on) =>
             {
                 drop(self.emit(&event)?);
                 let _: Option<u64> = self.latest.insert((track.clone(), op.to_owned()), reached);
@@ -793,8 +795,8 @@ impl Live {
                     engine.on ^= switched;
                 }
                 // a mask kept for the frames it covers, open until its off; a turn and a voice,
-                // open until its off, for the words engine's replays
-                if op != "words" {
+                // open until its off, for the told engines' replays
+                if switched || op == "turn" {
                     let held = self.tracks.entry(track.clone()).or_default();
                     let spans = held.spans.entry(op.to_owned()).or_default();
                     match spans.last_mut() {
@@ -802,8 +804,8 @@ impl Live {
                         _ => spans.push((begun, if switched { u64::MAX } else { reached })),
                     }
                 }
-                // a turn's line and a voice's to the words engine, after the frame holding its
-                // end or start: its fields under its kind
+                // a turn's line and a voice's to the talkers and words engines, after the frame
+                // holding its end or start: its fields under its kind
                 if matches!(op, "turn" | "voice") {
                     let mut line = json!({});
                     line[op] = (fields.iter())
@@ -877,8 +879,8 @@ impl Live {
 
     /// Logs `track`'s open mask or voice (`kind`), `name`'s, off at `at`, or at its on when that
     /// is later: an echo engine gone with its mask on or a turn engine with its voice, the
-    /// drain's included, and a boot after a kill left one on; a voice's off told to the words
-    /// engine, so a voice line on is always followed by its off.
+    /// drain's included, and a boot after a kill left one on; a voice's off told to the talkers
+    /// and words engines, so a voice line on is always followed by its off.
     fn unmask(&mut self, track: &str, kind: &str, name: &str, at: u64) {
         let slot = (track.to_owned(), kind.to_owned());
         let off = at.max(self.latest.get(&slot).copied().unwrap_or_default());
@@ -950,7 +952,7 @@ fn labelled(mut event: Value, heard: &Value) -> Value {
     event
 }
 
-/// A frame's line for a turn or words engine: `pcm` placed at `at`, the samples a logged mask of
+/// A frame's line for an engine reading frames: `pcm` placed at `at`, the samples a logged mask of
 /// `spans` covers zeros and the frame marked `masked`.
 fn masked(spans: &BTreeMap<String, Vec<(u64, u64)>>, at: u64, pcm: &str) -> String {
     let (mut text, mut hit) = (pcm.as_bytes().to_vec(), false);
@@ -1084,6 +1086,59 @@ fn manifest() -> hotswap::Manifest {
             ]),
         ],
         ..hotswap::Manifest::default()
+    }
+}
+
+/// Whether an engine of `kind` reads its ear's frames from a `from`: a talkers, turn or words
+/// engine (docs/protocol.html#engines).
+fn reads(kind: &str) -> bool {
+    matches!(kind, "talkers" | "turn" | "words")
+}
+
+/// Whether a report's list holds (docs/protocol.html#engines), true for one with none: a final's
+/// or a partial's words each inside its span, rising; a talkers span's at most `TALKERS`, each a
+/// label of a track name's form scored 0 to 1 or null, or a number from 1 scored null, labels
+/// alphabetical, then numbers rising, none twice.
+fn listed(request: &Value) -> bool {
+    let (mut reach, last) = (
+        request["start"].as_u64().unwrap_or_default(),
+        request["end"].as_u64(),
+    );
+    match request["op"].as_str() {
+        Some("partial" | "words") => request["words"].as_array().is_some_and(|said| {
+            said.iter().all(|word| {
+                let span =
+                    (word["start"].as_u64().zip(word["end"].as_u64())).filter(|&(start, end)| {
+                        reach <= start
+                            && start <= end
+                            && Some(end) <= last
+                            && word["text"].is_string()
+                    });
+                reach = span.map_or(u64::MAX, |held| held.1);
+                span.is_some()
+            })
+        }),
+        Some("talkers") => request["talkers"].as_array().is_some_and(|said| {
+            said.len() <= TALKERS
+                && (said.iter())
+                    .map(|talker| &talker["id"])
+                    .map(|id| (id.is_u64(), id.as_str(), id.as_u64()))
+                    .is_sorted_by(|low, high| low < high)
+                && said.iter().all(|talker| {
+                    let score = talker.get("score");
+                    match (talker["id"].as_str(), talker["id"].as_u64()) {
+                        (Some(label), _) => score.is_some_and(|sure| {
+                            well("ear", label)
+                                && (sure.is_null()
+                                    || sure
+                                        .as_f64()
+                                        .is_some_and(|at| (0.0f64..=1.0f64).contains(&at)))
+                        }),
+                        (_, number) => number > Some(0) && score.is_some_and(Value::is_null),
+                    }
+                })
+        }),
+        _ => true,
     }
 }
 
@@ -1649,7 +1704,7 @@ fn main() -> ExitCode {
                         .filter(|event| {
                             matches!(
                                 event["kind"].as_str(),
-                                Some("mask" | "turn" | "voice" | "words")
+                                Some("mask" | "talkers" | "turn" | "voice" | "words")
                             )
                         })
                         .map(|event| {
@@ -1936,21 +1991,20 @@ fn main() -> ExitCode {
                         let rated = request["rate"]
                             .as_u64()
                             .is_some_and(|rate| (8000..=48_000).contains(&rate));
-                        // an engine's kind and name: echo, turn and words on an ear, speech on a
-                        // mouth, `from` a turn's and a words engine's alone
+                        // an engine's kind and name: echo, talkers, turn and words on an ear,
+                        // speech on a mouth, `from` a frame reader's alone
                         let role = request["kind"]
                             .as_str()
                             .zip(request["name"].as_str())
                             .filter(|&(kind, name)| {
-                                let reads = matches!(kind, "turn" | "words");
                                 tracked
                                     && well("ear", name)
                                     && match kind {
                                         "echo" => track.starts_with("ear-"),
                                         "speech" => track.starts_with("mouth-"),
-                                        _ => reads && track.starts_with("ear-"),
+                                        _ => reads(kind) && track.starts_with("ear-"),
                                     }
-                                    && request.get("from").is_some() == reads
+                                    && request.get("from").is_some() == reads(kind)
                                     && (request["from"].is_null()
                                         || request["from"].is_u64()
                                         || request["from"] == "through")
@@ -2066,9 +2120,9 @@ fn main() -> ExitCode {
                                             &guard.root.join(format!("engines/{kind}.err")),
                                             setting("RIFT_LOG_CAP", 1u64 << 20u8),
                                         );
-                                        // where its track's frames passed on reach: a turn or
-                                        // words engine reading live starts there, an echo
-                                        // engine's ruling too
+                                        // where its track's frames passed on reach: an engine
+                                        // reading frames live starts there, an echo engine's
+                                        // ruling too
                                         let reached = guard.reach(track);
                                         // an echo engine's ruling: past the latest mask too
                                         let ruling = (guard.latest)
@@ -2087,7 +2141,7 @@ fn main() -> ExitCode {
                                         // a turn engine's: its turns' and its voice's
                                         let through = latest(kind)
                                             .max(latest(&kind.replace("turn", "voice")));
-                                        if matches!(kind, "turn" | "words") {
+                                        if reads(kind) {
                                             reply["through"] = through.into();
                                         }
                                         // an echo engine's: where its ruling starts
@@ -2097,7 +2151,7 @@ fn main() -> ExitCode {
                                         // an echo engine reads its ear's frames as a listener
                                         // does, and every mouth's runs, from the plays open and
                                         // where each has got to; a speech engine its mouth's
-                                        // says; a turn or words engine joins its topics once its
+                                        // says; one reading frames joins its topics once its
                                         // replay has caught up
                                         let mut lines = vec![format!("{reply}\n")];
                                         let topics = match kind {
@@ -2124,11 +2178,7 @@ fn main() -> ExitCode {
                                             through.filter(|_| request["from"] == "through");
                                         let from =
                                             request["from"].as_u64().or(resumed).unwrap_or(reached);
-                                        let cursor = matches!(kind, "turn" | "words").then_some((
-                                            from,
-                                            from,
-                                            (0, 0),
-                                        ));
+                                        let cursor = reads(kind).then_some((from, from, (0, 0)));
                                         drop(guard.engines.insert(
                                             slot.clone(),
                                             Engine {
@@ -2321,7 +2371,7 @@ fn main() -> ExitCode {
                                                 &name,
                                                 &format!("{}\n", json!({"pcm": sound, "t": start})),
                                             );
-                                            // a mouth's frames go to no turn or words engine
+                                            // a mouth's frames go to no engine reading frames
                                             if name.starts_with("ear-") {
                                                 state.hear(&name, start, sound);
                                             }
@@ -2904,7 +2954,7 @@ fn main() -> ExitCode {
                                         while let Some(at) = cursor {
                                             let mut locked = lock(live);
                                             let chunk =
-                                                locked.replay(live, &slot.0, slot.1 == "words", at);
+                                                locked.replay(live, &slot.0, slot.1 != "turn", at);
                                             cursor = chunk.as_ref().map(|held| held.1);
                                             // given what this chunk sends; caught up, what the
                                             // live frames do from here
@@ -2922,7 +2972,7 @@ fn main() -> ExitCode {
                                             }
                                             let topics = ["heard", "turn"]
                                                 .iter()
-                                                .take(if slot.1 == "words" { 2 } else { 1 });
+                                                .take(if slot.1 == "turn" { 1 } else { 2 });
                                             for topic in topics.filter(|_| cursor.is_none()) {
                                                 locked.feeds.push((
                                                     sender.clone(),
@@ -3073,11 +3123,15 @@ fn main() -> ExitCode {
             &["setup"]
             | &["setup", "--print" | "--remove"]
             | &["engine", "list"]
-            | &["engine", "remove", "echo" | "speech" | "turn" | "words"]
+            | &[
+                "engine",
+                "remove",
+                "echo" | "speech" | "talkers" | "turn" | "words",
+            ]
             | &[
                 "engine",
                 "add",
-                "echo" | "speech" | "turn" | "words",
+                "echo" | "speech" | "talkers" | "turn" | "words",
                 "--",
                 _,
                 ..,
@@ -3344,7 +3398,7 @@ fn main() -> ExitCode {
                     off
                 };
                 // an engine's job, one per kind (docs/index.html#engines)
-                let kinds = ["echo", "speech", "turn", "words"];
+                let kinds = ["echo", "speech", "talkers", "turn", "words"];
                 let engine = |kind: &str| {
                     let job = format!("{label}.{kind}");
                     (path.with_file_name(format!("{job}.plist")), job)
