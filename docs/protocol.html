@@ -501,8 +501,8 @@
 <section class="docs-section" id="engines" data-component="engines">
   <header>
     <h2 class="h2">Engines</h2>
-    <p class="docs-note">Served, the echo engine's clean track aside (<a href="index.html#engines">the
-      slices</a>). An engine is a client that does one kind of work
+    <p class="docs-note">Served, the echo engine's clean track and the talkers kind aside, both
+      designed (<a href="index.html#engines">the slices</a>). An engine is a client that does one kind of work
       on one track and reports results, which the daemon checks and logs as events
       (<a href="index.html#engines">the design</a>). Every op, field, event and code here is
       additive: <code class="code">proto</code> stays 1, and nothing above changes meaning.</p>
@@ -511,17 +511,17 @@
     <li><strong>The connection.</strong> After hello,
       <code class="code">{"from":null,"kind":"words","name":"transcribe","op":"engine","track":"ear-desk"}</code>.
       <code class="code">kind</code> is <code class="code">echo</code> (on an ear's track),
-      <code class="code">speech</code> (a mouth's), <code class="code">turn</code> or
-      <code class="code">words</code> (an ear's or a clean track's); <code class="code">name</code> is of
-      a track name's form. <code class="code">from</code>, a turn's and a words engine's alone and
-      required, is a time on the stream, <code class="code">null</code> for live, or
+      <code class="code">speech</code> (a mouth's), <code class="code">talkers</code>,
+      <code class="code">turn</code> or <code class="code">words</code> (an ear's or a clean
+      track's); <code class="code">name</code> is of a track name's form.
+      <code class="code">from</code>, a talkers, turn or words engine's alone and required, is a time on the stream, <code class="code">null</code> for live, or
       <code class="code">"through"</code>: from its kind's <code class="code">through</code> on the
       track, live when that is <code class="code">null</code>, so one connection resumes; never
       <code class="code">gone</code>, the replay starting at the oldest audio still held, since a
       resume wants all it can have. The reply,
       <code class="code">{"ok":true,"seq":20,"through":1764000000600000}</code>, logs
-      <code class="code">engine</code>; <code class="code">through</code>, a turn's and a words
-      engine's, is the latest time a logged report of that kind on that track names, any boot,
+      <code class="code">engine</code>; <code class="code">through</code>, a talkers, turn or
+      words engine's, is the latest time a logged report of that kind on that track names, any boot,
       or <code class="code">null</code> (a turn engine's the later of its voices' starts and its
       turns' ends, so a resume may replay from a voice on); an echo engine's carries <code class="code">ruled</code>
       instead, where its ruling starts (below). The connection is then the engine's: its reports, each
@@ -543,7 +543,7 @@
       the track's frames passed on reach (any boot) as it connects, or past the latest mask when
       later, as its reply's <code class="code">ruled</code> says; so no mask reaches a frame already
       passed on and none is unbounded.</li>
-    <li><strong>What a turn or words engine reads.</strong> Its track's frames,
+    <li><strong>What a talkers, turn or words engine reads.</strong> Its track's frames,
       <code class="code">{"pcm":"…","t":1764000000000000}</code> as a reader's, from
       <code class="code">from</code> (<code class="code">null</code>: where its frames reach as it
       connects): replayed from disk, a segment the sweep moved read from the archive, until the
@@ -554,7 +554,7 @@
       place: <code class="code">{"code":"gone","ok":false}</code>, then the end of stream.
       On an ear's track, samples the echo stage marked are zeros and their frame carries
       <code class="code">"masked":true</code>; while an echo engine is connected, a live frame
-      waits until it has ruled on it. A words engine also reads each logged
+      waits until it has ruled on it. A talkers or words engine also reads each logged
       <code class="code">turn</code> on its track, <code class="code">{"turn":{"end":…,"start":…}}</code>,
       after the frame holding its <code class="code">end</code>, so it may finish a turn knowing it
       has all of it, and each logged <code class="code">voice</code>,
@@ -564,6 +564,25 @@
       found unfinished), so a words engine keeps its audio past a turn's end until the line or
       its own rule closes it. Word times are as fine as the engine can give: one without per-word
       times may spread them within its span. 1024 live lines unsent drop the engine, as a listener.</li>
+    <li><strong>What a talkers engine reports.</strong> Who was speaking, as spans
+      [<code class="code">start</code>, <code class="code">end</code>) that never overlap and rise, as
+      finals do, each settled: never revised, so an engine whose labels change for recent audio
+      holds a span until they stop. A span's <code class="code">talkers</code> are the voices
+      speaking throughout it, each <code class="code">{"id":…,"score":…}</code>: none for nobody,
+      two or more for speech at once, a change in who speaks a new span. <code class="code">id</code>
+      is a string for an enrolled voice, the label of a track name's form the engine was configured
+      with, the same across connections and boots while its profile stands; or an integer for a
+      voice matching none, numbered from 1 on each connection in the order first reported, never
+      reused on it and meaning nothing past it (the <code class="code">engine</code> events bracket
+      a connection). <code class="code">score</code> is how sure the engine is that the span's
+      audio is that enrolled voice, 0 to 1, higher surer, comparable only within one engine, and
+      <code class="code">null</code> for an integer id or a span too short to score. The talkers are
+      ordered strings first, alphabetically, then integers rising, each id once. A span's end is the
+      engine's settled reach: no later span starts before it, so a client knows who spoke at every
+      time up to the latest end, nobody included. The engine cuts a span where the turn line it
+      read ends a turn, once its labels there have settled, so the span covering a turn's end
+      closes with it rather than with the next change; with no turn engine on the track it cuts at
+      changes alone. Audio the echo stage masked is nobody's.</li>
     <li><strong>What an echo engine reads.</strong> Its ear's frames, live only, and, for every
       mouth, each play's open (those open as it connects, with their runs so far, first) (<code class="code">{"play":3,"rate":24000,"track":"mouth-desk"}</code>),
       each run as its mouth reports it, on the daemon's clock
@@ -595,6 +614,7 @@
         <tr><td class="table-mono">mask</td><td>echo</td><td class="table-mono">{"on":true,"op":"mask","start":…}</td><td>from an on's <code class="code">start</code> to its off's the ear is the machine hearing itself; on and off alternating from on, rising; <code class="code">mask</code></td></tr>
         <tr><td class="table-mono">partial</td><td>words</td><td class="table-mono">{"end":…,"op":"partial","start":…,"words":[…]}</td><td>a hypothesis for audio after the last final, superseding the last partial; not logged, sent to <code class="code">partials</code> readers</td></tr>
         <tr><td class="table-mono">ruled</td><td>echo</td><td class="table-mono">{"op":"ruled","to":…}</td><td>every sample before <code class="code">to</code> is ruled on; rising; releases the frames held for it; not logged</td></tr>
+        <tr><td class="table-mono">talkers</td><td>talkers</td><td class="table-mono">{"end":…,"op":"talkers","start":…,"talkers":[{"id":"enrolled-1","score":0.82},{"id":2,"score":null}]}</td><td>the voices speaking throughout [<code class="code">start</code>, <code class="code">end</code>), settled, never revised; spans never overlap and rise; each id a string of a track name's form with a <code class="code">score</code> from 0 to 1 or <code class="code">null</code>, or an integer from 1 with <code class="code">null</code>; strings alphabetical, then integers rising, none twice; <code class="code">talkers</code></td></tr>
         <tr><td class="table-mono">turn</td><td>turn</td><td class="table-mono">{"end":…,"op":"turn","start":…}</td><td>a turn from the voice that began it to the voice's end that closed it; turns never overlap and rise; <code class="code">turn</code></td></tr>
         <tr><td class="table-mono">voice</td><td>turn</td><td class="table-mono">{"on":true,"op":"voice","start":…}</td><td>speech starts (<code class="code">on</code>) or stops at <code class="code">start</code>, on and off alternating from on; <code class="code">voice</code></td></tr>
         <tr><td class="table-mono">words</td><td>words</td><td class="table-mono">{"end":…,"op":"words","start":…,"words":[{"end":…,"start":…,"text":"hello"}]}</td><td>final words for [<code class="code">start</code>, <code class="code">end</code>), never revised; finals never overlap and rise, each word inside its span, the words rising; <code class="code">words</code></td></tr>
@@ -649,6 +669,19 @@
       ended is ended by it, so a retry meets at most <code class="code">busy</code>; a
       <code class="code">text</code> dies with its connection. An engine's reports are not retried:
       it reconnects and resumes from <code class="code">through</code>.</li>
+    <li><strong>Who spoke a turn.</strong> No event carries a speaker but
+      <code class="code">talkers</code>: a client joins by time on a feed. For a
+      <code class="code">turn</code> [s, e) it keeps the <code class="code">talkers</code> events
+      overlapping it, before or after the turn's own, until one ends at or past e, and sums each
+      id's time inside [s, e); what share counts as mostly, and what score as sure, are the
+      client's. An <code class="code">engine</code> off for the talkers engine before that span
+      ends it: the turn's tail is unknown, never nobody's. Three answers stay apart: an integer id
+      (a voice, not enrolled), no talkers (nobody), and no span (no talkers engine, which
+      health's <code class="code">engines</code> and the <code class="code">engine</code> events
+      say, or one not yet settled there).</li>
+    <li><strong>A talkers engine leaving.</strong> Its spans logged stand; the span it held open
+      is never reported, so its reach stops at its last end and the next engine resumes from
+      <code class="code">through</code>, its integer ids counted afresh.</li>
   </ul>
   <div class="table-wrap">
     <table data-table>
@@ -659,6 +692,7 @@
         <tr><td class="table-mono">play</td><td class="table-mono">[say,] play, rate, track</td><td>as above; <code class="code">say</code> when the play is a say's</td></tr>
         <tr><td class="table-mono">say</td><td class="table-mono">say, track</td><td>a say opened on the mouth <code class="code">track</code></td></tr>
         <tr><td class="table-mono">spoken</td><td class="table-mono">play, reason, say, spoken, text, track</td><td>the say is over: <code class="code">text</code> all it was given, <code class="code">spoken</code> how many of its characters sounded, <code class="code">play</code> its play or <code class="code">null</code></td></tr>
+        <tr><td class="table-mono">talkers</td><td class="table-mono">end, engine, start, talkers, track</td><td>a talkers engine's span, each talker <code class="code">{"id","score"}</code></td></tr>
         <tr><td class="table-mono">turn</td><td class="table-mono">end, engine, start, track</td><td>a turn engine's turn</td></tr>
         <tr><td class="table-mono">voice</td><td class="table-mono">engine, on, start, track</td><td>a turn engine's speech start or stop</td></tr>
         <tr><td class="table-mono">words</td><td class="table-mono">end, engine, start, track, words</td><td>a words engine's final words, each <code class="code">{"end","start","text"}</code></td></tr>
@@ -694,6 +728,27 @@
 ← {"ok":true,"seq":23}
 → {"end":1764000001200000,"op":"turn","start":1764000000300000}
 ← {"ok":true,"seq":24}</pre>
+  <p class="docs-note">A talkers engine, one voice enrolled as <code class="code">enrolled-1</code>,
+    reading the turn above; a second voice joins at 1.6 s, the two overlap, the first stops:</p>
+  <pre class="tree">→ {"from":"through","kind":"talkers","name":"diarize","op":"engine","track":"ear-desk"}
+← {"ok":true,"seq":25,"through":null}
+← {"pcm":"…","t":1764000000000000}
+← … frames; its labels for a time settle about 1 s after it
+← {"turn":{"end":1764000001200000,"start":1764000000300000}}
+→ {"end":1764000000300000,"op":"talkers","start":1764000000000000,"talkers":[]}
+← {"ok":true,"seq":26}
+→ {"end":1764000001200000,"op":"talkers","start":1764000000300000,"talkers":[{"id":"enrolled-1","score":0.82}]}
+← {"ok":true,"seq":27}
+→ {"end":1764000001600000,"op":"talkers","start":1764000001200000,"talkers":[]}
+← {"ok":true,"seq":30}
+→ {"end":1764000002100000,"op":"talkers","start":1764000001600000,"talkers":[{"id":"enrolled-1","score":0.71},{"id":1,"score":null}]}
+← {"ok":true,"seq":31}
+→ {"end":1764000002000000,"op":"talkers","start":1764000002100000,"talkers":[{"id":1,"score":null}]}
+← {"code":"bad_request","ok":false}</pre>
+  <p class="docs-note">The last ends before it starts and is refused, logging nothing; the engine
+    holds what it has until it reports it right. Its first span ends at the turn's start and its
+    second at the turn's end, the cut the turn line asked for, so a client knows at seq 27 that the
+    turn was <code class="code">enrolled-1</code>'s throughout.</p>
   <p class="docs-note">An echo engine masking a play as it sounds, the tail heard out:</p>
   <pre class="tree">→ {"kind":"echo","name":"tail","op":"engine","track":"ear-desk"}
 ← {"ok":true,"ruled":1764000004980000,"seq":19}
@@ -725,15 +780,17 @@
   <ul class="stack">
     <li><strong>What an engine may rely on.</strong> The frames it is given are gapless but for
       holes and in order; a live ear frame it is given was already ruled on by the echo stage when
-      one was connected; a words engine's <code class="code">turn</code> lines follow the frames
-      they span; <code class="code">through</code> is exact; a report refused is not logged; the
+      one was connected; a talkers or words engine's <code class="code">turn</code> lines follow
+      the frames they span; <code class="code">through</code> is exact; a report refused is not logged; the
       codes and the fields above.</li>
     <li><strong>What is left unspecified, and may change in any release.</strong> When the daemon
       sends a frame relative to its placement, and how frames batch on the socket; how a held frame
       waits beyond the order stated; the order of lines between engines, beyond each engine's own;
       which of two engines racing for a kind wins; anything an engine decides: partials' cadence
       and contents, a final's latency, word boundaries, a mask's tail, when a turn closes, a
-      speech engine's rate and its marks' spacing. A client depends on values and order, never
+      speech engine's rate and its marks' spacing; a talkers engine's thresholds, how many voices
+      it tells apart, how long a new voice waits for its id and a span to settle, where it cuts
+      beyond the turn ends and changes, and what its scores mean beyond their order. A client depends on values and order, never
       on how soon.</li>
   </ul>
 </section>
