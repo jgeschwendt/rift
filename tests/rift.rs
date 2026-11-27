@@ -4828,7 +4828,7 @@ start() {{ [ -f {root}/dead ] && return; case $1 in *.ear.plist) [ -f {root}/dea
 stop() {{ kill $1 2>/dev/null || return 0; while kill -0 $1 2>/dev/null; do sleep 0.02; done; }}
 hold() {{ until RIFT_ROOT=$1 {serve} status | grep -q ready; do sleep 0.05; done; RIFT_ROOT=$1 RIFT_MIC={root}/fake {serve} device ear test-mac --mic >/dev/null 2>&1 & echo $! > {root}/holder; until RIFT_ROOT=$1 {serve} status | grep -q ear-test-mac; do sleep 0.05; done; }}
 case $1 in
-print) [ -f {root}/loaded/$job.going ] && {{ rm {root}/loaded/$job.going; exit 0; }}; [ -f {root}/loaded/$job ] || exit 113;;
+print) [ -f {root}/loaded/$job.going ] && {{ rm {root}/loaded/$job.going; exit 0; }}; [ -f {root}/loaded/$job ] || exit 113; [ -f {root}/lwcr ] && echo 'managed LWCR | has LWCR'; exit 0;;
 bootout) stop $(cat {root}/loaded/$job); [ -f {root}/stuck ] || mv {root}/loaded/$job {root}/loaded/$job.going;;
 bootstrap) case $3 in *.upgrade.plist) touch {root}/loaded/$(basename $3 .plist); exit;; esac; held=$(sed -n 's|.*<key>RIFT_ROOT</key><string>\(.*\)</string>.*|\1|p' $3); [ -n "$(find "$held" -maxdepth 0 -perm 700)" ] && echo root 0700 >> {root}/launchctl.log; [ -f {root}/fail ] && {{ echo 'Bootstrap failed: 5: Input/output error' >&2; exit 5; }}; start $3; case $3 in *rift.plist) [ ! -f {root}/held ] || hold "$held";; esac;;
 print-disabled) [ -f {root}/disabled ] && sed 's/.*/	"&" => disabled/' {root}/disabled; exit 0;;
@@ -5045,7 +5045,7 @@ esac
         same(
             &format!("{}{}{}", run(&stubbed, &[], &[])?, calls()?, signs()?),
             &format!(
-                "0\n{linked}{wrote}{muted}launchctl kickstart -k {job}\n{heard}print {job}\n{tended}{deafen}kickstart -k {job}\n{hear}{steady}"
+                "0\n{linked}{wrote}{muted}launchctl kickstart -k {job}\n{heard}print {job}\n{tended}{deafen}print {job}\nkickstart -k {job}\n{hear}{steady}"
             ),
         )?;
         // the swap returns once the respawn, held back as by ThrottleInterval, answers ready,
@@ -5088,7 +5088,7 @@ esac
                 signs()?
             ),
             &format!(
-                "1\n{linked}{wrote}{muted}launchctl kickstart -k {job}\ndev.gigantic.rift not ready 0 ms after its load; loading it again\nlaunchctl bootout {job}\nlaunchctl bootstrap {gui} {file}\n{earboot}dev.gigantic.rift.ear not ready 0 ms after its load; loading it again\n{earboot}rift setup: dev.gigantic.rift.ear not ready 3000 ms after its load; see {data}/ear.err\nprint {job}\n{tended}{deafen}kickstart -k {job}\nprint {job}\nbootout {job}\nprint {job}\nprint {job}\nbootstrap {gui} {file}\nroot 0700\nprint-disabled {gui}\n{0}{0}{steady}",
+                "1\n{linked}{wrote}{muted}launchctl kickstart -k {job}\ndev.gigantic.rift not ready 0 ms after its load; loading it again\nlaunchctl bootout {job}\nlaunchctl bootstrap {gui} {file}\n{earboot}dev.gigantic.rift.ear not ready 0 ms after its load; loading it again\n{earboot}rift setup: dev.gigantic.rift.ear not ready 3000 ms after its load; see {data}/ear.err\nprint {job}\n{tended}{deafen}print {job}\nkickstart -k {job}\nprint {job}\nbootout {job}\nprint {job}\nprint {job}\nbootstrap {gui} {file}\nroot 0700\nprint-disabled {gui}\n{0}{0}{steady}",
                 on(&earjob, &earfile),
             ),
         )?;
@@ -5107,7 +5107,7 @@ esac
                 signs()?
             ),
             &format!(
-                "1\n{linked}{wrote}launchctl kickstart -k {job}\n{heard}dev.gigantic.rift.mouth not ready 15000 ms after its load; loading it again\nlaunchctl bootstrap {gui} {mouthfile}\nremoved {mouthfile}\nremoved {mouthcopy}\nrift setup: dev.gigantic.rift.mouth not ready 1000 ms after its load; see {data}/mouth.err\nprint {job}\n{tended}{unheard}kickstart -k {job}\n{hear}{mouthon}{0}{steady}",
+                "1\n{linked}{wrote}launchctl kickstart -k {job}\n{heard}dev.gigantic.rift.mouth not ready 15000 ms after its load; loading it again\nlaunchctl bootstrap {gui} {mouthfile}\nremoved {mouthfile}\nremoved {mouthcopy}\nrift setup: dev.gigantic.rift.mouth not ready 1000 ms after its load; see {data}/mouth.err\nprint {job}\n{tended}{unheard}print {job}\nkickstart -k {job}\n{hear}{mouthon}{0}{steady}",
                 absent(&mouthjob)
             ),
         )?;
@@ -5116,6 +5116,27 @@ esac
             &format!("{} {}", fs::exists(&mouthfile)?, fs::exists(&mouthcopy)?),
             "false false",
         )?;
+        // a daemon loaded at login carries a managed launch constraint (`lwcr`) that a kickstart
+        // keeps: it is booted out and loaded afresh instead, and comes up ready (the mouth muted,
+        // so the run leaves what it found)
+        for marker in ["lwcr", "mute"] {
+            fs::write(format!("{root}/{marker}"), "")?;
+        }
+        let reloaded = format!("{}{}{}", run(&stubbed, &[], &[])?, calls()?, signs()?);
+        for marker in ["lwcr", "mute"] {
+            fs::remove_file(format!("{root}/{marker}"))?;
+        }
+        same(
+            &format!(
+                "{} {}",
+                reloaded.contains(&format!(
+                    "launchctl bootout {job}\nlaunchctl bootstrap {gui} {file}\n"
+                )),
+                reloaded.contains("kickstart")
+            ),
+            "true false",
+        )?;
+        same(&health()?["state"].to_string(), "\"ready\"")?;
         // the swap: setup through the link, its kickstart, then the smoke against the new daemon
         same(
             &format!(
@@ -5133,7 +5154,7 @@ esac
                 signs()?
             ),
             &format!(
-                "0\nrift 1: green, 2 smoke probes\nprint {job}\n{tended}{}{}kickstart -k {job}\n{hear}{steady}",
+                "0\nrift 1: green, 2 smoke probes\nprint {job}\n{tended}{}{}print {job}\nkickstart -k {job}\n{hear}{steady}",
                 off(&earjob),
                 absent(&mouthjob)
             ),
