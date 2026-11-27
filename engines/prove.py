@@ -18,10 +18,10 @@ dashboard, please.", an invented word scribe hears as Flogix without a vocabular
 With $PROVE_TALKERS (diarize's weights in $DIARIZE_MODEL) it proves the talkers engine instead:
 endpoint alone hears fixtures/voices.pcm (Pocket TTS, alba then marius, twice each); the first
 turn's voice is enrolled as `first` from the daemon's read of it (`diarize enrol --track`); then
-diarize connects and the fixture is played again. alba's turns must be mostly `first`, scored over
-0.5; marius's never `first` over 0.5 (LS-EEND alone names his first phrase `first`, its score
-under). The verdict adds each turn's ids, `first`'s scores and how long after the turn event the
-span reaching its end was logged.
+diarize connects and the fixture is played again. alba's turns must be mostly `first`, each
+scored, every score of hers above any of marius's as `first` (LS-EEND alone may name his phrase
+`first`): order is all a score promises. The verdict adds each turn's ids, `first`'s scores and
+how long after the turn event the span reaching its end was logged.
 """
 
 # ruff: noqa: S603 -- it runs the programs it was handed
@@ -49,7 +49,6 @@ TERMS = os.environ.get("PROVE_TERMS")
 FIXTURE, HEARD = ("term.pcm", ("phlogix",)) if TERMS else ("phrase.pcm", ("kitchen", "lights"))
 HERE = Path(__file__).parent
 REPLY = "Sure, the kitchen lights are on now. Anything else?"
-SURE = 0.5  # the score over which a talkers label is the enrolled voice's
 
 
 def ask(sock: str, *requests: dict, rest: bool = False) -> list[dict]:
@@ -263,12 +262,13 @@ def talkers(rift: str, bins: Path, out: Path) -> None:
     print(
         json.dumps({"enrolled": enrolled.stderr.strip(), "stops": stops, "turns": rows}, indent=1)
     )
-    # the fixture's four phrases, alba's first: hers mostly `first`, scored over 0.5; marius's
-    # never `first` over 0.5, which LS-EEND alone may name him
-    over = [any((score or 0) > SURE for score in row["first_scores"]) for row in rows]
-    sys.exit(
-        0 if over == [True, False] * 2 and rows[0]["mostly"] == rows[2]["mostly"] == "first" else 1
-    )
+    # the fixture's four phrases, alba's first: hers mostly `first`, each scored; every score of
+    # hers above every score of marius's as `first`, which LS-EEND alone may name him
+    hers = [[s for s in row["first_scores"] if s is not None] for row in rows[0::2]]
+    his = [s for row in rows[1::2] for s in row["first_scores"] if s is not None]
+    named = len(rows) == len(hers) * 2 and rows[0]["mostly"] == rows[2]["mostly"] == "first"
+    ordered = all(hers) and min(min(h) for h in hers) > max(his, default=0)
+    sys.exit(0 if named and ordered else 1)
 
 
 def main() -> None:

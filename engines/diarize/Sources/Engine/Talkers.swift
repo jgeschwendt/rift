@@ -8,8 +8,8 @@ let stepFrames = 5
 let keptFrames = 1_500
 /// The longest span held before the engine cuts it itself: 20 s, in µs.
 let capSpan = 20_000_000
-/// The shortest span scored, 2 s in µs; a shorter one's score is null: under it WeSpeaker scored
-/// windows of other voices over windows of the enrolled one, and over 0.53 (engines/README.md).
+/// The shortest span scored, 2 s in µs; a shorter one's score is null, not identified: under it
+/// WeSpeaker scored windows of other voices over the enrolled one's (engines/README.md).
 let shortest = 2_000_000
 /// The most talkers a span names.
 let most = 16
@@ -25,6 +25,13 @@ let lag = 20
 let rate = 16_000
 /// The most samples one embedding reads: WeSpeaker's 10 s window.
 let window = 160_000
+
+/// A model that broke its contract: not a `Failure` waited out, since a replay would break it
+/// again unsaid, but an error that escapes, said and exit 1 for launchd to restart, each time.
+struct Fault: LocalizedError {
+  let reason: String
+  var errorDescription: String? { reason }
+}
 
 /// A streaming diarizer and a voice embedder.
 public protocol Model {
@@ -55,9 +62,8 @@ func cosine(_ a: [Float], _ b: [Float]) -> Float {
   return aa * bb > 0 ? dot / (aa * bb).squareRoot() : 0
 }
 
-/// A cosine similarity as a score: linear from 0.06 (0) to 1 (1), clamped, to 3 places, so 0.53,
-/// over every window of 2 s or more of seven other voices WeSpeaker scored, reads 0.5
-/// (engines/README.md).
+/// A cosine similarity as a score: linear from 0.06 (0) to 1 (1), clamped, to 3 places. Evidence,
+/// not a decision: how far it parts voices depends on the profile (engines/README.md).
 func score(_ cosine: Float) -> Double {
   (min(1, max(0, (Double(cosine) - 0.06) / 0.94)) * 1_000).rounded() / 1_000
 }
@@ -119,12 +125,11 @@ final class Talkers {
   }
 
   /// A frame's `samples` fed, and what settles; a model giving more steps than were fed, or
-  /// falling more than `lag` behind, fails the connection rather than pair a step with the wrong
-  /// frames.
+  /// falling more than `lag` behind, is a `Fault` rather than a step paired with the wrong frames.
   func push(_ samples: [Float]) throws -> [[String: Any]] {
     let rows = try model.feed(samples)
     guard rows.count <= fed.count, fed.count - rows.count <= lag else {
-      throw Failure(reason: "the model gave \(rows.count) steps with \(fed.count) fed")
+      throw Fault(reason: "the model gave \(rows.count) steps with \(fed.count) fed")
     }
     for slots in rows {
       given.append((fed.removeFirst(), Set(slots.indices.filter { slots[$0] > bar })))

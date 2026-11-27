@@ -292,7 +292,7 @@ func voiced() -> [[String: Any]] {
     #expect(spoken == ["diarize: a span named more than 16 talkers; the rest were left out"])
   }
 
-  @Test("a model giving more steps than fed, or trailing past 2 s, fails rather than pairs")
+  @Test("a model giving more steps than fed, or trailing past 2 s, is a fault rather than paired")
   func paired() throws {
     final class Over: Model {
       let rows: Int
@@ -306,14 +306,15 @@ func voiced() -> [[String: Any]] {
       let engine = try Talkers(model: model, voices: [], floor: nil)
       do {
         for at in 0..<frames { _ = try engine.frame(at * 20_000, [0], masked: false) }
-      } catch {
-        failed.append(error.localizedDescription)
+      } catch let fault as Fault {
+        // never a Failure, which standing would wait out and repeat unsaid
+        failed.append(fault.localizedDescription)
       }
     }
     #expect(failed == ["the model gave 2 steps with 0 fed", "the model gave 0 steps with 21 fed"])
   }
 
-  @Test("16 kHz to 8 kHz the same however the input is cut; 1 kHz passed, 6 kHz stopped")
+  @Test("16 kHz to 8 kHz the same however the input is cut; 1 kHz passed, 4.2 and 6 kHz stopped")
   func decimated() {
     let tone = { (hz: Double) in
       (0..<16_000).map { Float(sin(2 * Double.pi * hz * Double($0) / 16_000)) }
@@ -329,9 +330,12 @@ func voiced() -> [[String: Any]] {
       #expect(pieces == once, "\(size)")
     }
     let power = { (pcm: [Float]) in pcm.dropFirst(100).map { $0 * $0 }.reduce(0, +) / 7_900 }
-    var high = Decimator()
     #expect(once.count == 8_000 && abs(power(once) - 0.5) < 0.01)
-    #expect(power(high(tone(6_000))) < 1e-5)
+    // over 60 dB down: 4.2 kHz would fold to 3.8 kHz
+    for hz in [4_200.0, 6_000] {
+      var high = Decimator()
+      #expect(power(high(tone(hz))) < 0.5e-6, "\(hz)")
+    }
   }
 
   @Test("the wire's pieces: a label's form, hex samples, PCM, the socket, a flag")
@@ -420,12 +424,18 @@ func voiced() -> [[String: Any]] {
       try text.write(toFile: dir + "/" + name, atomically: true, encoding: .utf8)
     }
     read = voices(dir) + voices(dir) + voices(dir + "/none") + voices(nil)
+    // one another user owns, or others may write: nothing loaded, said once
+    chmod(dir, 0o770)
+    read += voices(dir) + voices(dir) + voices("/usr")
+    chmod(dir, 0o700)
     #expect(read.map(\.label) == ["alpha", "alpha"])
     #expect(
       spoken == [
         "diarize: \(dir)/2x.json: not a profile; skipped",
         "diarize: \(dir)/beta.json: not a profile; skipped",
         "diarize: \(dir)/none: cannot be read; no voice is enrolled",
+        "diarize: \(dir): not this user's, or writable by others; no voice is enrolled",
+        "diarize: /usr: not this user's, or writable by others; no voice is enrolled",
       ])
     try forget("alpha", in: dir)
     #expect(!FileManager.default.fileExists(atPath: path))

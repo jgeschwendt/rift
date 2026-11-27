@@ -41,11 +41,17 @@ func valid(_ label: String) throws {
 }
 
 /// The voices in `dir`'s profiles, in byte order of their labels; a file that is no label's
-/// profile, or a directory that cannot be read, said once and skipped.
+/// profile said once and skipped; a directory that cannot be read, or is not this user's or is
+/// writable by others (so another could plant a voice), said once and nothing loaded.
 func voices(_ dir: String?) -> [(label: String, pcm: [Float], embedding: [Float])] {
   guard let dir else { return [] }
   guard let names = try? FileManager.default.contentsOfDirectory(atPath: dir) else {
     once("diarize: \(dir): cannot be read; no voice is enrolled")
+    return []
+  }
+  var held = stat()
+  guard stat(dir, &held) == 0, held.st_uid == getuid(), held.st_mode & 0o022 == 0 else {
+    once("diarize: \(dir): not this user's, or writable by others; no voice is enrolled")
     return []
   }
   return names.filter { $0.hasSuffix(".json") }.sorted().compactMap { name in
@@ -97,9 +103,7 @@ func enrol(_ label: String, _ audio: [Float], in dir: String, model: any Model) 
   // moment, never through a link
   unlink(temp)
   let fd = open(temp, O_CREAT | O_EXCL | O_NOFOLLOW | O_WRONLY, 0o600)
-  let wrote =
-    fd >= 0 && fchmod(fd, 0o600) == 0
-    && data.withUnsafeBytes { write(fd, $0.baseAddress, data.count) } == data.count
+  let wrote = fd >= 0 && fchmod(fd, 0o600) == 0 && put(fd, data)
   // errno read before close can change it
   var reason = wrote ? nil : String(cString: strerror(errno))
   if fd >= 0 { close(fd) }
@@ -109,6 +113,20 @@ func enrol(_ label: String, _ audio: [Float], in dir: String, model: any Model) 
     throw Failure(reason: "\(path): \(reason)")
   }
   return path
+}
+
+/// All of `data` written to `fd`, a short write carried on from where it stopped; false on a
+/// failed write, its errno left for the caller (a regular file's write returns 0 only for 0 bytes).
+func put(_ fd: Int32, _ data: Data) -> Bool {
+  data.withUnsafeBytes { bytes in
+    var at = 0
+    while at < bytes.count {
+      let count = write(fd, bytes.baseAddress! + at, bytes.count - at)
+      guard count > 0 else { return false }
+      at += count
+    }
+    return true
+  }
 }
 
 /// `label`'s profile removed from `dir`.

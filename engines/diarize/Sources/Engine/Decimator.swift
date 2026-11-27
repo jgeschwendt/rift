@@ -1,12 +1,12 @@
 import Foundation
 
-/// 16 kHz to 8 kHz, LS-EEND's rate: a 65-tap Blackman-windowed sinc low-pass at 3.8 kHz, every
-/// second sample kept, the last 64 inputs carried from one call to the next, so the output is the
-/// same however the input is cut (FluidAudio's own resampler starts afresh at each call). It lags
-/// its input by 32 samples, 2 ms.
+/// 16 kHz to 8 kHz, LS-EEND's rate: a 129-tap Blackman-windowed sinc low-pass at 3.6 kHz (0.3 dB
+/// down at 3.4 kHz, 79 dB at 4 kHz and above), every second sample kept, the last 128 inputs
+/// carried from one call to the next, so the output is the same however the input is cut
+/// (FluidAudio's own resampler starts afresh at each call). It lags its input by 64 samples, 4 ms.
 public struct Decimator {
   static let taps: [Float] = {
-    let (count, cutoff) = (65, 3_800.0 / 16_000)
+    let (count, cutoff) = (129, 3_600.0 / 16_000)
     let raw = (0..<count).map { n -> Double in
       let x = Double(n - count / 2)
       let sinc = x == 0 ? 2 * cutoff : sin(2 * .pi * cutoff * x) / (.pi * x)
