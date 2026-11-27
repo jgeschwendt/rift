@@ -626,6 +626,14 @@
       Two words engines on one track would put two truths in the log with no rule between them, as
       two devices on one track would; comparing engines is done on a second track or offline, by
       reading the same audio.</li>
+    <li><strong>A result is a claim, its form checked, never its truth.</strong> Any process of the
+      socket's user may take a free kind's slot (before its job starts, during a respawn or a swap)
+      and report what it likes under a <code class="code">name</code> of its own choosing, so a
+      label, a transcript, a turn or a mask is the word of whichever process held the slot. The
+      boundary is same-user access to the 0700 socket directory; within it a client can see a
+      change of engine, the <code class="code">engine</code> events and their
+      <code class="code">name</code>, and verify nothing more (<a href="protocol.html#engines">the
+      protocol</a>).</li>
     <li><strong>Engines carry no clock.</strong> They read frames already on the daemon's clock and
       report times off them, so there are no pings, and a report past what the engine was given is
       refused: no engine can claim audio it never heard.</li>
@@ -664,17 +672,19 @@
       revises nothing, so the engine holds a span until its labels stop changing and reports it
       once, as words are finals. Revisions inside a horizon would leave every client a merge rule
       and a feed replay two truths; the cost is the settling delay, which the onset sets anyway.</li>
-    <li><strong>Spans tile what was heard, nobody included.</strong> A span with no talkers says
-      nobody spoke, so the latest end is the engine's settled reach and a client tells
-      "nobody" from "not yet" by values. Speech at once is one span naming each voice: spans never
-      overlap, as finals, and a change in who speaks is a new span, so overlap needs no rule of
-      its own.</li>
+    <li><strong>Nobody is said, never inferred.</strong> A span with no talkers is the only way to
+      say nobody spoke; time no span covers is unknown, so a client tells "nobody" from "unknown"
+      and "not yet" by values, and the daemon need not hold an engine to tiling. The latest end is
+      the engine's settled reach. Speech at once is one span naming each voice: spans never
+      overlap, as finals, none is empty, and a change in who speaks is a new span, so overlap
+      needs no rule of its own.</li>
     <li><strong>An enrolled voice's id is its label; any other is a number for one
       connection.</strong> The label is what the engine was configured with, stable across
       reconnects and boots while its profile stands; an unknown voice is an integer from 1 per
       connection, since a diarizer's slots mean nothing to its next process. The JSON type tells the
-      two apart, so no label can pass for an unknown voice. Keeping unknown voices across
-      connections would need the engine to persist profiles of people never enrolled, which is
+      two apart, and a label starts with a letter, so none can pass for an unknown voice. Keeping
+      unknown voices across connections would need the engine to persist profiles of voices never
+      enrolled, which is
       enrolment by stealth.</li>
     <li><strong>How sure is a score per talker per span.</strong> The embedding match of that
       span's audio against the label's profile (WeSpeaker on 1 s windows accepted every window of
@@ -688,7 +698,7 @@
       pure function of two kinds of event on a feed (<a href="protocol.html#engines">who spoke a
       turn</a>). A client that acts only on one enrolled voice's speech keeps each
       <code class="code">turn</code> until a <code class="code">talkers</code> span reaches its end,
-      then sums the voice's share: with labels settling about 1.1 s after the audio and the turn
+      then sums the voice's share over the turn's whole length, time no span covers unknown: with labels settling about 1.1 s after the audio and the turn
       logged 279 ms after speech ends past 1.5 s of voice, 770 ms under it, it knows 0.3 to 0.8 s
       after the turn event (unverified 2026-11-26 · the two engines' delays measured apart, never
       together).</li>
@@ -703,7 +713,7 @@
       reads the directory as it connects, so a new profile takes effect on its job's restart. No
       profile, recording or label is ever committed.</li>
     <li><strong>The echo stage rules before anything downstream reads.</strong> With an echo engine
-      connected, a live ear frame reaches the turn and words engines only once it has ruled past it,
+      connected, a live ear frame reaches the talkers, turn and words engines only once it has ruled past it,
       masked samples as zeros and the frame marked <code class="code">masked</code>, so no engine
       author handles echo, and a later echo engine that cancels instead of masking publishes a clean
       track (<code class="code">clean-&lt;name&gt;</code>, segments and window as any) that
@@ -808,8 +818,8 @@ rift status                                   # "engines":{"ear-mac":{"echo":"ta
         <tr><td>6 · jobs</td><td><code class="code">rift engine add</code>, <code class="code">remove</code>, <code class="code">list</code></td><td>against the <code class="code">launchctl</code> stub: the plist's fields, the old job booted out before the new loads, ready only once health lists the kind, <code class="code">setup --remove</code> removing them</td></tr>
         <tr><td>7 · model engines</td><td><code class="code">endpoint</code>, <code class="code">read-aloud</code>, <code class="code">transcribe</code></td><td>each in its own gate on a recorded fixture through a file-fed ear: the phrase's words among the finals; voice on before off and one turn over a phrase with a pause; a say's play ending <code class="code">end</code> with sound in <code class="code">heard</code> and <code class="code">spoken</code> its text's length</td></tr>
         <tr><td>8 · the loop</td><td>the jobs on a Mac</td><td>speak, a final <code class="code">words</code> event, a <code class="code">say</code>, its <code class="code">spoken</code> whole and the ear's track masked across its runs; the same with fixture and fake output as the suite's last case</td></tr>
-        <tr><td>9 · talkers</td><td>the kind, <code class="code">talkers</code> reports and events, its <code class="code">through</code>, its frames and turn lines, <code class="code">rift engine add talkers</code></td><td>a suite talkers engine over a file-fed ear: its spans logged with the values sent, talkers as given; refused and unlogged: one overlapping, out of order, past the last frame, a string id not of the form, an integer under 1 or with a score, a score outside 0 to 1, an id twice or out of order; a reconnect's <code class="code">through</code> the last span's end; each turn line after the frame holding its end, as slice 3's; health and the <code class="code">engine</code> events listing it; the plist's kind against the <code class="code">launchctl</code> stub</td></tr>
-        <tr><td>10 · the join</td><td>nothing in the daemon: the client's rule, held by the suite</td><td>a suite turn engine and talkers engine on one ear, a feed reading both: for each turn, the first span reaching its end found in feed order and each id's share summed from the values; a talkers engine leaving mid-turn, its <code class="code">engine</code> off before any span reaching the end, so the tail reads unknown; with none connected, health and the feed saying so</td></tr>
+        <tr><td>9 · talkers</td><td>the kind, <code class="code">talkers</code> reports and events, its <code class="code">through</code>, its frames and turn lines, <code class="code">rift engine add talkers</code></td><td>a suite talkers engine over a file-fed ear: its spans logged with the values sent, talkers as given; refused and unlogged: one overlapping, out of order, empty, past the last frame, a string id not of the form or not starting with a letter, an integer under 1 or with a score, a score outside 0 to 1, an id twice or out of order; a reconnect's <code class="code">through</code> the last span's end; each turn line after the frame holding its end, as slice 3's; health and the <code class="code">engine</code> events listing it; the plist's kind against the <code class="code">launchctl</code> stub</td></tr>
+        <tr><td>10 · the join</td><td>nothing in the daemon: the client's rule, held by the suite</td><td>a suite turn engine and talkers engine on one ear, a feed reading both: for each turn, each id's, nobody's and the unknown time over its whole length summed from the values, a gap unknown, known once a span reaches its end; a talkers engine's <code class="code">engine</code> off after a turn's last span and before its event, so the tail reads unknown, not "not yet"; a reconnect mid-turn, each connection's integer ids kept apart; with none connected, health and the feed saying so</td></tr>
         <tr><td>11 · <code class="code">diarize</code></td><td>the reference talkers engine, <code class="code">engines/diarize/</code>, Swift, macOS only, and its <code class="code">enrol</code> and <code class="code">forget</code></td><td>its protocol logic at 100 % against a stub diarizer and embedder in <code class="code">check-engines</code> on macOS (said skipped elsewhere): settling, cuts at turn lines, ids and order; one model test over a synthetic fixture of two Pocket TTS voices, one enrolled from its first phrase: that voice's label on its later phrases, an integer on the other's, a span naming both where the fixture overlaps them</td></tr>
         <tr><td>12 · on the clean track</td><td>a talkers engine naming <code class="code">clean-&lt;name&gt;</code> once the echo engine streams one</td><td>the clean track accepted as a talkers engine's track and its turn lines routed from that track's turn engine; a profile enrolled from the clean track scoring its own voice there as from the ruled ear; the machine's own speech, masked on the ear, nobody's on the clean track</td></tr>
       </tbody>

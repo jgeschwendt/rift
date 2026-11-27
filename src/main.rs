@@ -1096,9 +1096,9 @@ fn reads(kind: &str) -> bool {
 }
 
 /// Whether a report's list holds (docs/protocol.html#engines), true for one with none: a final's
-/// or a partial's words each inside its span, rising; a talkers span's at most `TALKERS`, each a
-/// label of a track name's form scored 0 to 1 or null, or a number from 1 scored null, labels
-/// alphabetical, then numbers rising, none twice.
+/// or a partial's words each inside its span, rising; a talkers span not empty and its talkers at
+/// most `TALKERS`, each a label of a track name's form starting with a letter scored 0 to 1 or
+/// null, or a number from 1 scored null, labels in byte order, then numbers rising, none twice.
 fn listed(request: &Value) -> bool {
     let (mut reach, last) = (
         request["start"].as_u64().unwrap_or_default(),
@@ -1119,7 +1119,8 @@ fn listed(request: &Value) -> bool {
             })
         }),
         Some("talkers") => request["talkers"].as_array().is_some_and(|said| {
-            said.len() <= TALKERS
+            Some(reach) < last
+                && said.len() <= TALKERS
                 && (said.iter())
                     .map(|talker| &talker["id"])
                     .map(|id| (id.is_u64(), id.as_str(), id.as_u64()))
@@ -1129,6 +1130,7 @@ fn listed(request: &Value) -> bool {
                     match (talker["id"].as_str(), talker["id"].as_u64()) {
                         (Some(label), _) => score.is_some_and(|sure| {
                             well("ear", label)
+                                && label.starts_with(|first: char| first.is_ascii_alphabetic())
                                 && (sure.is_null()
                                     || sure
                                         .as_f64()

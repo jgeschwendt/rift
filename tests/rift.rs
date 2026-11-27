@@ -2624,6 +2624,13 @@ mod tests {
         Ok(serde_json::from_str(&next(conn)?)?)
     }
 
+    /// Lines read on an engine's `conn` through its frame at `at`, so it has been given that frame
+    /// whether it came live or replayed.
+    fn upto(conn: &mut BufReader<UnixStream>, at: u64) -> Outcome {
+        while line(conn)?["t"] != at {}
+        Ok(())
+    }
+
     /// A words engine, the suite as it and as its ear (docs/protocol.html#engines): `absent`
     /// partials with none; frames from a `from` inside the window, replayed from disk across a
     /// hole, then live, each placed frame once and in order; finals logged with the values sent,
@@ -3122,8 +3129,9 @@ mod tests {
     /// A talkers engine, the suite as it, a turn engine and the ear (docs/protocol.html#engines):
     /// health and the `engine` events listing it; each voice and turn line after the frame it is
     /// due, by the `t`s read; spans logged with the values sent, each talker's `id` and `score`
-    /// alone; refused and unlogged: one overlapping, out of order or past the last frame given, an
-    /// id not of a track name's form, a number under 1 or scored, a score missing or outside 0 to
+    /// alone; refused and unlogged: one overlapping, out of order, empty or past the last frame
+    /// given, an id not of a track name's form or not starting with a letter, a number under 1 or
+    /// scored, a score missing or outside 0 to
     /// 1, more than 16, an id twice or out of order; a reconnect's `through` the last span's end,
     /// its replay from there, and the same after a restart.
     #[test]
@@ -3151,6 +3159,7 @@ mod tests {
         let early = placed(&mut ear, base, 0..5)?;
         let at = |index: usize| early.get(index).copied().unwrap_or_default();
         let (closed, given) = (at(3) + 5000, at(4) + 20_000);
+        upto(&mut turns, at(4))?;
         for report in [
             json!({"on": true, "op": "voice", "start": at(1)}),
             json!({"on": false, "op": "voice", "start": closed}),
@@ -3211,7 +3220,9 @@ mod tests {
             span(at(1), at(4), json!([])),
             span(at(4), closed, json!([])),
             span(closed, given + 1, json!([])),
+            span(closed, closed, json!([])),
             span(closed, given, json!("x")),
+            span(closed, given, one(json!("1"), Value::Null)),
             span(closed, given, one(json!("a/b"), Value::Null)),
             span(closed, given, one(json!("x".repeat(65)), Value::Null)),
             span(closed, given, one(json!(0u8), Value::Null)),
@@ -3249,7 +3260,7 @@ mod tests {
         }
         same(
             &verdicts.join(" "),
-            &format!("ok ok{} ok", " bad_request".repeat(18)),
+            &format!("ok ok{} ok", " bad_request".repeat(20)),
         )?;
         let logged = |start: u64, stop: u64, said: Value| json!({"end": stop, "engine": "talkers", "kind": "talkers", "start": start, "talkers": said, "track": "ear-desk"});
         same(
@@ -3308,12 +3319,13 @@ mod tests {
         same(&format!("{:?}", restarted.0.wait()?.code()), "Some(0)")
     }
 
-    /// The join by time, the suite as a turn engine, a talkers engine, the ear and a client reading
-    /// a feed (docs/protocol.html#engines): per `turn` in feed order, each id's time inside it
-    /// summed from the `talkers` spans overlapping it, before or after the turn's own, up to the
-    /// first reaching its end, so its talkers are known there; a talkers engine leaving mid-turn,
-    /// its `engine` off before any span reaching the end, so the tail reads unknown, never
-    /// nobody's; with none connected, health and the feed saying so and a turn with no span.
+    /// The join by time, the suite as a turn engine, three talkers engines in turn, the ear and a
+    /// client reading a feed (docs/protocol.html#engines): per `turn`, each voice's, nobody's and
+    /// the unknown time over its whole length from the spans overlapping it, before or after its
+    /// own event, a gap unknown; known once a span reaches its end; unknown-tailed when a talkers
+    /// engine's `engine` off follows its last span unreached, before its own event, with health
+    /// saying none is connected; integer ids kept apart across a reconnect mid-turn; not yet
+    /// while one is on and no span has reached it.
     #[test]
     fn join() -> Outcome {
         let root = temp("join")?;
@@ -3336,16 +3348,33 @@ mod tests {
         let (mut turns, mut heard) = (greet(&root)?, greet(&root)?);
         drop(line_after(&mut turns, &engine("turn"))?);
         drop(line_after(&mut heard, &engine("talkers"))?);
-        let all = placed(&mut ear, base, 0..15)?;
-        let at = |index: usize| all.get(index).copied().unwrap_or_default();
+        let first = placed(&mut ear, base, 0..1)?
+            .first()
+            .copied()
+            .unwrap_or_default();
+        let at = |index: u64| first + index * 20_000;
+        // frames placed on the ear, each where it follows the last, then given to each engine
+        let frames = |fed: &mut BufReader<UnixStream>,
+                      range: Range<u64>,
+                      engines: &mut [&mut BufReader<UnixStream>]|
+         -> Outcome {
+            same(
+                &json!(placed(fed, base, range.clone())?).to_string(),
+                &json!(range.clone().map(at).collect::<Vec<_>>()).to_string(),
+            )?;
+            for conn in engines {
+                upto(conn, at(range.end - 1))?;
+            }
+            Ok(())
+        };
         let report = |conn: &mut BufReader<UnixStream>, said: Value| -> Outcome {
             same(
                 &line_after(conn, &said.to_string())?["ok"].to_string(),
                 "true",
             )
         };
-        let span = |start: usize, stop: usize, said: Value| json!({"end": at(stop), "op": "talkers", "start": at(start), "talkers": said});
-        let spoken = |conn: &mut BufReader<UnixStream>, start: usize, stop: usize| -> Outcome {
+        let span = |start: u64, stop: u64, said: Value| json!({"end": at(stop), "op": "talkers", "start": at(start), "talkers": said});
+        let spoken = |conn: &mut BufReader<UnixStream>, start: u64, stop: u64| -> Outcome {
             report(conn, json!({"on": true, "op": "voice", "start": at(start)}))?;
             report(conn, json!({"on": false, "op": "voice", "start": at(stop)}))?;
             report(
@@ -3353,18 +3382,18 @@ mod tests {
                 json!({"end": at(stop), "op": "turn", "start": at(start)}),
             )
         };
-        let (enrolled, unknown) = (
+        let (enrolled, other) = (
             json!({"id": "enrolled-1", "score": 0.8f64}),
             json!({"id": 1u8, "score": null}),
         );
-        // two spans before the turn's event, the one reaching its end after it
-        report(&mut heard, span(0, 1, json!([])))?;
-        report(&mut heard, span(1, 4, json!([enrolled])))?;
+        frames(&mut ear, 1..10, &mut [&mut turns, &mut heard])?;
+        // nobody, then a voice, a gap, two at once; the last span after the turn's event
+        report(&mut heard, span(0, 2, json!([])))?;
+        report(&mut heard, span(2, 3, json!([enrolled])))?;
+        report(&mut heard, span(4, 6, json!([enrolled, other])))?;
         spoken(&mut turns, 1, 6)?;
-        report(&mut heard, span(4, 6, json!([enrolled, unknown])))?;
-        // the talkers engine gone mid-turn: settled to 8 of a turn to 9
-        report(&mut heard, span(6, 8, json!([unknown])))?;
-        spoken(&mut turns, 7, 9)?;
+        report(&mut heard, span(6, 8, json!([other])))?;
+        // gone before the next turn's event, none reconnecting: its tail unknown
         drop(heard);
         until(|| unlisted(&root, "ear-desk", "talkers"))?;
         same(
@@ -3373,57 +3402,100 @@ mod tests {
                 .to_string(),
             r#"{"ear-desk":{"turn":"turn"}}"#,
         )?;
-        spoken(&mut turns, 11, 13)?;
+        spoken(&mut turns, 7, 9)?;
+        // a reconnect mid-turn: each connection's `1` its own voice
+        let mut second = greet(&root)?;
+        drop(line_after(&mut second, &engine("talkers"))?);
+        frames(&mut ear, 10..14, &mut [&mut turns, &mut second])?;
+        report(
+            &mut turns,
+            json!({"on": true, "op": "voice", "start": at(11)}),
+        )?;
+        report(&mut second, span(10, 12, json!([other])))?;
+        drop(second);
+        until(|| unlisted(&root, "ear-desk", "talkers"))?;
+        let mut third = greet(&root)?;
+        drop(line_after(&mut third, &engine("talkers"))?);
+        frames(&mut ear, 14..18, &mut [&mut turns, &mut third])?;
+        report(&mut third, span(12, 16, json!([other])))?;
+        report(
+            &mut turns,
+            json!({"on": false, "op": "voice", "start": at(15)}),
+        )?;
+        report(
+            &mut turns,
+            json!({"end": at(15), "op": "turn", "start": at(11)}),
+        )?;
+        spoken(&mut turns, 16, 17)?;
+        // the client's rule, over the feed as read
         let read = take(&mut client, events(&root)?.len())?;
         let feed = read.as_array().map(Vec::as_slice).unwrap_or_default();
         let time = |event: &Value, key: &str| event[key].as_u64().unwrap_or_default();
+        let talkers = |event: &&Value, on: bool| event["stage"] == "talkers" && event["on"] == on;
         let joined: Vec<Value> = (feed.iter().enumerate())
             .filter(|&(_, event)| event["kind"] == "turn")
             .map(|(index, turn)| {
                 let (start, end) = (time(turn, "start"), time(turn, "end"));
-                let (mut known, mut shares) = (start, Vec::<(Value, u64)>::new());
-                // the spans up to a talkers engine's leaving after the turn
-                let left = (feed.iter().enumerate())
-                    .find(|&(seen, event)| {
-                        seen > index && event["stage"] == "talkers" && event["on"] == false
+                let spans: Vec<(usize, &Value)> = (feed.iter().enumerate())
+                    .filter(|&(_, event)| {
+                        event["kind"] == "talkers"
+                            && time(event, "start") < end
+                            && time(event, "end") > start
                     })
-                    .map_or(feed.len(), |found| found.0);
-                for event in (feed.iter().take(left)).filter(|event| event["kind"] == "talkers") {
-                    let (low, high) =
-                        (time(event, "start").max(start), time(event, "end").min(end));
-                    if known >= end || low >= high {
-                        continue;
+                    .collect();
+                let (mut nobody, mut unknown, mut shares) =
+                    (0u64, end.saturating_sub(start), Vec::<(Value, u64)>::new());
+                for &(seen, event) in &spans {
+                    let inside = (time(event, "end").min(end))
+                        .saturating_sub(time(event, "start").max(start));
+                    unknown = unknown.saturating_sub(inside);
+                    let said = event["talkers"].as_array().map(Vec::as_slice).unwrap_or_default();
+                    if said.is_empty() {
+                        nobody = nobody.saturating_add(inside);
                     }
-                    known = high;
-                    for talker in event["talkers"].as_array().into_iter().flatten() {
-                        let inside = high.saturating_sub(low);
-                        match shares.iter_mut().find(|share| share.0 == talker["id"]) {
+                    // an integer id is its connection's: the talkers engines on before it
+                    let connection = feed.iter().take(seen).filter(|before| talkers(before, true)).count();
+                    for talker in said {
+                        let id = if talker["id"].is_u64() {
+                            json!([connection, talker["id"]])
+                        } else {
+                            talker["id"].clone()
+                        };
+                        match shares.iter_mut().find(|share| share.0 == id) {
                             Some(share) => share.1 = share.1.saturating_add(inside),
-                            None => shares.push((talker["id"].clone(), inside)),
+                            None => shares.push((id, inside)),
                         }
                     }
                 }
-                json!({"known": known, "shares": shares, "turn": [start, end]})
+                let last = spans.last().map_or(index, |held| held.0);
+                let on = (feed.iter().take(index).rev())
+                    .find(|event| event["stage"] == "talkers")
+                    .is_some_and(|event| event["on"] == true);
+                let state = if spans.iter().any(|held| time(held.1, "end") >= end) {
+                    "known"
+                } else if feed.iter().skip(last).any(|event| talkers(&event, false))
+                    || !on && spans.is_empty()
+                {
+                    "unknown"
+                } else {
+                    "pending"
+                };
+                json!({"nobody": nobody, "shares": shares, "state": state, "turn": [start, end], "unknown": unknown})
             })
             .collect();
+        // in frames' time: none, one, two, three
+        let (none, one, two, three) = (0u64, 20_000u64, 40_000u64, 60_000u64);
         same(
-            &format!(
-                "{} {}",
-                json!(joined),
-                (feed.iter().rev())
-                    .find(|event| event["stage"] == "talkers")
-                    .map_or(Value::Null, |event| event["on"].clone())
-            ),
-            &format!(
-                "{} false",
-                json!([
-                    {"known": at(6), "shares": [["enrolled-1", at(6) - at(1)], [1u8, at(6) - at(4)]], "turn": [at(1), at(6)]},
-                    {"known": at(8), "shares": [[1u8, at(8) - at(7)]], "turn": [at(7), at(9)]},
-                    {"known": at(11), "shares": [], "turn": [at(11), at(13)]}
-                ])
-            ),
+            &json!(joined).to_string(),
+            &json!([
+                {"nobody": one, "shares": [["enrolled-1", three], [[1u8, 1u8], two]], "state": "known", "turn": [at(1), at(6)], "unknown": one},
+                {"nobody": none, "shares": [[[1u8, 1u8], one]], "state": "unknown", "turn": [at(7), at(9)], "unknown": one},
+                {"nobody": none, "shares": [[[2u8, 1u8], one], [[3u8, 1u8], three]], "state": "known", "turn": [at(11), at(15)], "unknown": none},
+                {"nobody": none, "shares": [], "state": "pending", "turn": [at(16), at(17)], "unknown": one}
+            ])
+            .to_string(),
         )?;
-        drop((ear, turns));
+        drop((ear, turns, third));
         same(
             &say(&mut greet(&root)?, r#"{"op":"shutdown"}"#)?,
             r#"{"ok":true}"#,
