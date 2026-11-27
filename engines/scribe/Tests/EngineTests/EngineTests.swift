@@ -313,7 +313,9 @@ final class Daemon: @unchecked Sendable {
         == #"{"from":10000000,"kind":"words","name":"scribe","op":"engine","track":"ear-desk"}"#)
     #expect(spans(daemon.heard) == ["0 340000"] && finals(daemon.heard) == [["w10 20000 340000"]])
     #expect(
-      ends == ["returned", "not a JSON object: nope", #"{"code":"taken","ok":false}"#, ended])
+      ends == [
+        "returned", "a line of 4 bytes not a JSON object", #"{"code":"taken","ok":false}"#, ended,
+      ])
     #expect(spoken == [#"scribe: refused: {"code":"bad_request","ok":false}"#])
   }
 

@@ -89,7 +89,8 @@ final class Conn {
     defer { pending.removeSubrange(...newline) }
     let text = Data(pending[..<newline])
     guard let line = try? JSONSerialization.jsonObject(with: text) as? [String: Any] else {
-      throw Failure(reason: "not a JSON object: \(String(decoding: text, as: UTF8.self))")
+      // its length alone: the line may carry audio
+      throw Failure(reason: "a line of \(text.count) bytes not a JSON object")
     }
     return line
   }

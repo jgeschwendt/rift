@@ -12,6 +12,7 @@ func level(_ mask: Int) -> Float { Float(mask) / 1_048_576 }
 final class Stub: Model {
   let lag: Int
   var vector: [Float] = [1, 0]
+  var split = false
   var queued: [[Float]] = []
   /// The samples of the step being heard.
   var heard: [Float] = []
@@ -42,7 +43,8 @@ final class Stub: Model {
 
   func embed(_ pcm: [Float]) throws -> [Float] {
     embedded.append(pcm.count)
-    return vector
+    // [1, 0] for a full 10 s, [0, 1] for a shorter piece, while `split`
+    return split ? (pcm.count == 160_000 ? [1, 0] : [0, 1]) : vector
   }
 }
 
@@ -356,6 +358,11 @@ func voiced() -> [[String: Any]] {
     let model = Stub()
     // the sample 1/32768, which 16 bits keep: the stub's slot 5
     let audio = [Float](repeating: level(32), count: 170_000)
+    // the 10 s and the 0.625 s tail weighted by their lengths
+    model.split = true
+    _ = try enrol("alpha", audio, in: dir, model: model)
+    #expect(voices(dir)[0].embedding == [Float(160_000) / 170_000, Float(10_000) / 170_000])
+    (model.split, model.embedded, model.started) = (false, [], [])
     let path = try enrol("alpha", audio, in: dir, model: model)
     let attributes = try FileManager.default.attributesOfItem(atPath: path)
     let parent = try FileManager.default.attributesOfItem(atPath: dir)
@@ -382,18 +389,31 @@ func voiced() -> [[String: Any]] {
     do { _ = try enrol("beta", audio, in: "/dev/null/x", model: model) } catch {
       refused.append("mkdir")
     }
-    let locked = dir + "/locked"
+    // an existing directory open to others is made 0700
+    let open = dir + "/open"
     try FileManager.default.createDirectory(
-      atPath: locked, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o500])
-    do { _ = try enrol("beta", audio, in: locked, model: model) } catch {
-      refused.append(error.localizedDescription)
+      atPath: open, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o755])
+    _ = try enrol("beta", audio, in: open, model: model)
+    let opened = try FileManager.default.attributesOfItem(atPath: open)
+    #expect(opened[.posixPermissions] as? Int == 0o700)
+    // one not this user's to change, a temp that cannot be made, a profile not to be renamed over
+    try FileManager.default.createDirectory(
+      atPath: open + "/.gamma.json.new", withIntermediateDirectories: false)
+    try FileManager.default.createDirectory(
+      atPath: open + "/delta.json/held", withIntermediateDirectories: true)
+    for (label, into) in [("beta", "/usr"), ("gamma", open), ("delta", open)] {
+      do { _ = try enrol(label, audio, in: into, model: model) } catch {
+        refused.append(error.localizedDescription)
+      }
     }
-    try FileManager.default.removeItem(atPath: locked)
+    #expect(!FileManager.default.fileExists(atPath: open + "/.delta.json.new"))
+    try FileManager.default.removeItem(atPath: open)
     #expect(
       refused == [
         "1ada: a label is 1 to 64 letters, digits, - or _, starting with a letter",
         "no voice found in the audio", "under 1 s of audio", "mkdir",
-        "\(locked)/beta.json: Permission denied",
+        "/usr: Operation not permitted", "\(open)/gamma.json: File exists",
+        "\(open)/delta.json: Is a directory",
       ])
     // a file that is no label's profile is said once, as is a directory that cannot be read
     for (name, text) in [("2x.json", "{}"), ("beta.json", "{}"), ("notes.txt", "")] {
@@ -459,7 +479,9 @@ func voiced() -> [[String: Any]] {
     #expect(
       spans(daemon.heard) == ["0 500000 alpha", "500000 1100000", "1100000 1600000 alpha"])
     #expect(
-      ends == ["returned", "not a JSON object: nope", #"{"code":"taken","ok":false}"#, ended])
+      ends == [
+        "returned", "a line of 4 bytes not a JSON object", #"{"code":"taken","ok":false}"#, ended,
+      ])
     #expect(
       spoken == [
         "diarize: beta: its profile's audio took no voice; not enrolled",
@@ -529,10 +551,13 @@ func voiced() -> [[String: Any]] {
       ["enrol", "alpha", "--model", "m", "--profiles", profiles],
       ["enrol", "alpha", "--model", "m", "--profiles", profiles, "--track", "t", "--from", "0"],
       ["forget"], ["forget", "alpha"],
+      // a mistyped verb, by its second word or its flags
+      ["enroll", "alpha", "--model", "m", "--profiles", profiles, "--file", file],
+      ["enroll", "--model", "m", "--file", file],
     ] {
       codes.append(await run(args, env: [:], load: load, wait: { _ in true }))
     }
-    #expect(codes == Array(repeating: 2, count: 9) && spoken == Array(repeating: usage, count: 9))
+    #expect(codes == Array(repeating: 2, count: 11) && spoken == Array(repeating: usage, count: 11))
     listen()
     codes = []
     let enrolling = ["enrol", "alpha", "--model", "m", "--profiles", profiles]

@@ -62,8 +62,9 @@ func voices(_ dir: String?) -> [(label: String, pcm: [Float], embedding: [Float]
   }
 }
 
-/// `audio`'s voice enrolled as `label` in `dir` (made 0700 when absent): its first 30 s, which
-/// LS-EEND must take as a voice, and the mean of WeSpeaker's embeddings of each 10 s of it, written
+/// `audio`'s voice enrolled as `label` in `dir` (made 0700, or refused): its first 30 s, which
+/// LS-EEND must take as a voice, and the mean of WeSpeaker's embeddings of each 10 s of it, each
+/// weighted by its length, written
 /// to `<dir>/<label>.json` 0600 by temp and rename; its path.
 func enrol(_ label: String, _ audio: [Float], in dir: String, model: any Model) throws -> String {
   try valid(label)
@@ -72,11 +73,13 @@ func enrol(_ label: String, _ audio: [Float], in dir: String, model: any Model) 
   guard try model.start([(label, seed)]).values.contains(label) else {
     throw Failure(reason: "no voice found in the audio")
   }
-  let parts = try stride(from: 0, to: seed.count, by: window).map {
-    try model.embed(Array(seed[$0..<min(seed.count, $0 + window)]))
+  // each 10 s's embedding weighted by its length, so a short tail counts for no more than it holds
+  let parts = try stride(from: 0, to: seed.count, by: window).map { from in
+    let chunk = Array(seed[from..<min(seed.count, from + window)])
+    return (vector: try model.embed(chunk), weight: Float(chunk.count) / Float(seed.count))
   }
-  let embedding = parts[0].indices.map { at in
-    parts.map { $0[at] }.reduce(0, +) / Float(parts.count)
+  let embedding = parts[0].vector.indices.map { at in
+    parts.map { $0.vector[at] * $0.weight }.reduce(0, +)
   }
   let pcm = seed.flatMap {
     withUnsafeBytes(of: Int16(max(-32_768, min(32_767, $0 * 32_768))).littleEndian, Array.init)
@@ -85,15 +88,23 @@ func enrol(_ label: String, _ audio: [Float], in dir: String, model: any Model) 
     Profile(embedding: embedding, pcm: Data(pcm).base64EncodedString()))
   try FileManager.default.createDirectory(
     atPath: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+  // an existing directory made 0700 too, or refused
+  guard chmod(dir, 0o700) == 0 else {
+    throw Failure(reason: "\(dir): \(String(cString: strerror(errno)))")
+  }
   let (path, temp) = ("\(dir)/\(label).json", "\(dir)/.\(label).json.new")
-  // created 0600, never wider for a moment
-  let fd = open(temp, O_CREAT | O_WRONLY | O_TRUNC, 0o600)
+  // a stale temp (or a link planted there) removed, then created anew 0600, never wider for a
+  // moment, never through a link
+  unlink(temp)
+  let fd = open(temp, O_CREAT | O_EXCL | O_NOFOLLOW | O_WRONLY, 0o600)
   let wrote =
     fd >= 0 && fchmod(fd, 0o600) == 0
     && data.withUnsafeBytes { write(fd, $0.baseAddress, data.count) } == data.count
+  // errno read before close can change it
+  var reason = wrote ? nil : String(cString: strerror(errno))
   if fd >= 0 { close(fd) }
-  guard wrote, rename(temp, path) == 0 else {
-    let reason = String(cString: strerror(errno))
+  if wrote, rename(temp, path) != 0 { reason = String(cString: strerror(errno)) }
+  if let reason {
     unlink(temp)
     throw Failure(reason: "\(path): \(reason)")
   }
@@ -153,7 +164,8 @@ func session(
 }
 
 /// The command line. `enrol` and `forget`: usage and 2 without their arguments, else done (one
-/// line, 0) or refused (one line, 1). Else the engine: usage and 2 without a track or a model;
+/// line, 0) or refused (one line, 1). Else the engine: usage and 2 without a track or a model, or
+/// with a second word or `enrol`'s flags, as a mistyped verb has;
 /// else the model loaded by `load` from `--model` before any connection, its readiness said once,
 /// then stood on the socket `env` names, `--profiles` read at each connect, `wait` handed
 /// $RIFT_POLL_MS (default 1000) between connections, until a stop signal (or `wait` says to
@@ -187,7 +199,10 @@ public func run(
       say("diarize: forgot \(label)")
       return 0
     default:
-      guard !verb.isEmpty, !verb.hasPrefix("-"), let dir else { break }
+      // a mistyped verb (`enroll alpha ...`) is no track: a second word or a verb's flag is usage
+      guard !verb.isEmpty, !verb.hasPrefix("-"), label.hasPrefix("-"), let dir,
+        !["file", "from", "to", "track"].contains(where: { flag(args, $0) != nil })
+      else { break }
       let clock = ContinuousClock()
       let started = clock.now
       let model = try await load(dir)
