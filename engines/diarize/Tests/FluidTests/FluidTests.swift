@@ -57,6 +57,38 @@ func fixture() async throws {
 }
 
 @Test(
+  "overlap: alba's and marius's later phrases summed at 0.7, alba enrolled: both named at once",
+  .enabled(
+    if: FileManager.default.fileExists(
+      atPath: model + "/speaker-diarization/wespeaker_v2.mlmodelc"),
+    "skipped: set DIARIZE_MODEL to the --model directory (engines/README.md)"))
+func overlap() async throws {
+  let fixture = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+    .appending(path: "../../../fixtures/voices.pcm")
+  let pcm = floats(try Data(contentsOf: fixture))
+  // 0.5 s of silence, alba's 7.66 s to 10.22 s and marius's 10.92 s to 13.48 s summed at 0.7
+  // each, 1.5 s of silence
+  let both: [Float] = (0..<40_960).map { 0.7 * (pcm[122_560 + $0] + pcm[174_720 + $0]) }
+  let mixed = [Float](repeating: 0, count: 8_000) + both + [Float](repeating: 0, count: 24_000)
+  let fluid = try await Fluid(model: model)
+  let dir = NSTemporaryDirectory() + "diarize-overlap-\(getpid())"
+  defer { try? FileManager.default.removeItem(atPath: dir) }
+  _ = try enrol("first", Array(pcm[8_000..<52_800]), in: dir, model: fluid)
+  let engine = try Talkers(model: fluid, voices: voices(dir), floor: nil)
+  var said: [[String: Any]] = []
+  for at in 0..<mixed.count / 320 {
+    said += try engine.frame(at * 20_000, Array(mixed[at * 320..<at * 320 + 320]), masked: false)
+  }
+  // 1.7 s of the 2.56 s named `first` and an integer together (measured 2026-11-27)
+  let together = said.filter {
+    let ids = ($0["talkers"] as! [[String: Any]]).map { "\($0["id"]!)" }
+    return ids.contains("first") && ids.contains { Int($0) != nil }
+  }
+  .map { ($0["end"] as! Int) - ($0["start"] as! Int) }.reduce(0, +)
+  #expect(together >= 1_500_000, "\(said)")
+}
+
+@Test(
   "the model's steps the same however the fixture is cut: 20 ms frames, 100 ms, 333 samples",
   .enabled(
     if: FileManager.default.fileExists(
