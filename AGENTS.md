@@ -308,11 +308,17 @@ printed:
    `mouth-<host>` and `<root>/mouth.err`, one `print-disabled` serving both. A failure from the
    copy on boots it out and removes its plist and copy before the line, exit 1, so a failed setup
    leaves nothing of the mouth;
-11. each engine job whose plist lacks `ProcessType` (written before 2026-11-28): the key put in
-   before `ProgramArguments`, the plist rewritten (`wrote <path>`), booted out when loaded, then
-   bootstrapped unwaited unless disabled; one carrying it is left alone. The daemon's, the ear's
-   and the mouth's plists change with the key, so the upgrade onto it reloads all three (step 7's
-   swap needs the same plist).
+11. each engine job whose plist has no `<key>ProcessType</key>` (written before 2026-11-28; one
+   carrying it, any value or layout, is left alone, an absent plist skipped): `INTERACTIVE` put in
+   before `ProgramArguments` (`wrote <path>`), booted out when loaded, then bootstrapped unwaited
+   unless disabled, so a disabled engine still loaded is stopped by it. A plist unreadable or
+   without `ProgramArguments` is left unwritten, a bootout or bootstrap refused has the old plist
+   written back (`wrote <path>` again); either is one line, `<label> not migrated, the next setup
+   tries again: <cause>`, and the next engine is taken, exit 0: no engine fails the daemon's setup, nor so rolls back
+   its upgrade; an engine whose bootstrap was refused stays down until that next setup. The
+   reloaded engine may be refused `taken` until the daemon lets go of the old one's connection, and
+   reconnects as every engine does. The daemon's, the ear's and the mouth's plists change with the
+   key, so the upgrade onto it reloads all three (step 7's swap needs the same plist).
 
 The upgrade from a release without the mouth runs this setup, and a failed one is rolled back by
 hotswap running the older setup, which knows nothing of the mouth: a failure before step 10

@@ -913,6 +913,11 @@ rift status                                   # "engines":{"ear-mac":{"echo":"ta
     (priority 97) whatever the job's class; cpal sets no priority of its own. The daemon's, the
     devices' and the engines' threads run at the job's class: no QoS or time-constraint call is
     made, so none is clamped.</p>
+  <p class="docs-note"><code class="code">rift setup</code> reloads the daemon, the ear and the mouth on
+    their new plists, and gives each engine job without the key the key, then a bootout and a
+    bootstrap (none for a disabled one). An engine it cannot migrate is one line and its plist as it
+    was, for the next setup to try again; setup still succeeds, so one engine never rolls back an
+    upgrade.</p>
 </section>
 
 <section class="docs-section" id="paths" data-component="paths">

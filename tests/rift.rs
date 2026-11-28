@@ -4833,8 +4833,8 @@ stop() {{ kill $1 2>/dev/null || return 0; while kill -0 $1 2>/dev/null; do slee
 hold() {{ until RIFT_ROOT=$1 {serve} status | grep -q ready; do sleep 0.05; done; RIFT_ROOT=$1 RIFT_MIC={root}/fake {serve} device ear test-mac --mic >/dev/null 2>&1 & echo $! > {root}/holder; until RIFT_ROOT=$1 {serve} status | grep -q ear-test-mac; do sleep 0.05; done; }}
 case $1 in
 print) [ -f {root}/loaded/$job.going ] && {{ rm {root}/loaded/$job.going; exit 0; }}; [ -f {root}/loaded/$job ] || exit 113; [ -f {root}/lwcr ] && echo 'managed LWCR | has LWCR'; exit 0;;
-bootout) stop $(cat {root}/loaded/$job); [ -f {root}/stuck ] || mv {root}/loaded/$job {root}/loaded/$job.going;;
-bootstrap) case $3 in *.upgrade.plist) touch {root}/loaded/$(basename $3 .plist); exit;; esac; held=$(sed -n 's|.*<key>RIFT_ROOT</key><string>\(.*\)</string>.*|\1|p' $3); [ -n "$(find "$held" -maxdepth 0 -perm 700)" ] && echo root 0700 >> {root}/launchctl.log; [ -f {root}/fail ] && {{ echo 'Bootstrap failed: 5: Input/output error' >&2; exit 5; }}; start $3; case $3 in *rift.plist) [ ! -f {root}/held ] || hold "$held";; esac;;
+bootout) [ -f {root}/fail-$job ] && {{ echo 'Boot-out failed: 5: Input/output error' >&2; exit 5; }}; stop $(cat {root}/loaded/$job); [ -f {root}/stuck ] || mv {root}/loaded/$job {root}/loaded/$job.going;;
+bootstrap) case $3 in *.upgrade.plist) touch {root}/loaded/$(basename $3 .plist); exit;; esac; held=$(sed -n 's|.*<key>RIFT_ROOT</key><string>\(.*\)</string>.*|\1|p' $3); [ -n "$(find "$held" -maxdepth 0 -perm 700)" ] && echo root 0700 >> {root}/launchctl.log; [ -f {root}/fail ] || [ -f {root}/fail-$(basename $3 .plist) ] && {{ echo 'Bootstrap failed: 5: Input/output error' >&2; exit 5; }}; start $3; case $3 in *rift.plist) [ ! -f {root}/held ] || hold "$held";; esac;;
 print-disabled) [ -f {root}/disabled ] && sed 's/.*/	"&" => disabled/' {root}/disabled; exit 0;;
 kickstart) stop $(cat {root}/loaded/${{3##*/}}); [ -f {root}/refuse ] && exit; {{ sleep 1; start {file}; }} >/dev/null 2>&1 &;;
 esac
@@ -4971,25 +4971,75 @@ esac
         fs::write(format!("{root}/loaded/dev.example.old"), "")?;
         let other = format!("{agents}/com.example.other.plist");
         fs::write(&other, plist(&old).replace(&exe, "/usr/bin/true"))?;
-        // engine jobs: one written before `ProcessType`, given it and reloaded; one with it, left
+        // engine jobs, as `rift engine add` writes them (`kept`) and as before `ProcessType`
+        // (`stale`): echo unreadable; speech disabled, not loaded; talkers disabled, loaded; turn
+        // carrying another class in another layout, left; words loaded, migrated and reloaded
         let kept = |kind: &str| {
             plist(&data)
                 .replace("rift</string>\n", &format!("rift.{kind}</string>\n"))
                 .replace("<string>serve</string>", "<string>version</string>")
         };
-        let (words, turn) = (
-            format!("{agents}/dev.gigantic.rift.words.plist"),
-            format!("{agents}/dev.gigantic.rift.turn.plist"),
-        );
-        fs::write(
-            &words,
-            kept("words").replace(
+        let aged = |kind: &str| {
+            kept(kind).replace(
                 "  <key>ProcessType</key>\n  <string>Interactive</string>\n",
                 "",
-            ),
+            )
+        };
+        let pair = |kind: &str| {
+            (
+                format!("{agents}/dev.gigantic.rift.{kind}.plist"),
+                format!("{gui}/dev.gigantic.rift.{kind}"),
+            )
+        };
+        let [echo, speech, talkers, turn, words] =
+            ["echo", "speech", "talkers", "turn", "words"].map(pair);
+        let disabling = |label: &str| {
+            format!(
+                "{label} is disabled, so written and not loaded; launchctl enable {gui}/{label} stands it\n"
+            )
+        };
+        let missed = |kind: &str, cause: &str| {
+            format!("dev.gigantic.rift.{kind} not migrated, the next setup tries again: {cause}\n")
+        };
+        let background = aged("turn").replace(
+            "  <key>ProgramArguments</key>",
+            "  <key>ProcessType</key><string>Background</string>\n  <key>ProgramArguments</key>",
+        );
+        fs::create_dir_all(&echo.0)?;
+        for (at, text) in [
+            (&speech.0, aged("speech")),
+            (&talkers.0, aged("talkers")),
+            (&turn.0, background.clone()),
+            (&words.0, aged("words")),
+        ] {
+            fs::write(at, text)?;
+        }
+        for loaded in ["talkers", "words"] {
+            fs::write(format!("{root}/loaded/dev.gigantic.rift.{loaded}"), "")?;
+        }
+        fs::write(
+            format!("{root}/disabled"),
+            "dev.gigantic.rift.speech\ndev.gigantic.rift.talkers\n",
         )?;
-        fs::write(&turn, kept("turn"))?;
-        let wordson = on(&format!("{gui}/dev.gigantic.rift.words"), &words);
+        let migrated = format!(
+            "{}wrote {}\n{}wrote {}\nlaunchctl bootout {}\n{}wrote {}\nlaunchctl bootout {}\nlaunchctl bootstrap {gui} {}\n",
+            missed("echo", "Is a directory (os error 21)"),
+            speech.0,
+            disabling("dev.gigantic.rift.speech"),
+            talkers.0,
+            talkers.1,
+            disabling("dev.gigantic.rift.talkers"),
+            words.0,
+            words.1,
+            words.0
+        );
+        let wordson = format!(
+            "{}{}{}bootstrap {gui} {}\nroot 0700\n",
+            absent(&speech.1),
+            off(&talkers.1),
+            off(&words.1),
+            words.0
+        );
         // the signing a run does: in a fresh keychain an identity made and the release signed;
         // after it, the unlock, the identity found and the signature checked
         let id = |at: &str| -> Result<String, Box<dyn Error>> {
@@ -5012,22 +5062,134 @@ esac
         same(
             &first,
             &format!(
-                "0\nlaunchctl bootout {former}\nmoved {old} to {data}\nremoved {earlier}\n{linked}{}{installed}{wrote}launchctl bootstrap {gui} {file}\n{placed}wrote {words}\nlaunchctl bootstrap {gui} {words}\nprint {job}\nprint {former}\nbootout {former}\nprint {former}\nprint {former}\n{tended}{unheard}print {job}\nprint {job}\nbootstrap {gui} {file}\nroot 0700\n{hear}{wordson}{fresh}",
+                "0\nlaunchctl bootout {former}\nmoved {old} to {data}\nremoved {earlier}\n{linked}{}{installed}{wrote}launchctl bootstrap {gui} {file}\n{placed}{migrated}print {job}\nprint {former}\nbootout {former}\nprint {former}\nprint {former}\n{tended}{unheard}print {job}\nprint {job}\nbootstrap {gui} {file}\nroot 0700\n{hear}{wordson}{fresh}",
                 made(&data, &id(&data)?)
+            ),
+        )?;
+        let holds = |at: &str, text: &str| fs::read_to_string(at).is_ok_and(|held| held == text);
+        same(
+            &format!(
+                "{} {} {} {}",
+                holds(&speech.0, &kept("speech")),
+                holds(&talkers.0, &kept("talkers")),
+                holds(&turn.0, &background),
+                holds(&words.0, &kept("words"))
+            ),
+            "true true true true",
+        )?;
+        // a failure restores the old plist and is one line, exit 0, the rest migrated: echo with
+        // no ProgramArguments; turn's bootstrap refused; words loaded and its bootout refused
+        let armless = aged("echo").replace("  <key>ProgramArguments</key>\n", "");
+        fs::remove_dir(&echo.0)?;
+        for (at, text) in [
+            (&echo.0, &armless),
+            (&turn.0, &aged("turn")),
+            (&words.0, &aged("words")),
+        ] {
+            fs::write(at, text)?;
+        }
+        for failing in ["turn", "words"] {
+            fs::write(format!("{root}/fail-dev.gigantic.rift.{failing}"), "")?;
+        }
+        let bare_line = missed(
+            "echo",
+            &format!("{} has no <key>ProgramArguments</key>", echo.0),
+        );
+        // the last of `text`, as long as `want`: what a run ends with, its engine lines
+        let tail = |text: &str, want: &str| {
+            same(
+                text.get(text.len().saturating_sub(want.len())..)
+                    .unwrap_or(text),
+                want,
+            )
+        };
+        let (refused, refusals) = (run(&stubbed, &[], &[])?, calls()?);
+        drop(signs()?);
+        tail(
+            &refused,
+            &format!(
+                "{bare_line}wrote {}\nwrote {}\n{}wrote {}\nwrote {}\n{}",
+                turn.0,
+                turn.0,
+                missed(
+                    "turn",
+                    &format!(
+                        "launchctl bootstrap {gui} {}: Bootstrap failed: 5: Input/output error",
+                        turn.0
+                    )
+                ),
+                words.0,
+                words.0,
+                missed(
+                    "words",
+                    &format!(
+                        "launchctl bootout {}: Boot-out failed: 5: Input/output error",
+                        words.1
+                    )
+                ),
+            ),
+        )?;
+        tail(
+            &refusals,
+            &format!(
+                "{}bootstrap {gui} {}\nroot 0700\nprint {}\nbootout {}\n",
+                absent(&turn.1),
+                turn.0,
+                words.1,
+                words.1
             ),
         )?;
         same(
             &format!(
-                "{} {}",
-                fs::read_to_string(&words)? == kept("words"),
-                fs::read_to_string(&turn)? == kept("turn")
+                "{} {} {} {}",
+                refused.starts_with("0\n"),
+                holds(&echo.0, &armless),
+                holds(&turn.0, &aged("turn")),
+                holds(&words.0, &aged("words"))
             ),
-            "true true",
+            "true true true true",
+        )?;
+        // the next setup tries again, and both are migrated
+        for failing in ["turn", "words"] {
+            fs::remove_file(format!("{root}/fail-dev.gigantic.rift.{failing}"))?;
+        }
+        let (retried, reloads) = (run(&stubbed, &[], &[])?, calls()?);
+        drop(signs()?);
+        tail(
+            &retried,
+            &format!(
+                "{bare_line}wrote {}\nlaunchctl bootstrap {gui} {}\nwrote {}\nlaunchctl bootout {}\nlaunchctl bootstrap {gui} {}\n",
+                turn.0, turn.0, words.0, words.1, words.0
+            ),
+        )?;
+        tail(
+            &reloads,
+            &format!(
+                "{}bootstrap {gui} {}\nroot 0700\n{}bootstrap {gui} {}\nroot 0700\n",
+                absent(&turn.1),
+                turn.0,
+                off(&words.1),
+                words.0
+            ),
+        )?;
+        same(
+            &format!(
+                "{} {} {}",
+                retried.starts_with("0\n"),
+                holds(&turn.0, &kept("turn")),
+                holds(&words.0, &kept("words"))
+            ),
+            "true true true",
         )?;
         // gone again, so the runs below meet no engine job
         for planted in [
-            words,
-            turn,
+            echo.0,
+            speech.0,
+            talkers.0,
+            turn.0,
+            words.0,
+            format!("{root}/disabled"),
+            format!("{root}/loaded/dev.gigantic.rift.turn"),
             format!("{root}/loaded/dev.gigantic.rift.words"),
         ] {
             fs::remove_file(planted)?;

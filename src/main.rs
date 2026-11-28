@@ -3775,25 +3775,40 @@ security import "$1/identity.p12" -k "$3" -P "$2" -T /usr/bin/codesign"#,
                     gone(&mouthcopy);
                 })?;
                 // since 2026-11-28: an engine job written before `ProcessType` ran as a daemon,
-                // throttled; given the key and reloaded, never kickstarted, unless disabled
-                let stale = kinds.map(engine).into_iter().filter_map(|(file, job)| {
-                    let held = fs::read_to_string(&file).ok()?;
+                // throttled; given the key, booted out and loaded afresh unless disabled, never
+                // kickstarted. A failure restores the old plist, so the next setup tries again,
+                // and is one line: an engine never fails the daemon's setup
+                let migrate = |file: &Path, job: &str, read: io::Result<String>| {
+                    let held = read?;
                     let key = "<key>ProgramArguments</key>";
-                    (!held.contains(INTERACTIVE)).then(|| {
-                        (
-                            held.replacen(key, &format!("{INTERACTIVE}\n  {key}"), 1),
-                            file,
-                            job,
-                        )
-                    })
-                });
-                for (text, file, job) in stale {
-                    write(&file, &text)?;
-                    unload(&job)?;
+                    if held.contains("<key>ProcessType</key>") {
+                        return Ok(());
+                    }
+                    if !held.contains(key) {
+                        return Err(io::Error::other(format!("{} has no {key}", file.display())));
+                    }
+                    write(
+                        file,
+                        &held.replacen(key, &format!("{INTERACTIVE}\n  {key}"), 1),
+                    )?;
                     let load = || must(&["bootstrap", &gui, &file.to_string_lossy()]);
-                    (!disabled(&listed_off, &job))
-                        .then(load)
-                        .unwrap_or(Ok(()))?;
+                    let reload = || -> io::Result<()> {
+                        unload(job)?;
+                        (!disabled(&listed_off, job)).then(load).unwrap_or(Ok(()))
+                    };
+                    reload().inspect_err(|_| drop(write(file, &held)))
+                };
+                for (file, job) in kinds.map(engine) {
+                    let held = fs::read_to_string(&file);
+                    if held
+                        .as_ref()
+                        .is_err_and(|cause| cause.kind() == io::ErrorKind::NotFound)
+                    {
+                        continue;
+                    }
+                    if let Err(cause) = migrate(&file, &job, held) {
+                        println!("{job} not migrated, the next setup tries again: {cause}");
+                    }
                 }
                 Ok(())
             };
