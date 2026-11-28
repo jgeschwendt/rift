@@ -1579,6 +1579,7 @@ fn main() -> ExitCode {
                 hook(json!({"event": "panic", "reason": info.to_string()}));
             }));
             let started = || -> io::Result<_> {
+                // ※ stop-signals-first
                 // first: a stop signal during the boot waits for the drain, never kills
                 let signals = Signals::new([SIGHUP, SIGINT, SIGTERM])?;
                 if sock.as_os_str().len() > 103 {
@@ -1592,6 +1593,7 @@ fn main() -> ExitCode {
                     .mode(0o700)
                     .create(&root)?;
                 drop(DirBuilder::new().mode(0o700).create(&rundir));
+                // ※ one-instance-by-lock
                 // append, not create: a second instance must not even truncate the lock file
                 let held = OpenOptions::new()
                     .append(true)
@@ -1608,6 +1610,7 @@ fn main() -> ExitCode {
                 }
                 drop(fs::remove_file(&tmp));
                 let listener = UnixListener::bind(&tmp)?;
+                // ※ socket-in-0700
                 let dir = fs::metadata(&rundir)?;
                 if dir.uid() != fs::metadata(&tmp)?.uid() || dir.mode() & 0o077 != 0 {
                     fs::remove_file(&tmp)?;

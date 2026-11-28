@@ -1,5 +1,20 @@
 # rift
 
+```stele
+kind: system
+purpose: rift — a launchd-owned daemon serving one append-only event log and an audio stream over a unix socket
+commands:
+  check: mise run check
+  cover: mise run cover
+invariants:
+  - claim: "the daemon arms SIGHUP, SIGINT and SIGTERM before anything else in its boot, so a stop during the boot waits for the drain and never kills"
+    anchor: ※ stop-signals-first
+  - claim: "one instance, by an exclusive flock on run/serve.lock opened append, never create, so a second instance cannot even truncate the lock file"
+    anchor: ※ one-instance-by-lock
+  - claim: "the socket lives in a run/ directory the daemon creates 0700 and checks is this user's and closed to group and other, else it refuses and removes the socket"
+    anchor: ※ socket-in-0700
+```
+
 A launchd-owned daemon: one append-only event log served over a unix socket, and an audio stream
 its devices feed onto one clock. The design, paths, environment and command line are
 `docs/index.html`; the wire contract, the stream's included, is `docs/protocol.html`. This file
@@ -357,3 +372,26 @@ the pin, so an install of it cannot upgrade.
 Stdout `<release>-<build>`, the hello's and health's `version`; exit 0. `<release>` is the release
 workflow's `YYYY.M.N` (`$RIFT_VERSION`, which `build.rs` stamps), a checkout's build the crate
 version.
+
+<!-- @stele -->
+
+## Hazards (0 active)
+
+
+## Map
+
+| node  | kind      | purpose                                                                                                                      | unfold                                           |
+| ----- | --------- | ---------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------ |
+| docs  | container | the design (`index.html`, GitHub Pages) and the wire contract (`protocol.html`)                                              | `stele unfold docs` · or read `docs/AGENTS.md`   |
+| src   | container | the binary — `main.rs` (serve, the clients, setup, upgrade), the microphone and mouth devices, and the reference tail engine | `stele unfold src` · or read `src/AGENTS.md`     |
+| tests | container | the end-to-end suite — the built binary over temp roots, stub launchctl and friends, fake mics and speakers                  | `stele unfold tests` · or read `tests/AGENTS.md` |
+
+## Indexes
+
+All invariants: `.stele/index/invariants.md` · all hazards: `.stele/index/hazards.md`
+
+## Engine
+
+`stele` CLI available → `stele root | unfold <id> | invariants --touching <path> | hazards | nodes --kind <k>`. MCP: `stele serve`.
+No engine → everything above is complete; nested AGENTS.md files carry the detail (nearest file wins).
+<!-- @end -->

@@ -1,0 +1,8 @@
+[budget]
+# AGENTS.md is the daemon's whole contract (commands, map, each verb), read in full.
+claude_root = 10000
+codex_cap = 40960
+
+[exhaustiveness]
+# `.github` is CI wiring, `engines` is a workspace of its own, `target` build output.
+exclude = [".github", "engines", "target"]

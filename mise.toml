@@ -8,11 +8,13 @@ rust = "1.94.0"
 uv = "0.13.10"
 
 [tasks.check]
-description = "the gate hk's pre-push runs: fmt, clippy, 100 % line coverage"
+description = "the gate hk's pre-push runs: fmt, clippy, 100 % line coverage, the stele graph"
 run = [
   "cargo fmt --check",
   "cargo clippy --all-targets -- -D warnings",
   { task = "cover" },
+  "stele check",
+  "stele emit --check",
 ]
 
 [tasks.check-engines]
