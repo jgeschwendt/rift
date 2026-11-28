@@ -887,6 +887,34 @@ rift status                                   # "engines":{"ear-mac":{"echo":"ta
   </ul>
 </section>
 
+<section class="docs-section" id="priority" data-component="priority">
+  <header>
+    <h2 class="h2">Priority</h2>
+    <p class="docs-note">Every launchd job rift writes (the daemon, the ear, the mouth and each engine)
+      carries <code class="code">ProcessType</code> <code class="code">Interactive</code>. Unset, launchd
+      applies "light resource limits to the job, throttling its CPU usage and I/O bandwidth"; Interactive
+      jobs "run with the same resource limitations as apps, that is to say, none"
+      (<code class="code">man launchd.plist</code>). Adaptive moves with XPC transactions, which rift
+      does not use. Under a load average of 43, unset, speech came out in 280 ms runs with gaps, the
+      output glitched, and the turn and words engines answered seconds late (observed 2026-11-28).</p>
+  </header>
+  <div class="table-wrap">
+    <table data-table>
+      <thead><tr><th>job's <code class="code">ProcessType</code></th><th>its threads' priority</th><th>a thread asking user-interactive QoS</th></tr></thead>
+      <tbody>
+        <tr><td class="table-mono">unset, Standard</td><td>20</td><td>20: clamped</td></tr>
+        <tr><td class="table-mono">Interactive</td><td>31, an app's</td><td>37</td></tr>
+        <tr><td class="table-mono">Adaptive, Background</td><td>4</td><td></td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="docs-note">Measured 2026-11-28 with <code class="code">ps -M</code> on throwaway agents, a
+    child of the job inheriting its class. The output's I/O thread is CoreAudio's own, real time
+    (priority 97) whatever the job's class; cpal sets no priority of its own. The daemon's, the
+    devices' and the engines' threads run at the job's class: no QoS or time-constraint call is
+    made, so none is clamped.</p>
+</section>
+
 <section class="docs-section" id="paths" data-component="paths">
   <header>
     <h2 class="h2">Paths</h2>

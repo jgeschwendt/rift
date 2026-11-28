@@ -52,6 +52,10 @@ const FORESIGHT: u64 = 1_000_000;
 /// A frame's bytes: 20 ms of 16 kHz mono 16-bit little-endian PCM.
 const FRAME: usize = 640;
 
+/// The scheduling class every launchd job rift writes runs at: an app's, unthrottled
+/// (`man launchd.plist`, `ProcessType`).
+const INTERACTIVE: &str = "<key>ProcessType</key>\n  <string>Interactive</string>";
+
 /// The longest request line, its `\n` not counted (docs/protocol.html#framing).
 const LINE: u64 = 1 << 16;
 
@@ -3158,7 +3162,10 @@ fn main() -> ExitCode {
                 "dev.gigantic.rift.ear",
                 "dev.gigantic.rift.mouth",
             );
-            // an agent's plist: `program` run with `said`, `keep` its KeepAlive, `err` its stderr
+            // an agent's plist: `program` run with `said`, `keep` its KeepAlive, `err` its stderr.
+            // `ProcessType` Interactive on every job: unset, launchd runs a job as a daemon, every
+            // thread at priority 20 to an app's 31, and audio starved under load (measured
+            // 2026-11-28, docs/index.html#priority)
             let sheet = |name: &str, program: &Path, said: &str, keep: &str, err: &str| {
                 format!(
                     r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -3173,6 +3180,7 @@ fn main() -> ExitCode {
   {keep}
   <key>Label</key>
   <string>{name}</string>
+  {INTERACTIVE}
   <key>ProgramArguments</key>
   <array><string>{}</string>{said}</array>
   <key>RunAtLoad</key>
@@ -3765,7 +3773,29 @@ security import "$1/identity.p12" -k "$3" -P "$2" -T /usr/bin/codesign"#,
                     drop(unload(mouth));
                     gone(&mouthfile);
                     gone(&mouthcopy);
-                })
+                })?;
+                // since 2026-11-28: an engine job written before `ProcessType` ran as a daemon,
+                // throttled; given the key and reloaded, never kickstarted, unless disabled
+                let stale = kinds.map(engine).into_iter().filter_map(|(file, job)| {
+                    let held = fs::read_to_string(&file).ok()?;
+                    let key = "<key>ProgramArguments</key>";
+                    (!held.contains(INTERACTIVE)).then(|| {
+                        (
+                            held.replacen(key, &format!("{INTERACTIVE}\n  {key}"), 1),
+                            file,
+                            job,
+                        )
+                    })
+                });
+                for (text, file, job) in stale {
+                    write(&file, &text)?;
+                    unload(&job)?;
+                    let load = || must(&["bootstrap", &gui, &file.to_string_lossy()]);
+                    (!disabled(&listed_off, &job))
+                        .then(load)
+                        .unwrap_or(Ok(()))?;
+                }
+                Ok(())
             };
             install().map_or_else(
                 |cause| {

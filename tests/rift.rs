@@ -4520,6 +4520,8 @@ esac
   <true/>
   <key>Label</key>
   <string>dev.gigantic.rift.echo</string>
+  <key>ProcessType</key>
+  <string>Interactive</string>
   <key>ProgramArguments</key>
   <array><string>{exe}</string><string>engine</string><string>run</string><string>tail</string><string>ear-test</string></array>
   <key>RunAtLoad</key>
@@ -4597,7 +4599,7 @@ esac
         )?;
         same(
             &fs::read_to_string(&talkers)?
-                .contains(&format!("<string>dev.gigantic.rift.talkers</string>\n  <key>ProgramArguments</key>\n  <array><string>diarize</string><string>ear-test</string></array>\n  <key>RunAtLoad</key>\n  <true/>\n  <key>StandardErrorPath</key>\n  <string>{data}/engines/talkers.err</string>"))
+                .contains(&format!("<string>dev.gigantic.rift.talkers</string>\n  <key>ProcessType</key>\n  <string>Interactive</string>\n  <key>ProgramArguments</key>\n  <array><string>diarize</string><string>ear-test</string></array>\n  <key>RunAtLoad</key>\n  <true/>\n  <key>StandardErrorPath</key>\n  <string>{data}/engines/talkers.err</string>"))
                 .to_string(),
             "true",
         )?;
@@ -4682,7 +4684,7 @@ esac
     /// loaded (its respawn held back a second, as by `ThrottleInterval`), reloads a changed one or
     /// a re-signed release, returns only once the loaded daemon answers health ready, reloads once
     /// a job none answers for past `$RIFT_RELOAD_MS` (`refuse`: a kickstart launchd refuses to
-    /// spawn), fails on a failed bootstrap, a job still loaded past `$RIFT_BOOTOUT_MS` or none
+    /// spawn), gives an engine job written before `ProcessType` the key and reloads it, fails on a failed bootstrap, a job still loaded past `$RIFT_BOOTOUT_MS` or none
     /// ready past `$RIFT_READY_MS` after that reload; `upgrade`
     /// swaps under the manifest, green once the swapped daemon answers with the new version;
     /// `--remove` has hotswap forget the layout and the upgrade agent, then boots the daemon and
@@ -4710,6 +4712,8 @@ esac
   <dict><key>SuccessfulExit</key><false/></dict>
   <key>Label</key>
   <string>dev.gigantic.rift</string>
+  <key>ProcessType</key>
+  <string>Interactive</string>
   <key>ProgramArguments</key>
   <array><string>{exe}</string><string>serve</string></array>
   <key>RunAtLoad</key>
@@ -4967,6 +4971,25 @@ esac
         fs::write(format!("{root}/loaded/dev.example.old"), "")?;
         let other = format!("{agents}/com.example.other.plist");
         fs::write(&other, plist(&old).replace(&exe, "/usr/bin/true"))?;
+        // engine jobs: one written before `ProcessType`, given it and reloaded; one with it, left
+        let kept = |kind: &str| {
+            plist(&data)
+                .replace("rift</string>\n", &format!("rift.{kind}</string>\n"))
+                .replace("<string>serve</string>", "<string>version</string>")
+        };
+        let (words, turn) = (
+            format!("{agents}/dev.gigantic.rift.words.plist"),
+            format!("{agents}/dev.gigantic.rift.turn.plist"),
+        );
+        fs::write(
+            &words,
+            kept("words").replace(
+                "  <key>ProcessType</key>\n  <string>Interactive</string>\n",
+                "",
+            ),
+        )?;
+        fs::write(&turn, kept("turn"))?;
+        let wordson = on(&format!("{gui}/dev.gigantic.rift.words"), &words);
         // the signing a run does: in a fresh keychain an identity made and the release signed;
         // after it, the unlock, the identity found and the signature checked
         let id = |at: &str| -> Result<String, Box<dyn Error>> {
@@ -4989,10 +5012,26 @@ esac
         same(
             &first,
             &format!(
-                "0\nlaunchctl bootout {former}\nmoved {old} to {data}\nremoved {earlier}\n{linked}{}{installed}{wrote}launchctl bootstrap {gui} {file}\n{placed}print {job}\nprint {former}\nbootout {former}\nprint {former}\nprint {former}\n{tended}{unheard}print {job}\nprint {job}\nbootstrap {gui} {file}\nroot 0700\n{hear}{fresh}",
+                "0\nlaunchctl bootout {former}\nmoved {old} to {data}\nremoved {earlier}\n{linked}{}{installed}{wrote}launchctl bootstrap {gui} {file}\n{placed}wrote {words}\nlaunchctl bootstrap {gui} {words}\nprint {job}\nprint {former}\nbootout {former}\nprint {former}\nprint {former}\n{tended}{unheard}print {job}\nprint {job}\nbootstrap {gui} {file}\nroot 0700\n{hear}{wordson}{fresh}",
                 made(&data, &id(&data)?)
             ),
         )?;
+        same(
+            &format!(
+                "{} {}",
+                fs::read_to_string(&words)? == kept("words"),
+                fs::read_to_string(&turn)? == kept("turn")
+            ),
+            "true true",
+        )?;
+        // gone again, so the runs below meet no engine job
+        for planted in [
+            words,
+            turn,
+            format!("{root}/loaded/dev.gigantic.rift.words"),
+        ] {
+            fs::remove_file(planted)?;
+        }
         same(
             &format!(
                 "{:o} {} {}",

@@ -3,17 +3,17 @@
   "landmarks": {
     "one-instance-by-lock": {
       "file": "src/main.rs",
-      "line": 1596,
+      "line": 1600,
       "node": "src"
     },
     "socket-in-0700": {
       "file": "src/main.rs",
-      "line": 1613,
+      "line": 1617,
       "node": "src"
     },
     "stop-signals-first": {
       "file": "src/main.rs",
-      "line": 1582,
+      "line": 1586,
       "node": "src"
     }
   },
@@ -26,11 +26,11 @@
           "enforced_by": null,
           "id": "one-instance-by-lock",
           "kind": "invariant",
-          "resolved": "src/main.rs:1596",
+          "resolved": "src/main.rs:1600",
           "text": "one instance, by an exclusive flock on run/serve.lock opened append, never create, so a second instance cannot even truncate the lock file",
           "verified": {
-            "digest": "4e6b252584732e183fe76869d3fffe6b631fe86951c68f945105b3933a46aae6",
-            "sha": "55ca037cf0264ee4f2be2a771bfef3e1ecb99acc"
+            "digest": "27ee6f6a45b63c251ce33d1c756d2339bf9b3ce0bdbbc75b2684c026c8992af3",
+            "sha": "a655b797e9125337f8f0b6dce5f09d9dcbe471ff"
           }
         },
         {
@@ -38,11 +38,11 @@
           "enforced_by": null,
           "id": "socket-in-0700",
           "kind": "invariant",
-          "resolved": "src/main.rs:1613",
+          "resolved": "src/main.rs:1617",
           "text": "the socket lives in a run/ directory the daemon creates 0700 and checks is this user's and closed to group and other, else it refuses and removes the socket",
           "verified": {
-            "digest": "4e6b252584732e183fe76869d3fffe6b631fe86951c68f945105b3933a46aae6",
-            "sha": "55ca037cf0264ee4f2be2a771bfef3e1ecb99acc"
+            "digest": "27ee6f6a45b63c251ce33d1c756d2339bf9b3ce0bdbbc75b2684c026c8992af3",
+            "sha": "a655b797e9125337f8f0b6dce5f09d9dcbe471ff"
           }
         },
         {
@@ -50,11 +50,11 @@
           "enforced_by": null,
           "id": "stop-signals-first",
           "kind": "invariant",
-          "resolved": "src/main.rs:1582",
+          "resolved": "src/main.rs:1586",
           "text": "the daemon arms SIGHUP, SIGINT and SIGTERM before anything else in its boot, so a stop during the boot waits for the drain and never kills",
           "verified": {
-            "digest": "4e6b252584732e183fe76869d3fffe6b631fe86951c68f945105b3933a46aae6",
-            "sha": "55ca037cf0264ee4f2be2a771bfef3e1ecb99acc"
+            "digest": "27ee6f6a45b63c251ce33d1c756d2339bf9b3ce0bdbbc75b2684c026c8992af3",
+            "sha": "a655b797e9125337f8f0b6dce5f09d9dcbe471ff"
           }
         }
       ],

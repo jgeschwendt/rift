@@ -211,7 +211,8 @@ a region of its own (a method, a precomputed guard) holds its count.
 The plist for `dev.gigantic.rift`: `ProgramArguments` `~/.local/bin/rift serve`,
 `EnvironmentVariables` the root it ran with, `KeepAlive` on an unclean exit only (a drain's exit 0,
 as after `shutdown`, stays down), `RunAtLoad`, `ThrottleInterval` 10,
-`ExitTimeOut` 3, `StandardErrorPath` `<root>/serve.err`. Beside it the standing ear's,
+`ExitTimeOut` 3, `ProcessType` `Interactive` (`INTERACTIVE`, on every job rift writes, engines
+included; `docs/index.html#priority`), `StandardErrorPath` `<root>/serve.err`. Beside it the standing ear's,
 `dev.gigantic.rift.ear`: the same but `ProgramArguments` `~/.local/libexec/rift/rift device ear
 <host> --mic` (the signed release's copy at one path every release shares, since the microphone's
 grant is keyed by the program's path; the daemon opens no microphone and stays on the link),
@@ -306,7 +307,12 @@ printed:
    `~/.local/libexec/rift/mouth` as in step 5, its plist written, then step 9's rules with
    `mouth-<host>` and `<root>/mouth.err`, one `print-disabled` serving both. A failure from the
    copy on boots it out and removes its plist and copy before the line, exit 1, so a failed setup
-   leaves nothing of the mouth.
+   leaves nothing of the mouth;
+11. each engine job whose plist lacks `ProcessType` (written before 2026-11-28): the key put in
+   before `ProgramArguments`, the plist rewritten (`wrote <path>`), booted out when loaded, then
+   bootstrapped unwaited unless disabled; one carrying it is left alone. The daemon's, the ear's
+   and the mouth's plists change with the key, so the upgrade onto it reloads all three (step 7's
+   swap needs the same plist).
 
 The upgrade from a release without the mouth runs this setup, and a failed one is rolled back by
 hotswap running the older setup, which knows nothing of the mouth: a failure before step 10
@@ -340,7 +346,7 @@ first has hotswap forget the layout, its record and the upgrade agent (refused w
 then boots out every earlier install, `dev.gigantic.rift.ear`, `dev.gigantic.rift.mouth` and `dev.gigantic.rift`, removes their plists,
 `~/.local/bin/rift`, the ear's and the mouth's copies and their `~/.local/libexec/rift/`, the keychain and its password as files (never `security delete-keychain`,
 which may ask to unlock it), and leaves the root alone. Idempotent. The engine jobs go first
-(`dev.gigantic.rift.<kind>`, `kinds`); an install never touches them.
+(`dev.gigantic.rift.<kind>`, `kinds`); an install touches them only by step 11.
 
 `rift engine add|remove|list` runs through the same arm and closures (`ask` under
 `$RIFT_SIGN_MS`, `unload` under `$RIFT_BOOTOUT_MS`, `up`, the one `print-disabled` listing
