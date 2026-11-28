@@ -93,6 +93,38 @@ struct Models {
     #expect(together >= 1_500_000, "\(said)")
   }
 
+  @Test(
+    "the fixture after 2 min of a quiet room, alba enrolled: a fresh stream's spans, the stream started afresh in the quiet"
+  )
+  func rested() async throws {
+    let pcm = try fixture("voices.pcm")
+    let fluid = try await Fluid(model: model)
+    let dir = NSTemporaryDirectory() + "diarize-rested-\(getpid())"
+    defer { try? FileManager.default.removeItem(atPath: dir) }
+    _ = try enrol("first", fixture("alba.pcm"), in: dir, model: fluid)
+    // a room's floor: 1 s of seeded noise at about -55 dBFS rms, repeated
+    var seed: UInt64 = 23
+    let second: [Float] = (0..<16_000).map { _ in
+      seed = seed &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+      return Float(Int(seed >> 40) - (1 << 23)) / Float(1 << 23) * 0.003
+    }
+    // each span after the quiet, its times from the fixture's start
+    func after(_ seconds: Int) throws -> [String] {
+      let engine = try Talkers(model: fluid, voices: Engine.voices(dir), floor: nil)
+      let quiet = Array([[Float]](repeating: second, count: seconds).joined())
+      return try heard(engine, quiet + pcm).compactMap { span in
+        let (start, end) = (span["start"] as! Int, span["end"] as! Int)
+        let talkers = (span["talkers"] as! [[String: Any]]).map { "\($0["id"]!)" }
+        return start < seconds * 1_000_000
+          ? nil : "\(start - seconds * 1_000_000) \(end - seconds * 1_000_000) \(talkers)"
+      }
+    }
+    // without the restart, after 40 s to 2 min of it marius's first phrase opened 0.3 s early and
+    // his second took alba's label (measured 2026-11-28 · a probe of this test's input)
+    let (fresh, rested) = (try after(0), try after(120))
+    #expect(fresh == rested && fresh.contains { $0.hasSuffix("[\"first\"]") }, "\(rested)")
+  }
+
   @Test("the steps the same however the fixture is cut: 20 ms frames, 100 ms, 333 samples")
   func chunked() async throws {
     let pcm = try fixture("voices.pcm")

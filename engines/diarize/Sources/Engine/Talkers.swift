@@ -21,6 +21,10 @@ let bar: Float = 0.5
 let radius = 2
 /// The most steps a model's output may trail what it was fed: 2 s, over LS-EEND's 0.9 s.
 let lag = 20
+/// The steps of nobody, as the model gives them, after which the stream starts afresh, its voices
+/// enrolled again: 30 s. A stream run for long on a quiet room drifts until LS-EEND hears the
+/// enrolled voice as a new one, or as nobody (engines/README.md).
+let rest = 300
 /// Samples a second.
 let rate = 16_000
 /// The most samples one embedding reads: WeSpeaker's 10 s window.
@@ -71,14 +75,20 @@ func score(_ cosine: Float) -> Double {
 /// One connection's spans, every time on the daemon's clock in µs.
 final class Talkers {
   let model: any Model
-  /// Each enrolled slot's label.
-  let labels: [Int: String]
+  /// Each label's audio, enrolled at each start of the stream.
+  let enrolled: [(label: String, pcm: [Float])]
+  /// Each enrolled slot's label, since the stream last started.
+  var labels: [Int: String]
   /// Each label's embedding.
   let profiles: [String: [Float]]
   /// The last span's end: nothing reported starts before it.
   var floor: Int
-  /// Each slot reported with no label, its integer id.
+  /// Each slot reported with no label since the stream last started, its integer id.
   var ids: [Int: Int] = [:]
+  /// The integer ids given on this connection, none reused.
+  var numbered = 0
+  /// The steps given in a row with no slot over the bar.
+  var quiet = 0
   /// The frames heard, the newest last.
   var kept: [(t: Int, pcm: [Float])] = []
   /// The frames of the step being gathered, each with whether it was masked.
@@ -102,7 +112,8 @@ final class Talkers {
     throws
   {
     self.model = model
-    labels = try model.start(voices.map { ($0.label, $0.pcm) })
+    enrolled = voices.map { ($0.label, $0.pcm) }
+    labels = try model.start(enrolled)
     // one profile per file, so one per label
     profiles = Dictionary(uniqueKeysWithValues: voices.map { ($0.label, $0.embedding) })
     self.floor = floor ?? 0
@@ -117,23 +128,58 @@ final class Talkers {
     if let last = step.last, last.t + frameSpan != t {
       let missing = stepFrames - step.count
       (fed, step) = (fed + [step], [])
-      for _ in 0..<missing { said += try push([Float](repeating: 0, count: 320)) }
+      said = try push([Float](repeating: 0, count: missing * 320))
     }
     step.append((t, masked))
     if step.count == stepFrames { (fed, step) = (fed + [step], []) }
-    return try said + push(samples + [Float](repeating: 0, count: max(0, 320 - samples.count)))
+    return try said + push(padded(samples))
   }
 
-  /// A frame's `samples` fed, and what settles; a model giving more steps than were fed, or
-  /// falling more than `lag` behind, is a `Fault` rather than a step paired with the wrong frames.
+  /// A frame's `samples` as fed: filled with silence to 20 ms.
+  func padded(_ samples: [Float]) -> [Float] {
+    samples + [Float](repeating: 0, count: max(0, 320 - samples.count))
+  }
+
+  /// A frame's `samples` fed, and what settles; after `rest` steps of nobody the stream started
+  /// afresh.
   func push(_ samples: [Float]) throws -> [[String: Any]] {
-    let rows = try model.feed(samples)
+    try take(model.feed(samples))
+    let said = try settle()
+    if quiet >= rest { try restart() }
+    return said
+  }
+
+  /// The model's `rows` paired with the steps fed, oldest first; a model giving more steps than
+  /// were fed, or falling more than `lag` behind, is a `Fault` rather than a step paired with the
+  /// wrong frames.
+  func take(_ rows: [[Float]]) throws {
     guard rows.count <= fed.count, fed.count - rows.count <= lag else {
       throw Fault(reason: "the model gave \(rows.count) steps with \(fed.count) fed")
     }
     for slots in rows {
-      given.append((fed.removeFirst(), Set(slots.indices.filter { slots[$0] > bar })))
+      let on = Set(slots.indices.filter { slots[$0] > bar })
+      quiet = on.isEmpty ? quiet + 1 : 0
+      given.append((fed.removeFirst(), on))
     }
+  }
+
+  /// The stream started afresh, its voices enrolled again, and the audio fed since its last
+  /// step fed again, a step a hole cut short padded as it was; slots reported before keep no id.
+  func restart() throws {
+    labels = try model.start(enrolled)
+    (quiet, ids) = (0, [:])
+    // fed and gathered frames are the newest heard, each still kept
+    let audio = { (frames: [(t: Int, masked: Bool)]) in
+      frames.flatMap { frame in self.padded(self.kept.last { $0.t == frame.t }!.pcm) }
+    }
+    let pending = fed.flatMap {
+      audio($0) + [Float](repeating: 0, count: (stepFrames - $0.count) * 320)
+    }
+    try take(model.feed(pending + audio(step)))
+  }
+
+  /// The steps given that have settled, each frame of theirs heard.
+  func settle() throws -> [[String: Any]] {
     var said: [[String: Any]] = []
     while given.count - next > radius {
       let around = given[max(0, next - radius)...next + radius].map(\.on)
@@ -195,7 +241,10 @@ final class Talkers {
     }
     let kept = named.prefix(most).count
     let room = others.prefix(most - kept)
-    for slot in room where ids[slot] == nil { ids[slot] = ids.count + 1 }
+    for slot in room where ids[slot] == nil {
+      numbered += 1
+      ids[slot] = numbered
+    }
     if named.count + others.count > most, !crowded {
       say("diarize: a span named more than 16 talkers; the rest were left out")
       crowded = true

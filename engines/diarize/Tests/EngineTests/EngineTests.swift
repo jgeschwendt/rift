@@ -34,11 +34,15 @@ final class Stub: Model {
 
   func feed(_ pcm: [Float]) throws -> [[Float]] {
     heard += pcm
-    guard heard.count == 1_600 else { return [] }
-    let mask = Int((heard[0] * 1_048_576).rounded())
-    heard = []
-    queued.append((0..<20).map { mask >> $0 & 1 == 1 ? 0.9 : 0.1 })
-    return queued.count > lag ? [queued.removeFirst()] : []
+    var given: [[Float]] = []
+    // each whole step, however the audio is cut
+    while heard.count >= 1_600 {
+      let mask = Int((heard[0] * 1_048_576).rounded())
+      heard.removeFirst(1_600)
+      queued.append((0..<20).map { mask >> $0 & 1 == 1 ? 0.9 : 0.1 })
+      if queued.count > lag { given.append(queued.removeFirst()) }
+    }
+    return given
   }
 
   func embed(_ pcm: [Float]) throws -> [Float] {
@@ -221,6 +225,41 @@ func voiced() -> [[String: Any]] {
     // a new connection's engine numbers afresh
     let again = try run(talkers(Stub()), [.frames(0, 0b10, 25), .frames(500_000, 0, 30)])
     #expect(spans(again) == ["0 500000 1"])
+  }
+
+  @Test(
+    "30 s of nobody starts the stream afresh, its voices enrolled again: the audio not yet given a step fed again, none lost, a voice heard before a new id"
+  )
+  func restarted() throws {
+    let model = Stub(lag: 3)
+    let engine = try talkers(model, [("alpha", 0)])
+    // the 300th step of nobody, from 0.5 s, is given at 30.8 s, past the voice at 30.5 s
+    let said = try run(
+      engine,
+      [
+        .frames(0, 0b10, 25), .frames(500_000, 0, 1_500), .frames(30_500_000, 0b10, 25),
+        .frames(31_000_000, 0b1, 25), .frames(31_500_000, 0, 30),
+      ])
+    #expect(
+      spans(said) == [
+        "0 500000 1", "500000 20500000", "20500000 30500000", "30500000 31000000 2",
+        "31000000 31500000 alpha",
+      ])
+    // started once more, and counting nobody afresh: the last 0.6 s, of which 3 steps are given
+    #expect(model.started == [["alpha"], ["alpha"]] && engine.quiet == 3, "\(engine.quiet)")
+    // the 300th step given as a step a hole cut short waits, fed again padded as before
+    let short = Stub(lag: 3)
+    let restarting = try talkers(short)
+    let holed = try run(
+      restarting,
+      [
+        .frames(0, 0b10, 20), .frames(400_000, 0, 1_502), .frames(30_600_000, 0b10, 25),
+        .frames(31_100_000, 0, 30),
+      ])
+    #expect(
+      spans(holed) == [
+        "0 400000 1", "400000 20400000", "20400000 30440000", "30600000 31100000 2",
+      ] && short.started.count == 2)
   }
 
   @Test("a score: the cosine mapped linearly, 0.53 at 0.5; a zero embedding's cosine 0")
