@@ -108,15 +108,15 @@ struct Models {
       seed = seed &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
       return Float(Int(seed >> 40) - (1 << 23)) / Float(1 << 23) * 0.003
     }
-    // each span after the quiet, its times from the fixture's start
+    // each span reaching past the quiet, cut at its end, its times from the fixture's start
     func after(_ seconds: Int) throws -> [String] {
       let engine = try Talkers(model: fluid, voices: Engine.voices(dir), floor: nil)
       let quiet = Array([[Float]](repeating: second, count: seconds).joined())
+      let lead = seconds * 1_000_000
       return try heard(engine, quiet + pcm).compactMap { span in
-        let (start, end) = (span["start"] as! Int, span["end"] as! Int)
+        let (start, end) = (max(lead, span["start"] as! Int), span["end"] as! Int)
         let talkers = (span["talkers"] as! [[String: Any]]).map { "\($0["id"]!)" }
-        return start < seconds * 1_000_000
-          ? nil : "\(start - seconds * 1_000_000) \(end - seconds * 1_000_000) \(talkers)"
+        return end > lead ? "\(start - lead) \(end - lead) \(talkers)" : nil
       }
     }
     // without the restart, after 40 s to 2 min of it marius's first phrase opened 0.3 s early and

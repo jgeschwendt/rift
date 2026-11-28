@@ -21,10 +21,15 @@ let bar: Float = 0.5
 let radius = 2
 /// The most steps a model's output may trail what it was fed: 2 s, over LS-EEND's 0.9 s.
 let lag = 20
-/// The steps of nobody, as the model gives them, after which the stream starts afresh, its voices
-/// enrolled again: 30 s. A stream run for long on a quiet room drifts until LS-EEND hears the
-/// enrolled voice as a new one, or as nobody (engines/README.md).
+/// The settled steps of nobody after which the stream starts afresh, its voices enrolled again:
+/// 30 s. A stream run for long on a quiet room drifts until LS-EEND mislabels or misses the
+/// enrolled voice (engines/README.md).
 let rest = 300
+/// The settled steps a stream lives before it starts afresh at its next `still` of nobody: 60 s,
+/// so a room never quiet for 30 s on end cannot age it into drift either.
+let aged = 600
+/// The settled steps of nobody an aged stream waits for: 1 s.
+let still = 10
 /// Samples a second.
 let rate = 16_000
 /// The most samples one embedding reads: WeSpeaker's 10 s window.
@@ -87,8 +92,9 @@ final class Talkers {
   var ids: [Int: Int] = [:]
   /// The integer ids given on this connection, none reused.
   var numbered = 0
-  /// The steps given in a row with no slot over the bar.
-  var quiet = 0
+  /// The settled steps since the stream last started, and those of nobody in a row, a step with
+  /// a masked frame leaving the row as it was.
+  var (age, quiet) = (0, 0)
   /// The frames heard, the newest last.
   var kept: [(t: Int, pcm: [Float])] = []
   /// The frames of the step being gathered, each with whether it was masked.
@@ -140,12 +146,12 @@ final class Talkers {
     samples + [Float](repeating: 0, count: max(0, 320 - samples.count))
   }
 
-  /// A frame's `samples` fed, and what settles; after `rest` steps of nobody the stream started
-  /// afresh.
+  /// A frame's `samples` fed, and what settles; after `rest` settled steps of nobody, or `still`
+  /// once `aged`, the stream started afresh.
   func push(_ samples: [Float]) throws -> [[String: Any]] {
     try take(model.feed(samples))
     let said = try settle()
-    if quiet >= rest { try restart() }
+    if quiet >= rest || (age >= aged && quiet >= still) { try restart() }
     return said
   }
 
@@ -157,17 +163,18 @@ final class Talkers {
       throw Fault(reason: "the model gave \(rows.count) steps with \(fed.count) fed")
     }
     for slots in rows {
-      let on = Set(slots.indices.filter { slots[$0] > bar })
-      quiet = on.isEmpty ? quiet + 1 : 0
-      given.append((fed.removeFirst(), on))
+      given.append((fed.removeFirst(), Set(slots.indices.filter { slots[$0] > bar })))
     }
   }
 
-  /// The stream started afresh, its voices enrolled again, and the audio fed since its last
-  /// step fed again, a step a hole cut short padded as it was; slots reported before keep no id.
+  /// The stream started afresh, its voices enrolled again, and the audio of every step not yet
+  /// settled fed again, a step a hole cut short padded as it was; slots reported before keep no
+  /// id.
   func restart() throws {
     labels = try model.start(enrolled)
-    (quiet, ids) = (0, [:])
+    (age, quiet, ids) = (0, 0, [:])
+    fed = given[next...].map(\.frames) + fed
+    given.removeLast(given.count - next)
     // fed and gathered frames are the newest heard, each still kept
     let audio = { (frames: [(t: Int, masked: Bool)]) in
       frames.flatMap { frame in self.padded(self.kept.last { $0.t == frame.t }!.pcm) }
@@ -186,7 +193,10 @@ final class Talkers {
       let slots = Set(around.joined()).filter { slot in
         around.filter { $0.contains(slot) }.count * 2 > around.count
       }.sorted()
-      for frame in given[next].frames { said += try heard(frame.t, frame.masked ? [] : slots) }
+      let frames = given[next].frames
+      for frame in frames { said += try heard(frame.t, frame.masked ? [] : slots) }
+      age += 1
+      if !frames.contains(where: \.masked) { quiet = slots.isEmpty ? quiet + 1 : 0 }
       next += 1
       given.removeFirst(max(0, next - radius))
       next = min(next, radius)

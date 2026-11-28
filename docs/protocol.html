@@ -583,7 +583,8 @@
       and boots while its profile stands; or an integer for a
       voice matching none, numbered from 1 on each connection in the order first reported, never
       reused on it and meaning nothing past it (the <code class="code">engine</code> events bracket
-      a connection). <code class="code">score</code> is the engine's evidence that the span's
+      a connection); one voice may take a new integer within a connection, as after an engine
+      starts its model afresh. <code class="code">score</code> is the engine's evidence that the span's
       audio is that enrolled voice, 0 to 1, higher closer, meaning nothing beyond its order within
       one engine and release, so no value of it is a cut the protocol promises; evidence, not
       authentication. <code class="code">null</code> is an integer id's, and a label's the engine

@@ -16,9 +16,10 @@ final class Stub: Model {
   var queued: [[Float]] = []
   /// The samples of the step being heard.
   var heard: [Float] = []
-  /// Each start's labels, and the length of each embedding's audio.
+  /// Each start's labels, the length of each embedding's audio, and of each feed's.
   var started: [[String]] = []
   var embedded: [Int] = []
+  var sizes: [Int] = []
 
   init(lag: Int = 0) { self.lag = lag }
 
@@ -33,10 +34,15 @@ final class Stub: Model {
   }
 
   func feed(_ pcm: [Float]) throws -> [[Float]] {
-    heard += pcm
+    (heard, sizes) = (heard + pcm, sizes + [pcm.count])
     var given: [[Float]] = []
-    // each whole step, however the audio is cut
+    // each whole step, however the audio is cut; one level, then a hole's silence at most, or the
+    // steps were cut out of line with the frames
     while heard.count >= 1_600 {
+      let voiced = heard.prefix(1_600).firstIndex { $0 != heard[0] } ?? 1_600
+      guard heard[voiced..<1_600].allSatisfy({ $0 == 0 }) else {
+        throw Failure(reason: "a step out of line with its frames")
+      }
       let mask = Int((heard[0] * 1_048_576).rounded())
       heard.removeFirst(1_600)
       queued.append((0..<20).map { mask >> $0 & 1 == 1 ? 0.9 : 0.1 })
@@ -191,11 +197,13 @@ func voiced() -> [[String: Any]] {
 
   @Test("nobody and unknown: a hole closes the span at its start and leaves its time unknown")
   func holes() throws {
+    let model = Stub()
     let said = try run(
-      talkers(Stub()),
-      [.frames(0, 1, 12), .frames(1_000_000, 1, 15), .frames(1_300_000, 0, 30)])
-    // the step a hole cuts short is fed padded; the time between 240 ms and 1 s no span covers
+      talkers(model), [.frames(0, 1, 12), .frames(1_000_000, 1, 15), .frames(1_300_000, 0, 30)])
+    // the step a hole cuts short is fed padded, in one feed so a restart never splits it; the
+    // time between 240 ms and 1 s no span covers
     #expect(spans(said) == ["0 240000 1", "1000000 1300000 1"])
+    #expect(model.sizes.filter { $0 != 320 } == [960])
   }
 
   @Test("masked audio is nobody's, whatever the model hears in it")
@@ -228,12 +236,12 @@ func voiced() -> [[String: Any]] {
   }
 
   @Test(
-    "30 s of nobody starts the stream afresh, its voices enrolled again: the audio not yet given a step fed again, none lost, a voice heard before a new id"
+    "30 settled s of nobody starts the stream afresh, its voices enrolled again: the audio not yet settled fed again, none lost, a voice heard before a new id"
   )
   func restarted() throws {
     let model = Stub(lag: 3)
     let engine = try talkers(model, [("alpha", 0)])
-    // the 300th step of nobody, from 0.5 s, is given at 30.8 s, past the voice at 30.5 s
+    // the 300th settled step of nobody, from 0.5 s, settles at 31 s, past the voice at 30.5 s
     let said = try run(
       engine,
       [
@@ -244,22 +252,41 @@ func voiced() -> [[String: Any]] {
       spans(said) == [
         "0 500000 1", "500000 20500000", "20500000 30500000", "30500000 31000000 2",
         "31000000 31500000 alpha",
-      ])
-    // started once more, and counting nobody afresh: the last 0.6 s, of which 3 steps are given
-    #expect(model.started == [["alpha"], ["alpha"]] && engine.quiet == 3, "\(engine.quiet)")
-    // the 300th step given as a step a hole cut short waits, fed again padded as before
-    let short = Stub(lag: 3)
-    let restarting = try talkers(short)
+      ] && model.started == [["alpha"], ["alpha"]])
+    // with no lag, the step a hole cut short gives the 300th as its silence is fed, so it is fed
+    // again padded, and the voice after the hole lines up with the new stream's steps (the stub
+    // throws on a step out of line)
+    let flush = Stub()
     let holed = try run(
-      restarting,
+      talkers(flush),
       [
-        .frames(0, 0b10, 20), .frames(400_000, 0, 1_502), .frames(30_600_000, 0b10, 25),
-        .frames(31_100_000, 0, 30),
+        .frames(0, 0b10, 20), .frames(400_000, 0, 1_507), .frames(30_700_000, 0b10, 25),
+        .frames(31_200_000, 0, 30),
       ])
     #expect(
       spans(holed) == [
-        "0 400000 1", "400000 20400000", "20400000 30440000", "30600000 31100000 2",
-      ] && short.started.count == 2)
+        "0 400000 1", "400000 20400000", "20400000 30540000", "30700000 31200000 2",
+      ] && flush.started.count == 2)
+  }
+
+  @Test("the rest counts settled steps: a step over the bar every 20 s, smoothed away, resets none")
+  func blips() throws {
+    let model = Stub()
+    let said = try run(
+      talkers(model),
+      [.frames(0, 0, 1_000), .frames(20_000_000, 0b10, 5), .frames(20_100_000, 0, 1_000)])
+    #expect(spans(said) == ["0 20000000"] && model.started.count == 2)
+  }
+
+  @Test("a stream 60 s old starts afresh at its next settled second of nobody, not before")
+  func aged() throws {
+    let model = Stub()
+    let engine = try talkers(model, [("alpha", 0)])
+    // a pause of 1.5 s at 30 s: too young
+    _ = try run(engine, [.frames(0, 0b1, 1_500), .frames(30_000_000, 0, 75)])
+    #expect(model.started.count == 1)
+    _ = try run(engine, [.frames(31_500_000, 0b1, 1_500), .frames(61_500_000, 0, 75)])
+    #expect(model.started.count == 2 && engine.age < 10)
   }
 
   @Test("a score: the cosine mapped linearly, 0.53 at 0.5; a zero embedding's cosine 0")
