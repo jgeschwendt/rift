@@ -1,0 +1,135 @@
+{
+  "adrs": {},
+  "landmarks": {
+    "one-instance-by-lock": {
+      "file": "src/main.rs",
+      "line": 1596,
+      "node": "src"
+    },
+    "socket-in-0700": {
+      "file": "src/main.rs",
+      "line": 1613,
+      "node": "src"
+    },
+    "stop-signals-first": {
+      "file": "src/main.rs",
+      "line": 1582,
+      "node": "src"
+    }
+  },
+  "nodes": {
+    "/": {
+      "budget": null,
+      "claims": [
+        {
+          "anchor": "※ one-instance-by-lock",
+          "enforced_by": null,
+          "id": "one-instance-by-lock",
+          "kind": "invariant",
+          "resolved": "src/main.rs:1596",
+          "text": "one instance, by an exclusive flock on run/serve.lock opened append, never create, so a second instance cannot even truncate the lock file",
+          "verified": {
+            "digest": "4e6b252584732e183fe76869d3fffe6b631fe86951c68f945105b3933a46aae6",
+            "sha": "55ca037cf0264ee4f2be2a771bfef3e1ecb99acc"
+          }
+        },
+        {
+          "anchor": "※ socket-in-0700",
+          "enforced_by": null,
+          "id": "socket-in-0700",
+          "kind": "invariant",
+          "resolved": "src/main.rs:1613",
+          "text": "the socket lives in a run/ directory the daemon creates 0700 and checks is this user's and closed to group and other, else it refuses and removes the socket",
+          "verified": {
+            "digest": "4e6b252584732e183fe76869d3fffe6b631fe86951c68f945105b3933a46aae6",
+            "sha": "55ca037cf0264ee4f2be2a771bfef3e1ecb99acc"
+          }
+        },
+        {
+          "anchor": "※ stop-signals-first",
+          "enforced_by": null,
+          "id": "stop-signals-first",
+          "kind": "invariant",
+          "resolved": "src/main.rs:1582",
+          "text": "the daemon arms SIGHUP, SIGINT and SIGTERM before anything else in its boot, so a stop during the boot waits for the drain and never kills",
+          "verified": {
+            "digest": "4e6b252584732e183fe76869d3fffe6b631fe86951c68f945105b3933a46aae6",
+            "sha": "55ca037cf0264ee4f2be2a771bfef3e1ecb99acc"
+          }
+        }
+      ],
+      "commands": {
+        "check": "mise run check",
+        "cover": "mise run cover"
+      },
+      "contains": [
+        "docs",
+        "src",
+        "tests"
+      ],
+      "declared": {
+        "allow": [],
+        "decided_by": [],
+        "depends": []
+      },
+      "extracted": {
+        "imports": []
+      },
+      "id": "/",
+      "kind": "system",
+      "purpose": "rift — a launchd-owned daemon serving one append-only event log and an audio stream over a unix socket"
+    },
+    "docs": {
+      "budget": null,
+      "claims": [],
+      "commands": {},
+      "contains": [],
+      "declared": {
+        "allow": [],
+        "decided_by": [],
+        "depends": []
+      },
+      "extracted": {
+        "imports": []
+      },
+      "id": "docs",
+      "kind": "container",
+      "purpose": "the design (`index.html`, GitHub Pages) and the wire contract (`protocol.html`)"
+    },
+    "src": {
+      "budget": null,
+      "claims": [],
+      "commands": {},
+      "contains": [],
+      "declared": {
+        "allow": [],
+        "decided_by": [],
+        "depends": []
+      },
+      "extracted": {
+        "imports": []
+      },
+      "id": "src",
+      "kind": "container",
+      "purpose": "the binary — `main.rs` (serve, the clients, setup, upgrade), the microphone and mouth devices, and the reference tail engine"
+    },
+    "tests": {
+      "budget": null,
+      "claims": [],
+      "commands": {},
+      "contains": [],
+      "declared": {
+        "allow": [],
+        "decided_by": [],
+        "depends": []
+      },
+      "extracted": {
+        "imports": []
+      },
+      "id": "tests",
+      "kind": "container",
+      "purpose": "the end-to-end suite — the built binary over temp roots, stub launchctl and friends, fake mics and speakers"
+    }
+  },
+  "version": 2
+}

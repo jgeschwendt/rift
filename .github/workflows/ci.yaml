@@ -13,7 +13,10 @@ jobs:
     # /dev/urandom) is refused only there
     runs-on: macos-15
     steps:
+      # full history: stele's freshness class walks verified.sha..HEAD
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@master
         with:
           components: clippy, llvm-tools-preview, rustfmt
@@ -28,5 +31,13 @@ jobs:
       # mise.toml's cover task: src/mic.rs and src/speaker.rs open a real microphone or output,
       # which no test may
       - run: cargo llvm-cov --fail-under-lines 100 --ignore-filename-regex 'src/(mic|speaker)\.rs$' --show-missing-lines
+      # the graph gate: NEVER `stele build` here, it would make check pass trivially. mise on PATH
+      # for stele's liveness check of the `mise run` commands.
+      - uses: jdx/mise-action@c37c93293d6b742fc901e1406b8f764f6fb19dac # v2.4.4
+        with:
+          install: false
+      - run: curl -fsSL https://raw.githubusercontent.com/jgeschwendt/stele/c7882176f321809064205db5b6474827834c5a34/scripts/install.sh | bash -s v0.3.0
+      - run: ~/.local/bin/stele check
+      - run: ~/.local/bin/stele emit --check
     # the suite takes about a minute: a hang is a red check with its log, never a lost runner
     timeout-minutes: 10
