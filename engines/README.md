@@ -51,15 +51,18 @@ starting with a letter. No profile is ever committed.
 
 The engine starts its stream afresh after 30 s of settled nobody (the median's, a step with a
 masked frame neither counting nor breaking the run), and once the stream is 60 s old at its
-next settled second of nobody: LS-EEND reset and each profile enrolled again on the frame path,
-0.28 to 0.31 s for one 30 s profile and about that again for each more, and the audio of every
-step not yet settled fed again, so no step is lost. A stream left running drifts on a quiet room, its running mean
-(LS-EEND's cumulative mean normalisation never forgets) and its state coming to be the room's:
+next 3.5 settled s of nobody, past the 3 s of silence a turn may be held across: LS-EEND reset
+and each profile enrolled again on the frame path, 0.28 to 0.31 s for one 30 s profile and
+about that again for each more, the audio of every step not yet settled fed again, so no step
+is lost, and the settled steps the median still reads cleared of the old stream's slots. A
+stream left running drifts on a quiet room, its running mean (LS-EEND's cumulative mean
+normalisation never forgets) and its state coming to be the room's:
 on the fixture, alba enrolled, after 40 s to 10 min of noise at about −55 dBFS marius's first
 phrase opened 0.3 s early and his second took alba's label, and after 30 min 0.7 s of his first
 went unheard; restarting, the spans after 1 to 30 min of it are a fresh stream's (measured
 2026-11-28 · the fixture after leads of uniform and Gaussian noise, the model test `rested`;
-validated privately on real speech). A voice not enrolled heard again after a restart takes a new integer.
+validated privately on real speech). A voice not enrolled heard again after a restart takes a
+new integer.
 
 A label is LS-EEND's guess, never proof of who speaks: with alba enrolled it labelled files of four
 other voices as her, 1.8 to 13.6 s of each, and the fixture's first marius phrase too. A span's

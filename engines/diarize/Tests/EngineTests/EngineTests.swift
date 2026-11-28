@@ -278,15 +278,30 @@ func voiced() -> [[String: Any]] {
     #expect(spans(said) == ["0 20000000"] && model.started.count == 2)
   }
 
-  @Test("a stream 60 s old starts afresh at its next settled second of nobody, not before")
+  @Test("a stream 60 s old starts afresh at its next 3.5 settled s of nobody, not before")
   func aged() throws {
     let model = Stub()
     let engine = try talkers(model, [("alpha", 0)])
-    // a pause of 1.5 s at 30 s: too young
-    _ = try run(engine, [.frames(0, 0b1, 1_500), .frames(30_000_000, 0, 75)])
+    // a pause of 4 s at 30 s: too young
+    _ = try run(engine, [.frames(0, 0b1, 1_500), .frames(30_000_000, 0, 200)])
     #expect(model.started.count == 1)
-    _ = try run(engine, [.frames(31_500_000, 0b1, 1_500), .frames(61_500_000, 0, 75)])
+    // 60 s old, a pause of 3 s, which a turn may hold across: not yet; at 4 s: afresh
+    _ = try run(engine, [.frames(34_000_000, 0b1, 1_500), .frames(64_000_000, 0, 150)])
+    #expect(model.started.count == 1)
+    _ = try run(engine, [.frames(67_000_000, 0, 50)])
     #expect(model.started.count == 2 && engine.age < 10)
+  }
+
+  @Test("masked steps neither count toward the rest nor break it, whatever the model hears")
+  func unrested() throws {
+    let model = Stub()
+    let engine = try talkers(model)
+    // 20 s of nobody, 15 s masked over a voice: 20 s of the rest, none of it in the mask
+    _ = try run(engine, [.frames(0, 0, 1_000), .masked(20_000_000, 0b10, 750)])
+    #expect(model.started.count == 1)
+    // 10.5 s more nobody makes 30 settled s: afresh once
+    _ = try run(engine, [.frames(35_000_000, 0, 525)])
+    #expect(model.started.count == 2)
   }
 
   @Test("a score: the cosine mapped linearly, 0.53 at 0.5; a zero embedding's cosine 0")

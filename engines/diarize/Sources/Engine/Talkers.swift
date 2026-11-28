@@ -28,8 +28,9 @@ let rest = 300
 /// The settled steps a stream lives before it starts afresh at its next `still` of nobody: 60 s,
 /// so a room never quiet for 30 s on end cannot age it into drift either.
 let aged = 600
-/// The settled steps of nobody an aged stream waits for: 1 s.
-let still = 10
+/// The settled steps of nobody an aged stream waits for: 3.5 s, past the 3 s of silence the turn
+/// engine may hold a turn open across, so the restart never lands inside a turn.
+let still = 35
 /// Samples a second.
 let rate = 16_000
 /// The most samples one embedding reads: WeSpeaker's 10 s window.
@@ -168,13 +169,14 @@ final class Talkers {
   }
 
   /// The stream started afresh, its voices enrolled again, and the audio of every step not yet
-  /// settled fed again, a step a hole cut short padded as it was; slots reported before keep no
-  /// id.
+  /// settled fed again, a step a hole cut short padded as it was; the settled steps the median
+  /// still reads hold no slot, and slots reported before keep no id.
   func restart() throws {
     labels = try model.start(enrolled)
     (age, quiet, ids) = (0, 0, [:])
     fed = given[next...].map(\.frames) + fed
-    given.removeLast(given.count - next)
+    // the settled rows the median still reads keep their frames, not the old stream's slots
+    given = given[..<next].map { ($0.frames, []) }
     // fed and gathered frames are the newest heard, each still kept
     let audio = { (frames: [(t: Int, masked: Bool)]) in
       frames.flatMap { frame in self.padded(self.kept.last { $0.t == frame.t }!.pcm) }
